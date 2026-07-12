@@ -223,7 +223,7 @@ if (fs.existsSync(distDir)) {
   app.use(express.static(distDir, { index: false, maxAge: "1h", immutable: false }));
 }
 app.use((req, res, next) => {
-  if (req.method !== "GET" || req.path.startsWith("/api/") || req.path === "/events") return next();
+  if (!["GET", "HEAD"].includes(req.method) || req.path.startsWith("/api/") || req.path === "/events") return next();
   const indexPath = path.join(distDir, "index.html");
   if (!fs.existsSync(indexPath)) {
     res.status(503).send("ForgeDeck client is not built. Run npm run build.");
