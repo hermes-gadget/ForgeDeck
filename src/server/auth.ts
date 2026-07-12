@@ -10,13 +10,20 @@ type Session = { expiresAt: number };
 type Attempt = { count: number; resetAt: number };
 
 export class AuthManager {
-  private readonly secret: string;
+  private readonly secret: string | null;
   private readonly sessions = new Map<string, Session>();
   private readonly attempts = new Map<string, Attempt>();
+  readonly enabled: boolean;
   readonly generatedTokenPath: string | null;
 
   constructor(dataDir: string) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    this.enabled = !["off", "false", "disabled", "none"].includes((process.env.FORGEDECK_AUTH || "on").trim().toLowerCase());
+    if (!this.enabled) {
+      this.secret = null;
+      this.generatedTokenPath = null;
+      return;
+    }
     const configured = process.env.FORGEDECK_PASSWORD;
     const tokenPath = path.join(dataDir, "access-token");
 
@@ -40,13 +47,16 @@ export class AuthManager {
   }
 
   login(ip: string, candidate: string): { ok: boolean; sessionId?: string; retryAfter?: number } {
+    if (!this.enabled) {
+      return { ok: true, sessionId: crypto.randomBytes(32).toString("base64url") };
+    }
     const now = Date.now();
     const attempt = this.attempts.get(ip);
     if (attempt && attempt.resetAt > now && attempt.count >= 10) {
       return { ok: false, retryAfter: Math.ceil((attempt.resetAt - now) / 1000) };
     }
 
-    const ok = safeEqual(candidate, this.secret);
+    const ok = safeEqual(candidate, this.secret!);
     if (!ok) {
       const next = !attempt || attempt.resetAt <= now
         ? { count: 1, resetAt: now + 15 * 60_000 }
@@ -78,6 +88,7 @@ export class AuthManager {
   }
 
   isAuthenticated(req: Request): boolean {
+    if (!this.enabled) return true;
     const id = readCookie(req, COOKIE_NAME);
     if (!id) return false;
     const session = this.sessions.get(id);

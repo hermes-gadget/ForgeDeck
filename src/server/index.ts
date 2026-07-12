@@ -244,7 +244,8 @@ const server = app.listen(port, host, () => {
   const addresses = lanAddresses(port);
   console.log(`\n  ForgeDeck is online`);
   for (const address of addresses) console.log(`  ${address}`);
-  if (auth.generatedTokenPath) console.log(`\n  Access key file: ${auth.generatedTokenPath}`);
+  if (!auth.enabled) console.log("\n  Authentication: disabled by FORGEDECK_AUTH=off");
+  else if (auth.generatedTokenPath) console.log(`\n  Access key file: ${auth.generatedTokenPath}`);
   console.log("\n  Closing a browser will not stop active Codex turns.\n");
 });
 

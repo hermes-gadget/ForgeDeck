@@ -56,6 +56,7 @@ The service restarts after crashes and starts with the user's systemd session. I
 | --- | --- | --- |
 | `FORGEDECK_HOST` | `0.0.0.0` | HTTP listen address |
 | `FORGEDECK_PORT` | `4173` | HTTP listen port |
+| `FORGEDECK_AUTH` | `on` | Set to `off` to disable the ForgeDeck login |
 | `FORGEDECK_PASSWORD` | generated token | ForgeDeck login password |
 | `FORGEDECK_ROOTS` | current home directory | Colon-separated selectable workspace roots |
 | `CODEX_BIN` | `codex` on `PATH` | Codex executable path |
@@ -65,6 +66,7 @@ The production start command and included systemd service automatically load `.e
 ## Security notes
 
 - Keep `.data/`, `.env`, and `~/.codex/` out of version control. The supplied `.gitignore` already covers ForgeDeck's local secrets and build output.
+- `FORGEDECK_AUTH=off` gives every device that can reach the service full control of Codex. Use it only on a trusted, firewalled LAN.
 - ForgeDeck uses plain HTTP so phones and tablets can connect easily on the private LAN. Do not port-forward it to the internet or use it on an untrusted network. For remote access, put it behind a private VPN such as Tailscale or a TLS reverse proxy.
 - Workspace sessions use Codex's `workspace-write` sandbox and request approval for elevated commands. ForgeDeck restricts each thread's runtime workspace root to the selected directory.
 - Hidden and common credential directories are omitted from the browser and rejected as workspaces.
