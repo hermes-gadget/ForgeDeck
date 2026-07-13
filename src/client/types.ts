@@ -76,10 +76,23 @@ export type PendingRequest = {
   receivedAt: number;
 };
 
+export type QueueEntry = { id: string; text: string; model: string; effort: string | null; createdAt: number };
+export type LiveThreadState = {
+  items: Record<string, ThreadItem>;
+  agentText: Record<string, string>;
+  toolOutput: Record<string, string>;
+  active: boolean;
+  completedAt: number | null;
+  updatedAt: number;
+};
+
 export type Bootstrap = {
   models: { data: CodexModel[] };
   account: { account: { type: string; email?: string | null; planType?: string } | null; requiresOpenaiAuth: boolean };
   usage: Usage | null;
   roots: string[];
   pendingRequests: PendingRequest[];
+  liveState?: Record<string, LiveThreadState>;
+  queues?: Record<string, QueueEntry[]>;
+  activeThreadIds?: string[];
 };

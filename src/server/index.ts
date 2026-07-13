@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { AuthManager } from "./auth.js";
 import { CodexBridge, type ServerRequest } from "./codex-bridge.js";
+import { ExternalCodexMonitor } from "./external-monitor.js";
 import { PathError, WorkspacePaths } from "./paths.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,21 @@ const workspaces = await WorkspacePaths.create();
 const codex = new CodexBridge();
 const app = express();
 const sseClients = new Set<Response>();
+type QueuedMessage = { id: string; text: string; model: string; effort: string | null; createdAt: number };
+const queueFile = path.join(dataDir, "message-queues.json");
+const messageQueues = loadMessageQueues();
+const activeThreads = new Set<string>();
+const drainingQueues = new Set<string>();
+const bridgeOwnedThreads = new Set<string>();
+type LiveThreadState = {
+  items: Record<string, Record<string, unknown>>;
+  agentText: Record<string, string>;
+  toolOutput: Record<string, string>;
+  active: boolean;
+  completedAt: number | null;
+  updatedAt: number;
+};
+const liveThreadStates = new Map<string, LiveThreadState>();
 
 app.disable("x-powered-by");
 app.use(securityHeaders);
@@ -68,7 +84,7 @@ app.get("/api/bootstrap", async (_req, res, next) => {
       codex.request("account/read", { refreshToken: false }).catch(() => ({ account: null, requiresOpenaiAuth: true })),
       codex.request("account/rateLimits/read").catch(() => null)
     ]);
-    res.json({ models, account, usage, roots: workspaces.roots, pendingRequests: codex.listServerRequests() });
+    res.json({ models, account, usage, roots: workspaces.roots, pendingRequests: codex.listServerRequests(), liveState: Object.fromEntries(liveThreadStates), queues: Object.fromEntries(messageQueues), activeThreadIds: [...activeThreads] });
   } catch (error) {
     next(error);
   }
@@ -150,6 +166,43 @@ app.post("/api/threads/:threadId/messages", async (req, res, next) => {
   }
 });
 
+app.post("/api/threads/:threadId/queue", async (req, res, next) => {
+  try {
+    const threadId = validThreadId(req.params.threadId);
+    const text = requiredString(req.body?.text, "Message");
+    if (text.length > 100_000) throw httpError("Message is too long", 413);
+    const model = requiredString(req.body?.model, "Model");
+    const effort = optionalString(req.body?.effort);
+    await validateModelChoice(model, effort);
+    const entry: QueuedMessage = { id: crypto.randomUUID(), text, model, effort, createdAt: Date.now() };
+    const queue = messageQueues.get(threadId) || [];
+    queue.push(entry);
+    messageQueues.set(threadId, queue);
+    persistMessageQueues();
+    broadcastQueue(threadId);
+    void drainQueue(threadId);
+    res.status(202).json({ queued: entry, position: queue.length });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/threads/:threadId/queue/:queueId", (req, res, next) => {
+  try {
+    const threadId = validThreadId(req.params.threadId);
+    const queue = messageQueues.get(threadId) || [];
+    const nextQueue = queue.filter((entry) => entry.id !== req.params.queueId);
+    if (nextQueue.length === queue.length) throw httpError("Queued message not found", 404);
+    if (nextQueue.length) messageQueues.set(threadId, nextQueue);
+    else messageQueues.delete(threadId);
+    persistMessageQueues();
+    broadcastQueue(threadId);
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/threads/:threadId/interrupt", async (req, res, next) => {
   try {
     const threadId = validThreadId(req.params.threadId);
@@ -173,7 +226,10 @@ app.patch("/api/threads/:threadId", async (req, res, next) => {
 app.delete("/api/threads/:threadId", async (req, res, next) => {
   try {
     const threadId = validThreadId(req.params.threadId);
-    res.json(await codex.request("thread/archive", { threadId }));
+    const result = await codex.request("thread/archive", { threadId });
+    if (messageQueues.delete(threadId)) persistMessageQueues();
+    broadcastQueue(threadId);
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -209,7 +265,15 @@ app.get("/events", (req, res) => {
   });
 });
 
-codex.on("notification", (payload) => broadcast("codex", payload));
+codex.on("notification", (payload) => {
+  const notification = payload as { method: string; params?: Record<string, unknown> };
+  if (notification.method === "thread/started") {
+    const thread = notification.params?.thread as { id?: string } | undefined;
+    if (thread?.id) bridgeOwnedThreads.add(thread.id);
+  }
+  recordLiveEvent(notification);
+  broadcast("codex", payload);
+});
 codex.on("serverRequest", (payload) => broadcast("approval", payload));
 codex.on("serverRequestResolved", (payload) => broadcast("approval-resolved", payload));
 codex.on("offline", (payload) => broadcast("runtime", { state: "offline", ...payload }));
@@ -240,6 +304,14 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 await codex.start();
+const externalMonitor = new ExternalCodexMonitor((notification) => {
+  const threadId = typeof notification.params.threadId === "string" ? notification.params.threadId : null;
+  if (threadId && bridgeOwnedThreads.has(threadId)) return;
+  recordLiveEvent(notification);
+  broadcast("codex", notification);
+});
+externalMonitor.start();
+for (const threadId of messageQueues.keys()) void drainQueue(threadId);
 const server = app.listen(port, host, () => {
   const addresses = lanAddresses(port);
   console.log(`\n  ForgeDeck is online`);
@@ -251,6 +323,7 @@ const server = app.listen(port, host, () => {
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    externalMonitor.stop();
     codex.stop();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 5000).unref();
@@ -264,6 +337,66 @@ async function startTurn(threadId: string, text: string, model: string, effort: 
     model,
     effort: effort || undefined
   }, 60_000);
+}
+
+async function drainQueue(threadId: string): Promise<void> {
+  if (drainingQueues.has(threadId) || activeThreads.has(threadId) || !(messageQueues.get(threadId)?.length)) return;
+  drainingQueues.add(threadId);
+  let entry: QueuedMessage | undefined;
+  try {
+    const snapshot = await codex.request<{ thread: ThreadSnapshot }>("thread/read", { threadId, includeTurns: true }, 60_000);
+    const lastTurn = snapshot.thread.turns?.at(-1);
+    if (snapshot.thread.status?.type === "active" || lastTurn?.status === "inProgress") {
+      activeThreads.add(threadId);
+      return;
+    }
+    const queue = messageQueues.get(threadId) || [];
+    entry = queue.shift();
+    if (!entry) return;
+    if (queue.length) messageQueues.set(threadId, queue);
+    else messageQueues.delete(threadId);
+    persistMessageQueues();
+    broadcastQueue(threadId);
+    activeThreads.add(threadId);
+    await codex.request("thread/resume", { threadId, model: entry.model, excludeTurns: true }, 60_000);
+    await startTurn(threadId, entry.text, entry.model, entry.effort);
+  } catch (error) {
+    activeThreads.delete(threadId);
+    if (entry) {
+      const queue = messageQueues.get(threadId) || [];
+      queue.unshift(entry);
+      messageQueues.set(threadId, queue);
+      persistMessageQueues();
+      broadcastQueue(threadId, error instanceof Error ? error.message : String(error));
+    }
+    console.error(`[ForgeDeck] Could not start queued turn for ${threadId}:`, error);
+  } finally {
+    drainingQueues.delete(threadId);
+  }
+}
+
+type ThreadSnapshot = { status?: { type?: string }; turns?: Array<{ status?: string }> };
+
+function loadMessageQueues(): Map<string, QueuedMessage[]> {
+  try {
+    if (!fs.existsSync(queueFile)) return new Map();
+    const parsed = JSON.parse(fs.readFileSync(queueFile, "utf8")) as Record<string, QueuedMessage[]>;
+    return new Map(Object.entries(parsed).filter(([, queue]) => Array.isArray(queue) && queue.length));
+  } catch (error) {
+    console.error("[ForgeDeck] Ignoring invalid message queue file:", error);
+    return new Map();
+  }
+}
+
+function persistMessageQueues(): void {
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const temporary = `${queueFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(Object.fromEntries(messageQueues), null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, queueFile);
+}
+
+function broadcastQueue(threadId: string, error?: string): void {
+  broadcast("queue", { threadId, queue: messageQueues.get(threadId) || [], error: error || null });
 }
 
 async function validateModelChoice(modelId: string, effort: string | null): Promise<void> {
@@ -302,6 +435,67 @@ function broadcast(event: string, payload: unknown): void {
   const message = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const client of sseClients) client.write(message);
 }
+
+function recordLiveEvent(notification: { method: string; params?: Record<string, unknown> }): void {
+  const params = notification.params;
+  const threadId = typeof params?.threadId === "string" ? params.threadId : null;
+  if (!threadId) return;
+  if (notification.method === "turn/started") activeThreads.add(threadId);
+  if (notification.method === "turn/completed") {
+    activeThreads.delete(threadId);
+    setTimeout(() => void drainQueue(threadId), 50).unref();
+  }
+  if (notification.method === "thread/status/changed") {
+    const status = params?.status as { type?: string } | undefined;
+    if (status?.type === "active") activeThreads.add(threadId);
+  }
+  if (notification.method === "thread/deleted" || notification.method === "thread/archived") {
+    liveThreadStates.delete(threadId);
+    return;
+  }
+
+  const state = liveThreadStates.get(threadId) || { items: {}, agentText: {}, toolOutput: {}, active: false, completedAt: null, updatedAt: Date.now() };
+  state.updatedAt = Date.now();
+  if (notification.method === "turn/started") {
+    state.active = true;
+    state.completedAt = null;
+  }
+  if (notification.method === "turn/completed") {
+    state.active = false;
+    state.completedAt = Date.now();
+  }
+  if (notification.method === "thread/status/changed") {
+    const status = params?.status as { type?: string } | undefined;
+    state.active = status?.type === "active";
+  }
+  if ((notification.method === "item/started" || notification.method === "item/completed") && params?.item && typeof params.item === "object") {
+    const item = params.item as Record<string, unknown>;
+    if (typeof item.id === "string") {
+      state.items[item.id] = item;
+      if (notification.method === "item/completed" && item.type === "agentMessage") delete state.agentText[item.id];
+      trimRecord(state.items, 64);
+    }
+  }
+  if (notification.method === "item/agentMessage/delta" && typeof params?.itemId === "string") {
+    state.agentText[params.itemId] = (state.agentText[params.itemId] || "") + String(params.delta || "");
+    trimRecord(state.agentText, 16);
+  }
+  if ((notification.method === "item/commandExecution/outputDelta" || notification.method === "item/fileChange/outputDelta") && typeof params?.itemId === "string") {
+    state.toolOutput[params.itemId] = (state.toolOutput[params.itemId] || "") + String(params.delta || "");
+    trimRecord(state.toolOutput, 32);
+  }
+  liveThreadStates.set(threadId, state);
+}
+
+function trimRecord<T>(record: Record<string, T>, maxEntries: number): void {
+  const keys = Object.keys(record);
+  for (const key of keys.slice(0, Math.max(0, keys.length - maxEntries))) delete record[key];
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 60 * 60_000;
+  for (const [threadId, state] of liveThreadStates) if (state.updatedAt < cutoff) liveThreadStates.delete(threadId);
+}, 10 * 60_000).unref();
 
 function securityHeaders(_req: Request, res: Response, next: NextFunction): void {
   res.set({

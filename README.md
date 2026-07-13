@@ -15,6 +15,10 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Live response streaming, command/file approval prompts, user questions, and stop controls
 - Desktop-first Control Center with live multi-session panels, adaptive 4/3/2/1-column layouts, and at most two rows per page
 - Real-time agent messages, command executions and output, file changes, MCP calls, dynamic tools, and resilient polling fallback
+- Server-retained live activity that restores running tool calls after a browser reconnect or refresh
+- Read-only monitoring of other local Codex processes, including their active state and command/tool records
+- Per-session queued messages that run in order after the current turn and survive browser closure or a ForgeDeck restart
+- Pulsing orange completion indicators that remain until the finished session is opened
 - Search, pin, rename, archive, and sorting for large session collections
 - Responsive desktop/mobile UI
 

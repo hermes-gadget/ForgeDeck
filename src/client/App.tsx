@@ -5,9 +5,9 @@ import {
   Clock3, Code2, Command, Folder, FolderOpen, Gauge, GitBranch, KeyRound,
   LayoutGrid, LoaderCircle, LogOut, Menu, MessageSquareText, MoreHorizontal,
   PanelLeftClose, Pin, PinOff, Plus, RefreshCw, Search, Send, Server,
-  Settings2, ShieldCheck, Sparkles, TerminalSquare, X
+  Settings2, ShieldCheck, Sparkles, TerminalSquare, ListPlus, X
 } from "lucide-react";
-import type { Bootstrap, CodexModel, PendingRequest, Thread, ThreadItem, Usage } from "./types";
+import type { Bootstrap, CodexModel, LiveThreadState, PendingRequest, QueueEntry, Thread, ThreadItem, Usage } from "./types";
 
 type SortMode = "updated" | "created" | "name" | "directory" | "status";
 type ViewMode = "session" | "control";
@@ -39,6 +39,9 @@ export default function App() {
   const [liveText, setLiveText] = useState<LiveStreams>({});
   const [liveToolOutput, setLiveToolOutput] = useState<LiveStreams>({});
   const [liveItems, setLiveItems] = useState<LiveItems>({});
+  const [liveStatuses, setLiveStatuses] = useState<Record<string, Thread["status"]>>({});
+  const [queues, setQueues] = useState<Record<string, QueueEntry[]>>({});
+  const [completedSignals, setCompletedSignals] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem("forgedeck-completed") || "[]")));
   const [activityVersion, setActivityVersion] = useState(0);
   const [runtime, setRuntime] = useState<"ready" | "offline" | "error">("ready");
   const [toast, setToast] = useState<string | null>(null);
@@ -52,6 +55,26 @@ export default function App() {
     const data = await api<Bootstrap>("/api/bootstrap");
     setBootstrap(data);
     setPending(data.pendingRequests);
+    setQueues(data.queues || {});
+    if (data.activeThreadIds?.length) {
+      setLiveStatuses((current) => Object.fromEntries([
+        ...Object.entries(current),
+        ...data.activeThreadIds!.map((threadId) => [threadId, { type: "active", activeFlags: [] } as Thread["status"]])
+      ]));
+    }
+    if (data.liveState) {
+      setLiveItems((current) => mergeLiveState(current, data.liveState!, "items"));
+      setLiveText((current) => mergeLiveState(current, data.liveState!, "agentText"));
+      setLiveToolOutput((current) => mergeLiveState(current, data.liveState!, "toolOutput"));
+      const seen = JSON.parse(localStorage.getItem("forgedeck-completion-seen") || "{}") as Record<string, number>;
+      setCompletedSignals((current) => {
+        const next = new Set(current);
+        for (const [threadId, state] of Object.entries(data.liveState!)) {
+          if (!state.active && state.completedAt && state.completedAt > (seen[threadId] || 0)) next.add(threadId);
+        }
+        return next;
+      });
+    }
     return data;
   }, []);
 
@@ -136,6 +159,11 @@ export default function App() {
       const { id } = JSON.parse((event as MessageEvent).data);
       setPending((current) => current.filter((item) => String(item.id) !== String(id)));
     });
+    events.addEventListener("queue", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { threadId: string; queue: QueueEntry[]; error?: string | null };
+      setQueues((current) => ({ ...current, [payload.threadId]: payload.queue }));
+      if (payload.error) setToast(`Queued turn could not start: ${payload.error}`);
+    });
     events.addEventListener("codex", (event) => {
       const notification = JSON.parse((event as MessageEvent).data) as { method: string; params: Record<string, unknown> };
       const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
@@ -163,6 +191,17 @@ export default function App() {
             [threadId]: { ...(current[threadId] || {}), [item.id!]: item }
           }));
         }
+      }
+      if (notification.method === "thread/status/changed" && threadId && notification.params.status && typeof notification.params.status === "object") {
+        const status = notification.params.status as Thread["status"];
+        setLiveStatuses((current) => ({ ...current, [threadId]: status }));
+        setDetail((current) => current?.id === threadId ? { ...current, status } : current);
+      }
+      if (notification.method === "turn/started" && threadId) {
+        setCompletedSignals((current) => withoutSetValue(current, threadId));
+      }
+      if (notification.method === "turn/completed" && threadId) {
+        setCompletedSignals((current) => new Set(current).add(threadId));
       }
       if (notification.method === "account/rateLimits/updated") {
         void loadBootstrap().catch(() => undefined);
@@ -197,6 +236,7 @@ export default function App() {
   }, [pinned]);
   useEffect(() => localStorage.setItem("forgedeck-view", view), [view]);
   useEffect(() => localStorage.setItem("forgedeck-control-ids", JSON.stringify(controlIds)), [controlIds]);
+  useEffect(() => localStorage.setItem("forgedeck-completed", JSON.stringify([...completedSignals])), [completedSignals]);
   useEffect(() => {
     if (threads.length && controlIds.length === 0) {
       const initial = [...threads].sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
@@ -222,8 +262,12 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [toast]);
 
+  const effectiveThreads = useMemo(() => threads.map((thread) =>
+    liveStatuses[thread.id] ? { ...thread, status: liveStatuses[thread.id] } : thread
+  ), [threads, liveStatuses]);
+
   const sortedThreads = useMemo(() => {
-    const copy = [...threads];
+    const copy = [...effectiveThreads];
     copy.sort((a, b) => {
       const pinOrder = Number(pinned.has(b.id)) - Number(pinned.has(a.id));
       if (pinOrder) return pinOrder;
@@ -234,20 +278,20 @@ export default function App() {
       return b.updatedAt - a.updatedAt;
     });
     return copy;
-  }, [threads, sortMode, pinned]);
+  }, [effectiveThreads, sortMode, pinned]);
 
   const defaultModel = bootstrap?.models.data.find((model) => model.isDefault) || bootstrap?.models.data[0];
   const activeSettings = selectedId && settings[selectedId]
     ? settings[selectedId]
     : defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : null;
   const controlThreads = useMemo(() => {
-    const byId = new Map(threads.map((thread) => [thread.id, thread]));
+    const byId = new Map(effectiveThreads.map((thread) => [thread.id, thread]));
     const orderedIds = [...new Set([
-      ...threads.filter((thread) => thread.status.type === "active").map((thread) => thread.id),
+      ...effectiveThreads.filter((thread) => thread.status.type === "active").map((thread) => thread.id),
       ...controlIds
     ])];
     return orderedIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
-  }, [threads, controlIds]);
+  }, [effectiveThreads, controlIds]);
 
   if (authenticated === null) return <Splash />;
   if (!authenticated) return <Login onSuccess={() => setAuthenticated(true)} />;
@@ -262,6 +306,13 @@ export default function App() {
   const toggleControl = (id: string) => setControlIds((current) =>
     current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
   );
+
+  const markCompletionSeen = (id: string) => {
+    setCompletedSignals((current) => withoutSetValue(current, id));
+    const seen = JSON.parse(localStorage.getItem("forgedeck-completion-seen") || "{}") as Record<string, number>;
+    seen[id] = Date.now();
+    localStorage.setItem("forgedeck-completion-seen", JSON.stringify(seen));
+  };
 
   const updateSettings = (next: { model: string; effort: string }) => {
     if (!selectedId) return;
@@ -313,8 +364,8 @@ export default function App() {
         <div className="session-heading"><span>Sessions</span><span>{threads.length}</span></div>
         <nav className="session-list">
           {sortedThreads.map((thread) => (
-            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inControl={controlIds.includes(thread.id)}
-              onSelect={() => { setSelectedId(thread.id); setView("session"); }} onPin={() => togglePin(thread.id)} onControl={() => toggleControl(thread.id)} />
+            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inControl={controlIds.includes(thread.id)} completed={completedSignals.has(thread.id)}
+              onSelect={() => { setSelectedId(thread.id); setView("session"); markCompletionSeen(thread.id); }} onPin={() => togglePin(thread.id)} onControl={() => toggleControl(thread.id)} />
           ))}
           {!sortedThreads.length && <div className="empty-list"><MessageSquareText size={20} /><span>No sessions found</span></div>}
         </nav>
@@ -330,7 +381,7 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={20} /></button>
-          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={threads.filter((thread) => thread.status.type === "active").length} /> : detail ? <ThreadHeader thread={detail} pinned={pinned.has(detail.id)} onPin={() => togglePin(detail.id)}
+          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={effectiveThreads.filter((thread) => thread.status.type === "active").length} /> : detail ? <ThreadHeader thread={detail} pinned={pinned.has(detail.id)} onPin={() => togglePin(detail.id)}
             onRename={async () => {
               const name = prompt("Session name", threadTitle(detail));
               if (!name?.trim()) return;
@@ -346,14 +397,14 @@ export default function App() {
         </header>
 
         {view === "control" ? (
-          <ControlCenter threads={controlThreads} allThreads={threads} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel}
-            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} activityVersion={activityVersion}
+          <ControlCenter threads={controlThreads} allThreads={effectiveThreads} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel}
+            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} queues={queues} activityVersion={activityVersion}
             onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
-            onOpen={(id) => { setSelectedId(id); setView("session"); }} onRemove={toggleControl}
+            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={toggleControl}
             onAdd={(id) => setControlIds((current) => current.includes(id) ? current : [...current, id])}
             onError={(error) => showError(error, setToast)} />
         ) : detail ? (
-          <Chat thread={detail} loading={loadingDetail} liveText={liveText[detail.id] || {}} liveToolOutput={liveToolOutput[detail.id] || {}} liveItems={liveItems[detail.id] || {}} models={bootstrap.models.data}
+          <Chat thread={detail} loading={loadingDetail} liveText={liveText[detail.id] || {}} liveToolOutput={liveToolOutput[detail.id] || {}} liveItems={liveItems[detail.id] || {}} queue={queues[detail.id] || []} models={bootstrap.models.data}
             settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(detail.id)} onError={(error) => showError(error, setToast)} />
         ) : (
           <Welcome onNew={() => setNewOpen(true)} />
@@ -416,9 +467,9 @@ function UsageCard({ usage, plan }: { usage: Usage | null; plan?: string }) {
   </section>;
 }
 
-function SessionCard({ thread, selected, pinned, inControl, onSelect, onPin, onControl }: { thread: Thread; selected: boolean; pinned: boolean; inControl: boolean; onSelect: () => void; onPin: () => void; onControl: () => void }) {
+function SessionCard({ thread, selected, pinned, inControl, completed, onSelect, onPin, onControl }: { thread: Thread; selected: boolean; pinned: boolean; inControl: boolean; completed: boolean; onSelect: () => void; onPin: () => void; onControl: () => void }) {
   const running = thread.status.type === "active";
-  return <button className={`session-card ${selected ? "selected" : ""}`} onClick={onSelect}>
+  return <button className={`session-card ${selected ? "selected" : ""} ${completed && !running ? "completed" : ""}`} onClick={onSelect}>
     <span className={`status-dot ${thread.status.type}`} />
     <span className="session-copy"><strong>{threadTitle(thread)}</strong><small><Folder size={12} />{basename(thread.cwd)}<i>·</i>{timeAgo(thread.updatedAt)}</small></span>
     <span className="session-actions" onClick={(event) => event.stopPropagation()}>
@@ -443,9 +494,9 @@ function ControlHeader({ count, activeCount }: { count: number; activeCount: num
   </div>;
 }
 
-function ControlCenter({ threads, allThreads, models, settings, defaultModel, liveText, liveToolOutput, liveItems, activityVersion, onSettings, onOpen, onRemove, onAdd, onError }: {
+function ControlCenter({ threads, allThreads, models, settings, defaultModel, liveText, liveToolOutput, liveItems, queues, completedSignals, activityVersion, onSettings, onOpen, onRemove, onAdd, onError }: {
   threads: Thread[]; allThreads: Thread[]; models: CodexModel[]; settings: ThreadSettings; defaultModel?: CodexModel;
-  liveText: LiveStreams; liveToolOutput: LiveStreams; liveItems: LiveItems; activityVersion: number;
+  liveText: LiveStreams; liveToolOutput: LiveStreams; liveItems: LiveItems; queues: Record<string, QueueEntry[]>; completedSignals: Set<string>; activityVersion: number;
   onSettings: (threadId: string, value: { model: string; effort: string }) => void;
   onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onAdd: (threadId: string) => void; onError: (error: unknown) => void;
 }) {
@@ -493,12 +544,12 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
       </div>
     </div>
 
-    {pageThreads.length ? <div className="control-grid">
+    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": Math.min(columns, pageThreads.length) } as React.CSSProperties}>
       {pageThreads.map((summary) => {
         const thread = details[summary.id] || summary;
         const threadSettings = settings[thread.id] || (defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" });
         return <ControlCard key={thread.id} thread={thread} models={models} settings={threadSettings}
-          liveText={liveText[thread.id] || {}} liveToolOutput={liveToolOutput[thread.id] || {}} liveItems={liveItems[thread.id] || {}}
+          liveText={liveText[thread.id] || {}} liveToolOutput={liveToolOutput[thread.id] || {}} liveItems={liveItems[thread.id] || {}} queue={queues[thread.id] || []} completed={completedSignals.has(thread.id)}
           onSettings={(next) => onSettings(thread.id, next)} onOpen={() => onOpen(thread.id)} onRemove={() => onRemove(thread.id)}
           onRefresh={() => setReload((value) => value + 1)} onError={onError} />;
       })}
@@ -508,9 +559,9 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
   </section>;
 }
 
-function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveItems, onSettings, onOpen, onRemove, onRefresh, onError }: {
+function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveItems, queue, completed, onSettings, onOpen, onRemove, onRefresh, onError }: {
   thread: Thread; models: CodexModel[]; settings: { model: string; effort: string };
-  liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>;
+  liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; completed: boolean;
   onSettings: (value: { model: string; effort: string }) => void; onOpen: () => void; onRemove: () => void; onRefresh: () => void; onError: (error: unknown) => void;
 }) {
   const [text, setText] = useState("");
@@ -527,14 +578,14 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
   const toolCount = items.filter((item) => isToolItem(item)).length;
   const running = thread.status.type === "active" || Boolean(runningTurn);
 
-  useEffect(() => { body.current?.scrollTo({ top: body.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput]);
+  useEffect(() => { body.current?.scrollTo({ top: body.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput, liveItems]);
 
   const send = async (event: FormEvent) => {
     event.preventDefault();
-    if (!text.trim() || sending || runningTurn) return;
+    if (!text.trim() || sending) return;
     const outgoing = text.trim(); setText(""); setSending(true);
     try {
-      await api(`/api/threads/${thread.id}/messages`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
       onRefresh();
     } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
   };
@@ -544,10 +595,10 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
     if (next) onSettings({ model: next.model, effort: next.defaultReasoningEffort });
   };
 
-  return <article className={`control-card ${running ? "running" : ""}`}>
+  return <article className={`control-card ${running ? "running" : ""} ${completed && !running ? "completed" : ""}`}>
     <header>
       <button className="control-title" onClick={onOpen}><span className={`status-dot ${running ? "active" : thread.status.type}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
-      <div className="control-card-actions">{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
+      <div className="control-card-actions">{completed && !running && <span className="done-label">Done</span>}{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
     </header>
     <div className="control-feed" ref={body}>
       {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><Bot size={21} /><span>{running ? "Agent is starting…" : "Waiting for a task"}</span></div>}
@@ -557,8 +608,9 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
     </div>
     <div className="control-models"><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{model?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></div>
     <form className="control-composer" onSubmit={send}>
-      <input value={text} onChange={(event) => setText(event.target.value)} disabled={Boolean(runningTurn)} placeholder={runningTurn ? "Agent is working…" : "Send a task…"} />
-      {runningTurn ? <button type="button" className="stop" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).then(onRefresh).catch(onError)} title="Stop"><CircleStop size={15} /></button> : <button disabled={!text.trim() || sending} title="Send">{sending ? <LoaderCircle className="spin" size={14} /> : <Send size={14} />}</button>}
+      <input value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? "Queue the next task…" : "Send a task…"} />
+      <button className={running ? "queue" : ""} disabled={!text.trim() || sending} title={running ? "Queue next task" : "Send"}>{sending ? <LoaderCircle className="spin" size={14} /> : running ? <ListPlus size={14} /> : <Send size={14} />}</button>
+      {runningTurn && <button type="button" className="stop" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).then(onRefresh).catch(onError)} title="Stop"><CircleStop size={15} /></button>}
     </form>
   </article>;
 }
@@ -577,8 +629,8 @@ function CompactItem({ item, liveOutput }: { item: ThreadItem; liveOutput?: stri
   return null;
 }
 
-function Chat({ thread, loading, liveText, liveToolOutput, liveItems, models, settings, onSettings, onRefresh, onError }: {
-  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; models: CodexModel[];
+function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, models, settings, onSettings, onRefresh, onError }: {
+  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; models: CodexModel[];
   settings: { model: string; effort: string }; onSettings: (value: { model: string; effort: string }) => void;
   onRefresh: () => Promise<void>; onError: (error: unknown) => void;
 }) {
@@ -587,21 +639,22 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, models, se
   const scroller = useRef<HTMLDivElement>(null);
   const selectedModel = models.find((model) => model.model === settings.model) || models[0];
   const runningTurn = [...thread.turns].reverse().find((turn) => turn.status === "inProgress");
+  const running = thread.status.type === "active" || Boolean(runningTurn);
   const historyIds = new Set(thread.turns.flatMap((turn) => turn.items).map((item) => item.id).filter(Boolean));
   const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
   const immediateItems = Object.values(liveItems).filter((item) =>
     (!item.id || !historyIds.has(item.id)) && !(item.type === "agentMessage" && item.id && liveText[item.id])
   );
 
-  useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText]);
+  useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput, liveItems]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!text.trim() || sending || runningTurn) return;
+    if (!text.trim() || sending) return;
     const outgoing = text.trim(); setText(""); setSending(true);
     try {
-      await api(`/api/threads/${thread.id}/messages`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
-      await onRefresh();
+      await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      if (!running) await onRefresh();
     } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
   };
 
@@ -621,16 +674,17 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, models, se
     </div>
 
     <div className="composer-zone">
+      {queue.length > 0 && <div className="queue-strip"><div><ListPlus size={14} /><strong>{queue.length} queued</strong><span>Runs automatically after the current turn</span></div><div>{queue.map((entry, index) => <div className="queue-entry" key={entry.id}><b>{index + 1}</b><span>{entry.text}</span><button onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={13} /></button></div>)}</div></div>}
       <form className="composer" onSubmit={submit}>
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={runningTurn ? "This session is currently working…" : "Give Codex a task…"}
-          disabled={Boolean(runningTurn)} rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? "Queue the next task while Codex works…" : "Give Codex a task…"}
+          rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
         <div className="composer-footer">
           <div className="model-controls">
             <label><Bot size={14} /><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
             <label><BrainCircuit size={14} /><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></label>
           </div>
-          {runningTurn ? <button type="button" className="stop-button" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).catch(onError)}><CircleStop size={16} /> Stop</button>
-            : <button className="send-button" disabled={!text.trim() || sending}>{sending ? <LoaderCircle className="spin" size={17} /> : <Send size={16} />}<span>Send</span></button>}
+          <div className="composer-actions">{runningTurn && <button type="button" className="stop-button" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).catch(onError)}><CircleStop size={16} /> Stop</button>}
+            <button className={`send-button ${running ? "queue" : ""}`} disabled={!text.trim() || sending}>{sending ? <LoaderCircle className="spin" size={17} /> : running ? <ListPlus size={16} /> : <Send size={16} />}<span>{running ? "Queue" : "Send"}</span></button></div>
         </div>
       </form>
       <p className="persistence-note"><Server size={12} />Safe to close this tab — work continues on the host.</p>
@@ -783,6 +837,18 @@ function relativeReset(timestamp: number): string {
   return days ? `in ${days}d ${hours}h` : `in ${hours}h`;
 }
 function showError(error: unknown, setter: (value: string) => void) { setter(error instanceof Error ? error.message : String(error)); }
+function mergeLiveState<T>(current: Record<string, Record<string, T>>, state: Record<string, LiveThreadState>, key: "items" | "agentText" | "toolOutput"): Record<string, Record<string, T>> {
+  const next = { ...current };
+  for (const [threadId, value] of Object.entries(state)) {
+    next[threadId] = { ...(next[threadId] || {}), ...(value[key] as Record<string, T>) };
+  }
+  return next;
+}
+function withoutSetValue<T>(values: Set<T>, value: T): Set<T> {
+  const next = new Set(values);
+  next.delete(value);
+  return next;
+}
 function useControlColumns(): number {
   const getColumns = () => window.innerWidth >= 1700 ? 4 : window.innerWidth >= 1150 ? 3 : window.innerWidth >= 680 ? 2 : 1;
   const [columns, setColumns] = useState(getColumns);

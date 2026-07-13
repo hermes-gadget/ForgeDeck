@@ -25,6 +25,9 @@
 html, body, #root { height: 100%; margin: 0; }
 body { overflow: hidden; background: var(--bg); }
 button, input, select, textarea { font: inherit; }
+select { background-color: #11151b; color: #c8ced6; }
+select option { background-color: #11151b; color: #d8dde3; }
+select option:checked { background-color: #2a211d; color: #ffd9c7; }
 button { color: inherit; }
 button, select { cursor: pointer; }
 button:disabled, select:disabled { cursor: not-allowed; opacity: .48; }
@@ -89,6 +92,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .session-card:hover { background: #11151b; }
 .session-card.selected { background: linear-gradient(90deg, rgba(255, 107, 44, .11), rgba(255, 107, 44, .025)); border-color: rgba(255, 107, 44, .18); }
 .session-card.selected::before { content: ""; width: 2px; height: 29px; border-radius: 2px; background: var(--orange); position: absolute; left: -1px; box-shadow: 0 0 10px rgba(255, 107, 44, .6); }
+.session-card.completed:not(.selected) { border-color: rgba(255, 107, 44, .35); background: rgba(255, 107, 44, .045); animation: completedSidebar 3s ease-in-out infinite; }
 .status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #4a525e; }
 .status-dot.active { background: var(--green); box-shadow: 0 0 8px rgba(86, 212, 155, .5); }
 .status-dot.systemError { background: #f05c67; }
@@ -145,9 +149,10 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-toolbar-actions { display: flex; align-items: center; gap: 6px; }
 .add-panel { height: 30px; border: 1px solid var(--line); border-radius: 6px; background: #10141a; display: flex; align-items: center; gap: 5px; padding-left: 8px; color: #7a8490; }
 .add-panel select { max-width: 150px; border: 0; outline: 0; background: transparent; color: #9ca5af; font-size: 9px; padding-right: 5px; }
-.control-grid { flex: 1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: minmax(320px, calc((100vh - 157px) / 2)); gap: 11px; align-content: start; }
+.control-grid { flex: 1; display: grid; grid-template-columns: repeat(var(--control-columns, 4), minmax(0, 1fr)); grid-auto-rows: minmax(320px, calc((100vh - 157px) / 2)); gap: 11px; align-content: start; }
 .control-card { min-width: 0; min-height: 320px; border: 1px solid #252b34; border-radius: 10px; background: linear-gradient(160deg, #10141a, #0c0f14 68%); display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.16); }
 .control-card.running { border-color: rgba(86, 212, 155, .27); box-shadow: inset 0 1px rgba(86, 212, 155, .04), 0 10px 32px rgba(0,0,0,.2); }
+.control-card.completed:not(.running) { border-color: rgba(255, 107, 44, .65); animation: completedGlow 2.8s ease-in-out infinite; }
 .control-card > header { flex: 0 0 49px; border-bottom: 1px solid var(--line-soft); background: rgba(255,255,255,.012); display: flex; align-items: center; justify-content: space-between; gap: 5px; padding: 6px 7px 6px 10px; }
 .control-title { flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; display: flex; align-items: center; gap: 8px; text-align: left; }
 .control-title > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -157,6 +162,8 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-card-actions button { width: 25px; height: 25px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #59626e; display: grid; place-items: center; }
 .control-card-actions button:hover { background: #1a1f26; color: #aab2bc; }
 .tool-count { height: 20px; padding: 0 5px; margin-right: 2px; border-radius: 5px; background: #181d24; color: #68727f; display: flex; align-items: center; gap: 3px; font-size: 8px; }
+.queue-count { height: 20px; padding: 0 5px; margin-right: 2px; border-radius: 5px; background: rgba(110, 157, 255, .09); color: #85aaff; display: flex; align-items: center; gap: 3px; font-size: 8px; }
+.done-label { height: 20px; padding: 0 6px; border: 1px solid rgba(255, 107, 44, .3); border-radius: 5px; background: rgba(255, 107, 44, .1); color: var(--orange-2); display: flex; align-items: center; font-size: 7px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; }
 .control-feed { flex: 1; min-height: 0; overflow-y: auto; padding: 9px; display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth; }
 .control-waiting { flex: 1; min-height: 110px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #505a66; font-size: 9px; }
 .control-waiting svg { color: #6a554b; }
@@ -193,6 +200,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-composer input:focus { border-color: #424b57; }
 .control-composer input::placeholder { color: #4e5763; }
 .control-composer button { flex: 0 0 29px; border: 1px solid #bc4f23; border-radius: 6px; background: #d95a27; color: white; display: grid; place-items: center; padding: 0; }
+.control-composer button.queue { border-color: #385a88; background: #29496f; color: #b8d2ff; }
 .control-composer button.stop { border-color: #593036; background: #211316; color: #ed7d85; }
 .control-pages { min-height: 36px; padding-top: 8px; display: flex; align-items: center; justify-content: center; gap: 15px; }
 .control-pages span { color: #5b6571; font-size: 8.5px; }
@@ -254,13 +262,26 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .composer textarea { width: 100%; min-height: 73px; max-height: 180px; resize: none; background: none; border: 0; outline: 0; color: var(--text); padding: 14px 15px 6px; font-size: 12.5px; line-height: 1.55; }
 .composer textarea::placeholder { color: #525b68; }
 .composer-footer { min-height: 42px; padding: 5px 7px 7px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.composer-actions { display: flex; align-items: center; gap: 6px; }
 .model-controls { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .model-controls label { min-width: 0; height: 28px; border: 1px solid #242a33; background: #0d1015; border-radius: 6px; display: flex; align-items: center; gap: 5px; padding-left: 7px; color: #6d7682; }
 .model-controls select { min-width: 0; max-width: 190px; border: 0; outline: 0; background: transparent; color: #929ba7; font-size: 9.5px; padding-right: 4px; }
 .send-button, .stop-button { height: 31px; min-width: 72px; border: 1px solid #d65622; border-radius: 7px; background: linear-gradient(180deg, #ff7437, #df5420); display: flex; align-items: center; justify-content: center; gap: 7px; font-size: 10px; font-weight: 600; color: white; }
 .send-button:hover { filter: brightness(1.08); }
+.send-button.queue { border-color: #42658f; background: linear-gradient(180deg, #365d8b, #29496f); color: #d6e5ff; }
 .stop-button { background: rgba(215, 66, 76, .11); border-color: rgba(215, 66, 76, .32); color: #ff8990; }
 .persistence-note { display: flex; align-items: center; justify-content: center; gap: 6px; color: #4d5662; font-size: 8.5px; margin: 7px 0 0; letter-spacing: .2px; }
+.queue-strip { margin-bottom: 7px; border: 1px solid #28384d; border-radius: 8px; background: rgba(58, 94, 140, .075); overflow: hidden; }
+.queue-strip > div:first-child { min-height: 31px; padding: 6px 9px; display: flex; align-items: center; gap: 7px; color: #8eb2e8; font-size: 9px; }
+.queue-strip > div:first-child strong { font-size: 9px; }
+.queue-strip > div:first-child span { color: #5e7391; }
+.queue-strip > div:last-child { max-height: 100px; overflow-y: auto; border-top: 1px solid #223044; }
+.queue-entry { min-height: 28px; padding: 4px 6px 4px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid rgba(40, 56, 77, .55); color: #8f9fb3; font-size: 8.5px; }
+.queue-entry:last-child { border-bottom: 0; }
+.queue-entry b { width: 16px; height: 16px; display: grid; place-items: center; border-radius: 4px; background: #1e3047; color: #8bb3e9; font-size: 7px; }
+.queue-entry span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.queue-entry button { width: 23px; height: 23px; border: 0; border-radius: 4px; background: transparent; color: #61738a; display: grid; place-items: center; }
+.queue-entry button:hover { background: #1b2b40; color: #b5c9e4; }
 
 .welcome { flex: 1; overflow-y: auto; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 45px 25px; background-image: linear-gradient(rgba(255,255,255,.014) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.014) 1px, transparent 1px); background-size: 42px 42px; mask-image: radial-gradient(circle, black 30%, transparent 75%); }
 .welcome-mark { padding: 20px; margin-bottom: 20px; }
@@ -358,13 +379,15 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes dot { 0%, 70%, 100% { opacity: .2; transform: translateY(1px); } 35% { opacity: 1; transform: translateY(-1px); } }
 @keyframes livePulse { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
+@keyframes completedGlow { 0%, 100% { box-shadow: 0 10px 30px rgba(0,0,0,.16), 0 0 0 rgba(255,107,44,0); } 50% { box-shadow: 0 10px 30px rgba(0,0,0,.2), 0 0 18px rgba(255,107,44,.18); } }
+@keyframes completedSidebar { 0%, 100% { box-shadow: inset 0 0 0 rgba(255,107,44,0); } 50% { box-shadow: inset 0 0 12px rgba(255,107,44,.08); } }
 
 @media (max-width: 1699px) {
-  .control-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .control-grid { grid-template-columns: repeat(var(--control-columns, 3), minmax(0, 1fr)); }
 }
 
 @media (max-width: 1149px) {
-  .control-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .control-grid { grid-template-columns: repeat(var(--control-columns, 2), minmax(0, 1fr)); }
 }
 
 @media (max-width: 850px) {
@@ -381,7 +404,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 }
 
 @media (max-width: 679px) {
-  .control-grid { grid-template-columns: 1fr; grid-auto-rows: minmax(350px, calc(100vh - 160px)); }
+  .control-grid { grid-template-columns: repeat(var(--control-columns, 1), minmax(0, 1fr)); grid-auto-rows: minmax(350px, calc(100vh - 160px)); }
   .control-toolbar p { display: none; }
   .control-pages { justify-content: space-between; }
 }
