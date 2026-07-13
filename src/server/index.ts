@@ -7,6 +7,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { AuthManager } from "./auth.js";
 import { CodexBridge, type ServerRequest } from "./codex-bridge.js";
 import { ExternalCodexMonitor } from "./external-monitor.js";
+import { McpAccessManager } from "./mcp-access.js";
 import { PathError, WorkspacePaths } from "./paths.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +17,7 @@ const distDir = path.join(projectRoot, "dist");
 const host = process.env.FORGEDECK_HOST || "0.0.0.0";
 const port = parsePort(process.env.FORGEDECK_PORT || "4173");
 const auth = new AuthManager(dataDir);
+const mcpAccess = new McpAccessManager(dataDir);
 const workspaces = await WorkspacePaths.create();
 const codex = new CodexBridge();
 const app = express();
@@ -30,6 +32,8 @@ const activeThreads = new Set<string>();
 const activeTurnIds = new Map<string, string>();
 const drainingQueues = new Set<string>();
 const bridgeOwnedThreads = new Set<string>();
+const capacityBuffers = new Map<string, string>();
+const capacityHandledThreads = new Set<string>();
 type LiveThreadState = {
   items: Record<string, Record<string, unknown>>;
   agentText: Record<string, string>;
@@ -57,7 +61,23 @@ app.post("/api/login", (req, res) => {
   res.json({ ok: true });
 });
 
-app.use("/api", auth.requireAuth);
+app.post("/api/mcp/actors", mcpAccess.requireBootstrap, (_req, res) => {
+  res.status(201).json(mcpAccess.registerActor());
+});
+
+app.use("/api", (req, res, next) => {
+  const actorId = mcpAccess.authenticateActor(req);
+  if (!actorId) {
+    auth.requireAuth(req, res, next);
+    return;
+  }
+  res.locals.mcpActorId = actorId;
+  if (!mcpRequestAllowed(req, actorId)) {
+    res.status(403).json({ error: "MCP agents have read-only access to user-created sessions" });
+    return;
+  }
+  next();
+});
 app.use("/events", auth.requireAuth);
 app.use((req, res, next) => {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
@@ -76,6 +96,11 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get("/api/mcp/owned-threads", (_req, res) => {
+  const actorId = typeof res.locals.mcpActorId === "string" ? res.locals.mcpActorId : "";
+  res.json({ data: mcpAccess.listOwnedThreads(actorId) });
+});
+
 app.post("/api/logout", (req, res) => {
   auth.logout(req, res);
   res.json({ ok: true });
@@ -88,7 +113,7 @@ app.get("/api/bootstrap", async (_req, res, next) => {
       codex.request("account/read", { refreshToken: false }).catch(() => ({ account: null, requiresOpenaiAuth: true })),
       codex.request("account/rateLimits/read").catch(() => null)
     ]);
-    res.json({ models, account, usage, roots: workspaces.roots, pendingRequests: codex.listServerRequests(), liveState: Object.fromEntries(liveThreadStates), queues: Object.fromEntries(messageQueues), activeThreadIds: [...activeThreads] });
+    res.json({ models, account, usage, roots: workspaces.roots, pendingRequests: codex.listServerRequests(), liveState: Object.fromEntries(liveThreadStates), queues: Object.fromEntries(messageQueues), activeThreadIds: [...activeThreads], agentThreadIds: mcpAccess.listAgentThreads() });
   } catch (error) {
     next(error);
   }
@@ -123,7 +148,23 @@ app.get("/api/threads", async (req, res, next) => {
       searchTerm: stringQuery(req, "search") || undefined,
       archived: false
     };
-    res.json(await codex.request("thread/list", params));
+    const result = await codex.request<{ data: Array<Record<string, unknown>>; nextCursor: string | null }>("thread/list", params);
+    if (!params.cursor) {
+      const listed = new Set(result.data.map((thread) => String(thread.id || "")));
+      const missingIds = mcpAccess.listAgentThreads().filter((threadId) => !listed.has(threadId));
+      const missing = await Promise.allSettled(missingIds.map((threadId) =>
+        codex.request<{ thread: Record<string, unknown> }>("thread/read", { threadId, includeTurns: false }, 60_000)
+      ));
+      const search = params.searchTerm?.toLowerCase();
+      for (const snapshot of missing) {
+        if (snapshot.status !== "fulfilled") continue;
+        const thread = snapshot.value.thread;
+        const searchable = `${thread.name || ""} ${thread.preview || ""} ${thread.cwd || ""}`.toLowerCase();
+        if (!search || searchable.includes(search)) result.data.push(thread);
+      }
+      result.data.sort((left, right) => compareThreadListEntries(left, right, params.sortKey, params.sortDirection));
+    }
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -147,10 +188,13 @@ app.post("/api/threads", async (req, res, next) => {
       serviceName: "ForgeDeck"
     });
     const threadId = result.thread.id;
+    const mcpActorId = typeof res.locals.mcpActorId === "string" ? res.locals.mcpActorId : null;
+    if (mcpActorId) mcpAccess.assignThread(threadId, mcpActorId);
     threadPolicies.set(threadId, yolo ? "yolo" : "workspace-write");
     persistThreadPolicies();
     const name = optionalString(req.body?.name);
     if (name) await codex.request("thread/name/set", { threadId, name: name.slice(0, 100) });
+    broadcast("threads", { action: "created", threadId });
     const prompt = optionalString(req.body?.prompt);
     if (prompt) {
       bridgeOwnedThreads.add(threadId);
@@ -208,14 +252,18 @@ app.post("/api/threads/:threadId/command", async (req, res, next) => {
     }
     if (command === "rename") {
       if (!args) throw httpError("Use /rename followed by a session name", 400);
-      res.json(await codex.request("thread/name/set", { threadId, name: args.slice(0, 100) }));
+      const result = await codex.request("thread/name/set", { threadId, name: args.slice(0, 100) });
+      broadcast("threads", { action: "updated", threadId });
+      res.json(result);
       return;
     }
     if (command === "archive") {
       const result = await codex.request("thread/archive", { threadId });
       if (messageQueues.delete(threadId)) persistMessageQueues();
       if (threadPolicies.delete(threadId)) persistThreadPolicies();
+      mcpAccess.releaseThread(threadId);
       broadcastQueue(threadId);
+      broadcast("threads", { action: "removed", threadId });
       res.json(result);
       return;
     }
@@ -319,7 +367,9 @@ app.patch("/api/threads/:threadId", async (req, res, next) => {
   try {
     const threadId = validThreadId(req.params.threadId);
     const name = requiredString(req.body?.name, "Name").slice(0, 100);
-    res.json(await codex.request("thread/name/set", { threadId, name }));
+    const result = await codex.request("thread/name/set", { threadId, name });
+    broadcast("threads", { action: "updated", threadId });
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -331,7 +381,9 @@ app.delete("/api/threads/:threadId", async (req, res, next) => {
     const result = await codex.request("thread/archive", { threadId });
     if (messageQueues.delete(threadId)) persistMessageQueues();
     if (threadPolicies.delete(threadId)) persistThreadPolicies();
+    mcpAccess.releaseThread(threadId);
     broadcastQueue(threadId);
+    broadcast("threads", { action: "removed", threadId });
     res.json(result);
   } catch (error) {
     next(error);
@@ -374,6 +426,7 @@ codex.on("notification", (payload) => {
     const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
     if (threadId) bridgeOwnedThreads.add(threadId);
   }
+  resumeGoalAfterCapacity(notification);
   recordLiveEvent(notification);
   broadcast("codex", payload);
   if (notification.method === "turn/completed") {
@@ -411,9 +464,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 await codex.start();
-const externalMonitor = new ExternalCodexMonitor((notification) => {
+const externalMonitor = new ExternalCodexMonitor((notification, historical) => {
   const threadId = typeof notification.params.threadId === "string" ? notification.params.threadId : null;
   if (threadId && bridgeOwnedThreads.has(threadId)) return;
+  if (!historical) resumeGoalAfterCapacity(notification);
   recordLiveEvent(notification);
   broadcast("codex", notification);
 });
@@ -425,6 +479,7 @@ const server = app.listen(port, host, () => {
   for (const address of addresses) console.log(`  ${address}`);
   if (!auth.enabled) console.log("\n  Authentication: disabled by FORGEDECK_AUTH=off");
   else if (auth.generatedTokenPath) console.log(`\n  Access key file: ${auth.generatedTokenPath}`);
+  console.log(`  MCP bootstrap token: ${mcpAccess.bootstrapTokenPath}`);
   console.log("\n  Closing a browser will not stop active Codex turns.\n");
 });
 
@@ -627,6 +682,35 @@ function recordLiveEvent(notification: { method: string; params?: Record<string,
   liveThreadStates.set(threadId, state);
 }
 
+function resumeGoalAfterCapacity(notification: { method: string; params?: Record<string, unknown> }): void {
+  const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
+  if (!threadId) return;
+  if (notification.method === "turn/started") {
+    capacityBuffers.delete(threadId);
+    capacityHandledThreads.delete(threadId);
+  }
+  if (capacityHandledThreads.has(threadId)) return;
+  const strings = collectStrings(notification).join(" ");
+  const previous = capacityBuffers.get(threadId) || "";
+  const combined = `${previous} ${strings}`.slice(-1_000);
+  capacityBuffers.set(threadId, combined);
+  if (!combined.toLowerCase().includes("selected model is at capacity. please try a different model.")) return;
+  capacityHandledThreads.add(threadId);
+  capacityBuffers.delete(threadId);
+  void codex.request("thread/goal/set", { threadId, status: "active" }).then(() => {
+    console.log(`[ForgeDeck] Resumed goal for ${threadId} after the selected model reported capacity`);
+  }).catch((error) => {
+    console.error(`[ForgeDeck] Could not resume goal for ${threadId} after a model-capacity error:`, error);
+  });
+}
+
+function collectStrings(value: unknown, depth = 0): string[] {
+  if (typeof value === "string") return [value];
+  if (!value || typeof value !== "object" || depth >= 6) return [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectStrings(item, depth + 1));
+  return Object.values(value as Record<string, unknown>).flatMap((item) => collectStrings(item, depth + 1));
+}
+
 function trimRecord<T>(record: Record<string, T>, maxEntries: number): void {
   const keys = Object.keys(record);
   for (const key of keys.slice(0, Math.max(0, keys.length - maxEntries))) delete record[key];
@@ -653,6 +737,13 @@ function requiredString(value: unknown, label: string): string {
   return value.trim();
 }
 
+function mcpRequestAllowed(req: Request, actorId: string): boolean {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return true;
+  if (req.method === "POST" && req.path === "/threads") return true;
+  const match = /^\/threads\/([a-zA-Z0-9_-]{8,128})(?:\/|$)/.exec(req.path);
+  return match ? mcpAccess.ownsThread(actorId, match[1]) : false;
+}
+
 function optionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -675,6 +766,13 @@ function numberQuery(req: Request, name: string, fallback: number, min: number, 
 function enumQuery<T extends string>(req: Request, name: string, values: readonly T[], fallback: T): T {
   const value = req.query[name];
   return typeof value === "string" && values.includes(value as T) ? value as T : fallback;
+}
+
+function compareThreadListEntries(left: Record<string, unknown>, right: Record<string, unknown>, sortKey: "created_at" | "updated_at", direction: "asc" | "desc"): number {
+  const key = sortKey === "created_at" ? "createdAt" : "updatedAt";
+  const leftValue = Number(left[key] || 0);
+  const rightValue = Number(right[key] || 0);
+  return (leftValue - rightValue) * (direction === "asc" ? 1 : -1);
 }
 
 function httpError(message: string, status: number): Error & { status: number } {

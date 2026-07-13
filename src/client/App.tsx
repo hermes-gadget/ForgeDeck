@@ -68,6 +68,9 @@ export default function App() {
     setPending(data.pendingRequests);
     setQueues(data.queues || {});
     setActiveThreadIds(new Set(data.activeThreadIds || []));
+    if (data.agentThreadIds?.length) {
+      setControlIds((current) => [...current, ...data.agentThreadIds!.filter((threadId) => !current.includes(threadId))]);
+    }
     if (data.activeThreadIds?.length) {
       setLiveStatuses((current) => Object.fromEntries([
         ...Object.entries(current),
@@ -102,7 +105,7 @@ export default function App() {
       cursor = response.nextCursor;
     } while (cursor);
     setThreads(collected);
-    setSelectedId((current) => current || collected[0]?.id || null);
+    setSelectedId((current) => current && collected.some((thread) => thread.id === current) ? current : collected[0]?.id || null);
   }, [search]);
 
   const loadThread = useCallback(async (id: string, quiet = false) => {
@@ -180,6 +183,16 @@ export default function App() {
       const payload = JSON.parse((event as MessageEvent).data) as { threadId: string; queue: QueueEntry[]; error?: string | null };
       setQueues((current) => ({ ...current, [payload.threadId]: payload.queue }));
       if (payload.error) setToast(`Queued turn could not start: ${payload.error}`);
+    });
+    events.addEventListener("threads", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { action: "created" | "updated" | "removed"; threadId: string };
+      if (payload.action === "created") {
+        setControlIds((current) => current.includes(payload.threadId) ? current : [...current, payload.threadId]);
+      }
+      if (payload.action === "removed") {
+        setControlIds((current) => current.filter((threadId) => threadId !== payload.threadId));
+      }
+      void loadThreads().catch(() => undefined);
     });
     events.addEventListener("codex", (event) => {
       const notification = JSON.parse((event as MessageEvent).data) as { method: string; params: Record<string, unknown> };

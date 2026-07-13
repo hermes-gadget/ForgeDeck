@@ -108,4 +108,5 @@ export type Bootstrap = {
   liveState?: Record<string, LiveThreadState>;
   queues?: Record<string, QueueEntry[]>;
   activeThreadIds?: string[];
+  agentThreadIds?: string[];
 };

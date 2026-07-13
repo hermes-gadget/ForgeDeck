@@ -15,6 +15,8 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Live response streaming, command/file approval prompts, user questions, and stop controls
 - Desktop-first Control Center with fixed card positions, full-height adaptive 4/3/2/1-column layouts, and at most two rows per page
 - Real-time agent messages, command executions and output, file changes, MCP calls, dynamic tools, and resilient polling fallback
+- A local MCP server that lets other AI agents spawn user-visible Codex sessions with a chosen workspace, model, reasoning effort, and YOLO policy
+- Per-MCP-client ownership controls: agents may inspect all sessions but can message, stop, change, or remove only sessions they spawned themselves
 - Server-retained live activity that restores running tool calls after a browser reconnect or refresh
 - Read-only monitoring of other local Codex processes, including their active state and command/tool records
 - Restored external-session user/assistant conversation history and colored unified file diffs
@@ -23,6 +25,7 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Pulsing orange completion indicators that remain until the finished session is opened
 - Search, pin, rename, archive, and sorting for large session collections
 - Responsive desktop/mobile UI
+- Automatic `/goal resume` recovery when Codex reports that the selected model is at capacity
 
 ## Run it
 
@@ -68,12 +71,30 @@ The installer creates separate `forgedeck.service` and `forgedeck-codex.service`
 | `FORGEDECK_PASSWORD` | generated token | ForgeDeck login password |
 | `FORGEDECK_ROOTS` | current home directory | Colon-separated selectable workspace roots |
 | `CODEX_BIN` | `codex` on `PATH` | Codex executable path |
+| `FORGEDECK_URL` | `http://127.0.0.1:4173` | Dashboard API URL used by the stdio MCP server |
+| `FORGEDECK_MCP_TOKEN_FILE` | `.data/mcp-token` | MCP bootstrap token path for nonstandard installations |
 
 The production start command and included systemd service automatically load `.env` when it exists.
+
+## MCP server for AI-orchestrated sessions
+
+ForgeDeck includes a local stdio MCP server. It exposes tools to browse allowed workspaces and model options, spawn sessions, inspect their progress, queue follow-up messages, stop them, toggle YOLO mode while idle, and remove them after completion. Every spawned session is a normal card in the same user-visible Control Center.
+
+Build ForgeDeck, then register the server with Codex using an absolute path:
+
+```bash
+npm run build
+codex mcp add forgedeck -- node /absolute/path/to/forgedeck/build/server/mcp.js
+```
+
+For another MCP client, configure an stdio server with `node` as the command and `/absolute/path/to/forgedeck/build/server/mcp.js` as its argument. The dashboard must be running. Set `FORGEDECK_URL` only when it does not use the default `http://127.0.0.1:4173`; the MCP bootstrap credential is read from `.data/mcp-token` by default.
+
+Each MCP subprocess registers a separate actor credential. The ForgeDeck server records which sessions that actor created and enforces the boundary on every mutation. MCP callers have read-only access to user-created and other agents' sessions, while the user keeps normal Control Center access to everything. Ownership records survive dashboard restarts.
 
 ## Security notes
 
 - Keep `.data/`, `.env`, and `~/.codex/` out of version control. The supplied `.gitignore` already covers ForgeDeck's local secrets and build output.
+- Keep `.data/mcp-token` private. It is used only to mint isolated MCP actor credentials and is never sent to the browser.
 - `FORGEDECK_AUTH=off` gives every device that can reach the service full control of Codex. Use it only on a trusted, firewalled LAN.
 - ForgeDeck uses plain HTTP so phones and tablets can connect easily on the private LAN. Do not port-forward it to the internet or use it on an untrusted network. For remote access, put it behind a private VPN such as Tailscale or a TLS reverse proxy.
 - Workspace sessions use Codex's `workspace-write` sandbox and request approval for elevated commands. ForgeDeck restricts each thread's runtime workspace root to the selected directory.

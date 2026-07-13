@@ -24,7 +24,7 @@ export class ExternalCodexMonitor {
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
 
-  constructor(private readonly emit: (notification: Notification) => void, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
+  constructor(private readonly emit: (notification: Notification, historical?: boolean) => void, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
     this.db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
   }
 
@@ -90,9 +90,9 @@ export class ExternalCodexMonitor {
     for (const line of chunks) this.processLine(tracker, line, !initial);
 
     if (initial) {
-      this.emitStatus(tracker);
+      this.emitStatus(tracker, true);
       for (const item of tracker.recent.slice(-192)) {
-        this.emit({ method: item.status === "inProgress" ? "item/started" : "item/completed", params: { threadId: tracker.id, turnId: "external", item } });
+        this.emit({ method: item.status === "inProgress" ? "item/started" : "item/completed", params: { threadId: tracker.id, turnId: "external", item } }, true);
       }
     }
   }
@@ -199,8 +199,8 @@ export class ExternalCodexMonitor {
     }
   }
 
-  private emitStatus(tracker: Tracker): void {
-    this.emit({ method: "thread/status/changed", params: { threadId: tracker.id, status: tracker.active ? { type: "active", activeFlags: [] } : { type: "idle" } } });
+  private emitStatus(tracker: Tracker, historical = false): void {
+    this.emit({ method: "thread/status/changed", params: { threadId: tracker.id, status: tracker.active ? { type: "active", activeFlags: [] } : { type: "idle" } } }, historical);
   }
 }
 
