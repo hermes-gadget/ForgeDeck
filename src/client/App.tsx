@@ -580,7 +580,8 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
 
     {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-rows": visibleRows } as React.CSSProperties}>
       {pageThreads.map((summary) => {
-        const thread = details[summary.id] || summary;
+        const snapshot = details[summary.id];
+        const thread = snapshot ? { ...snapshot, status: summary.status } : summary;
         const threadSettings = settings[thread.id] || (defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" });
         return <ControlCard key={thread.id} thread={thread} models={models} settings={threadSettings}
           liveText={liveText[thread.id] || {}} liveToolOutput={liveToolOutput[thread.id] || {}} liveItems={liveItems[thread.id] || {}} queue={queues[thread.id] || []} completed={completedSignals.has(thread.id)}
@@ -607,9 +608,10 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
   const historyItems = (thread.turns || []).flatMap((turn) => turn.items);
   const historyIds = new Set(historyItems.map((item) => item.id).filter(Boolean));
   const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
-  const items = [...historyItems, ...unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
+  const allItems = [...historyItems, ...unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
     !(item.type === "agentMessage" && item.id && liveText[item.id])
-  )].slice(-8);
+  )];
+  const items = selectControlItems(allItems, 12);
   const toolCount = items.filter((item) => isToolItem(item)).length;
   const running = thread.status.type === "active" || Boolean(runningTurn);
 
@@ -669,7 +671,7 @@ function CompactItem({ item, liveOutput }: { item: ThreadItem; liveOutput?: stri
   if (item.type === "reasoning") return <details className="compact-reasoning"><summary><BrainCircuit size={12} />Reasoning</summary><p>{item.summary?.join("\n")}</p></details>;
   if (item.type === "plan") return <div className="compact-tool plan"><LayoutGrid size={13} /><span><strong>Plan updated</strong><small>{truncate(item.text || "", 140)}</small></span></div>;
   if (item.type === "commandExecution") return <details className={`compact-tool ${item.status || ""}`} {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={13} /><span><strong>Command</strong><small>{item.command}</small></span><em>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`}><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><DiffView changes={item.changes || []} compact /></details>;
+  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`} open><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><DiffView changes={item.changes || []} compact /></details>;
   if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : "Codex tool"}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
   return null;
 }
@@ -808,7 +810,7 @@ function ItemView({ item, liveOutput }: { item: ThreadItem; liveOutput?: string 
   if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
   if (item.type === "reasoning") return <details className="reasoning-item"><summary><BrainCircuit size={15} />Reasoning <ChevronRight size={14} /></summary><div>{item.summary?.map((part, index) => <ReactMarkdown key={index}>{part}</ReactMarkdown>)}</div></details>;
   if (item.type === "commandExecution") return <details className="tool-item" {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className="tool-item"><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><DiffView changes={item.changes || []} /></details>;
+  if (item.type === "fileChange") return <details className="tool-item" open><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><DiffView changes={item.changes || []} /></details>;
   if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || "Codex tool"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
   if (item.type === "plan") return <div className="plan-item"><LayoutGrid size={15} /><ReactMarkdown>{item.text || ""}</ReactMarkdown></div>;
   if (["contextCompaction", "enteredReviewMode", "exitedReviewMode"].includes(item.type)) return null;
@@ -1101,4 +1103,17 @@ function unseenLiveItems(history: ThreadItem[], live: ThreadItem[]): ThreadItem[
     }
     return true;
   });
+}
+
+function selectControlItems(items: ThreadItem[], limit: number): ThreadItem[] {
+  const selected = new Set<number>();
+  for (let index = Math.max(0, items.length - limit); index < items.length; index += 1) selected.add(index);
+  let retainedChanges = 0;
+  for (let index = items.length - 1; index >= 0 && retainedChanges < 2; index -= 1) {
+    if (items[index].type === "fileChange") {
+      selected.add(index);
+      retainedChanges += 1;
+    }
+  }
+  return [...selected].sort((a, b) => a - b).map((index) => items[index]);
 }
