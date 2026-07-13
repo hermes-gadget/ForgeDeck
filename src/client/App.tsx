@@ -10,7 +10,10 @@ import {
 import type { Bootstrap, CodexModel, PendingRequest, Thread, ThreadItem, Usage } from "./types";
 
 type SortMode = "updated" | "created" | "name" | "directory" | "status";
+type ViewMode = "session" | "control";
 type ThreadSettings = Record<string, { model: string; effort: string }>;
+type LiveStreams = Record<string, Record<string, string>>;
+type LiveItems = Record<string, Record<string, ThreadItem>>;
 
 const EFFORT_LABELS: Record<string, string> = {
   none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
@@ -28,10 +31,15 @@ export default function App() {
   const [sortMode, setSortMode] = useState<SortMode>(() => localStorage.getItem("forgedeck-sort") as SortMode || "updated");
   const [pinned, setPinned] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem("forgedeck-pins") || "[]")));
   const [settings, setSettings] = useState<ThreadSettings>(() => JSON.parse(localStorage.getItem("forgedeck-settings") || "{}"));
+  const [view, setView] = useState<ViewMode>(() => localStorage.getItem("forgedeck-view") === "control" ? "control" : "session");
+  const [controlIds, setControlIds] = useState<string[]>(() => JSON.parse(localStorage.getItem("forgedeck-control-ids") || "[]"));
   const [newOpen, setNewOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [pending, setPending] = useState<PendingRequest[]>([]);
-  const [liveText, setLiveText] = useState<Record<string, string>>({});
+  const [liveText, setLiveText] = useState<LiveStreams>({});
+  const [liveToolOutput, setLiveToolOutput] = useState<LiveStreams>({});
+  const [liveItems, setLiveItems] = useState<LiveItems>({});
+  const [activityVersion, setActivityVersion] = useState(0);
   const [runtime, setRuntime] = useState<"ready" | "offline" | "error">("ready");
   const [toast, setToast] = useState<string | null>(null);
   const selectedRef = useRef(selectedId);
@@ -95,6 +103,20 @@ export default function App() {
     void loadThread(selectedId).catch((error) => showError(error, setToast));
   }, [selectedId, loadThread]);
 
+  // SSE is the fast path; these lightweight polls are a resilience fallback for
+  // browsers, proxies, or sleeping devices that temporarily drop the event stream.
+  useEffect(() => {
+    if (!authenticated) return;
+    const timer = window.setInterval(() => void loadThreads().catch(() => undefined), 4_000);
+    return () => clearInterval(timer);
+  }, [authenticated, loadThreads]);
+
+  useEffect(() => {
+    if (!authenticated || view !== "session" || !selectedId) return;
+    const timer = window.setInterval(() => void loadThread(selectedId, true).catch(() => undefined), 1_500);
+    return () => clearInterval(timer);
+  }, [authenticated, view, selectedId, loadThread]);
+
   useEffect(() => {
     if (!authenticated) return;
     const events = new EventSource("/events");
@@ -117,10 +139,30 @@ export default function App() {
     events.addEventListener("codex", (event) => {
       const notification = JSON.parse((event as MessageEvent).data) as { method: string; params: Record<string, unknown> };
       const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
-      if (notification.method === "item/agentMessage/delta" && threadId === selectedRef.current) {
+      if (notification.method === "item/agentMessage/delta" && threadId) {
         const itemId = String(notification.params.itemId);
         const delta = String(notification.params.delta || "");
-        setLiveText((current) => ({ ...current, [itemId]: (current[itemId] || "") + delta }));
+        setLiveText((current) => ({
+          ...current,
+          [threadId]: { ...(current[threadId] || {}), [itemId]: (current[threadId]?.[itemId] || "") + delta }
+        }));
+      }
+      if ((notification.method === "item/commandExecution/outputDelta" || notification.method === "command/exec/outputDelta") && threadId) {
+        const itemId = String(notification.params.itemId || notification.params.processId || "command");
+        const delta = String(notification.params.delta || "");
+        setLiveToolOutput((current) => ({
+          ...current,
+          [threadId]: { ...(current[threadId] || {}), [itemId]: (current[threadId]?.[itemId] || "") + delta }
+        }));
+      }
+      if ((notification.method === "item/started" || notification.method === "item/completed") && threadId && notification.params.item && typeof notification.params.item === "object") {
+        const item = notification.params.item as ThreadItem;
+        if (item.id) {
+          setLiveItems((current) => ({
+            ...current,
+            [threadId]: { ...(current[threadId] || {}), [item.id!]: item }
+          }));
+        }
       }
       if (notification.method === "account/rateLimits/updated") {
         void loadBootstrap().catch(() => undefined);
@@ -129,8 +171,17 @@ export default function App() {
         if (refreshTimer.current) clearTimeout(refreshTimer.current);
         refreshTimer.current = window.setTimeout(() => {
           if (selectedRef.current) void loadThread(selectedRef.current, true);
-          if (notification.method === "item/completed" || notification.method === "turn/completed") setLiveText({});
+          if (notification.method === "turn/completed") {
+            window.setTimeout(() => {
+              setLiveText((current) => omitKey(current, threadId!));
+              setLiveToolOutput((current) => omitKey(current, threadId!));
+              setLiveItems((current) => omitKey(current, threadId!));
+            }, 1_200);
+          }
         }, 300);
+      }
+      if (threadId && /^(item\/|turn\/|thread\/status)/.test(notification.method) && !notification.method.endsWith("/delta")) {
+        setActivityVersion((value) => value + 1);
       }
       if (/^(thread|turn)\//.test(notification.method)) {
         if (listTimer.current) clearTimeout(listTimer.current);
@@ -144,6 +195,14 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("forgedeck-pins", JSON.stringify([...pinned]));
   }, [pinned]);
+  useEffect(() => localStorage.setItem("forgedeck-view", view), [view]);
+  useEffect(() => localStorage.setItem("forgedeck-control-ids", JSON.stringify(controlIds)), [controlIds]);
+  useEffect(() => {
+    if (threads.length && controlIds.length === 0) {
+      const initial = [...threads].sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
+      setControlIds(initial);
+    }
+  }, [threads, controlIds.length]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -181,6 +240,14 @@ export default function App() {
   const activeSettings = selectedId && settings[selectedId]
     ? settings[selectedId]
     : defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : null;
+  const controlThreads = useMemo(() => {
+    const byId = new Map(threads.map((thread) => [thread.id, thread]));
+    const orderedIds = [...new Set([
+      ...threads.filter((thread) => thread.status.type === "active").map((thread) => thread.id),
+      ...controlIds
+    ])];
+    return orderedIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
+  }, [threads, controlIds]);
 
   if (authenticated === null) return <Splash />;
   if (!authenticated) return <Login onSuccess={() => setAuthenticated(true)} />;
@@ -192,6 +259,10 @@ export default function App() {
     return next;
   });
 
+  const toggleControl = (id: string) => setControlIds((current) =>
+    current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+  );
+
   const updateSettings = (next: { model: string; effort: string }) => {
     if (!selectedId) return;
     setSettings((current) => ({ ...current, [selectedId]: next }));
@@ -199,6 +270,7 @@ export default function App() {
 
   const onCreated = async (thread: Thread, model: string, effort: string) => {
     setSettings((current) => ({ ...current, [thread.id]: { model, effort } }));
+    setControlIds((current) => current.includes(thread.id) ? current : [...current, thread.id]);
     setNewOpen(false);
     await loadThreads();
     setSelectedId(thread.id);
@@ -220,6 +292,11 @@ export default function App() {
 
         <button className="new-session" onClick={() => setNewOpen(true)}><Plus size={18} /> New session <kbd>N</kbd></button>
 
+        <div className="view-switch">
+          <button className={view === "session" ? "active" : ""} onClick={() => setView("session")}><MessageSquareText size={14} />Session</button>
+          <button className={view === "control" ? "active" : ""} onClick={() => setView("control")}><LayoutGrid size={14} />Control center<span>{controlThreads.length}</span></button>
+        </div>
+
         <UsageCard usage={bootstrap.usage} plan={bootstrap.account.account?.planType} />
 
         <div className="session-tools">
@@ -236,8 +313,8 @@ export default function App() {
         <div className="session-heading"><span>Sessions</span><span>{threads.length}</span></div>
         <nav className="session-list">
           {sortedThreads.map((thread) => (
-            <SessionCard key={thread.id} thread={thread} selected={thread.id === selectedId} pinned={pinned.has(thread.id)}
-              onSelect={() => setSelectedId(thread.id)} onPin={() => togglePin(thread.id)} />
+            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inControl={controlIds.includes(thread.id)}
+              onSelect={() => { setSelectedId(thread.id); setView("session"); }} onPin={() => togglePin(thread.id)} onControl={() => toggleControl(thread.id)} />
           ))}
           {!sortedThreads.length && <div className="empty-list"><MessageSquareText size={20} /><span>No sessions found</span></div>}
         </nav>
@@ -253,7 +330,7 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={20} /></button>
-          {detail ? <ThreadHeader thread={detail} pinned={pinned.has(detail.id)} onPin={() => togglePin(detail.id)}
+          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={threads.filter((thread) => thread.status.type === "active").length} /> : detail ? <ThreadHeader thread={detail} pinned={pinned.has(detail.id)} onPin={() => togglePin(detail.id)}
             onRename={async () => {
               const name = prompt("Session name", threadTitle(detail));
               if (!name?.trim()) return;
@@ -268,8 +345,15 @@ export default function App() {
           <div className={`runtime-pill ${runtime}`}><span />{runtime === "ready" ? "Runtime online" : "Reconnecting"}</div>
         </header>
 
-        {detail ? (
-          <Chat thread={detail} loading={loadingDetail} liveText={liveText} models={bootstrap.models.data}
+        {view === "control" ? (
+          <ControlCenter threads={controlThreads} allThreads={threads} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel}
+            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} activityVersion={activityVersion}
+            onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
+            onOpen={(id) => { setSelectedId(id); setView("session"); }} onRemove={toggleControl}
+            onAdd={(id) => setControlIds((current) => current.includes(id) ? current : [...current, id])}
+            onError={(error) => showError(error, setToast)} />
+        ) : detail ? (
+          <Chat thread={detail} loading={loadingDetail} liveText={liveText[detail.id] || {}} liveToolOutput={liveToolOutput[detail.id] || {}} liveItems={liveItems[detail.id] || {}} models={bootstrap.models.data}
             settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(detail.id)} onError={(error) => showError(error, setToast)} />
         ) : (
           <Welcome onNew={() => setNewOpen(true)} />
@@ -332,13 +416,14 @@ function UsageCard({ usage, plan }: { usage: Usage | null; plan?: string }) {
   </section>;
 }
 
-function SessionCard({ thread, selected, pinned, onSelect, onPin }: { thread: Thread; selected: boolean; pinned: boolean; onSelect: () => void; onPin: () => void }) {
+function SessionCard({ thread, selected, pinned, inControl, onSelect, onPin, onControl }: { thread: Thread; selected: boolean; pinned: boolean; inControl: boolean; onSelect: () => void; onPin: () => void; onControl: () => void }) {
   const running = thread.status.type === "active";
   return <button className={`session-card ${selected ? "selected" : ""}`} onClick={onSelect}>
     <span className={`status-dot ${thread.status.type}`} />
     <span className="session-copy"><strong>{threadTitle(thread)}</strong><small><Folder size={12} />{basename(thread.cwd)}<i>·</i>{timeAgo(thread.updatedAt)}</small></span>
     <span className="session-actions" onClick={(event) => event.stopPropagation()}>
       {running && <LoaderCircle className="spin running-icon" size={14} />}
+      <span role="button" tabIndex={0} onClick={onControl} title={inControl ? "Remove from Control Center" : "Add to Control Center"}><LayoutGrid size={14} className={inControl ? "control-active" : ""} /></span>
       <span role="button" tabIndex={0} onClick={onPin} title={pinned ? "Unpin" : "Pin"}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</span>
     </span>
   </button>;
@@ -351,8 +436,149 @@ function ThreadHeader({ thread, pinned, onPin, onRename, onArchive }: { thread: 
   </div>;
 }
 
-function Chat({ thread, loading, liveText, models, settings, onSettings, onRefresh, onError }: {
-  thread: Thread; loading: boolean; liveText: Record<string, string>; models: CodexModel[];
+function ControlHeader({ count, activeCount }: { count: number; activeCount: number }) {
+  return <div className="control-header">
+    <div className="control-header-icon"><LayoutGrid size={18} /></div>
+    <div><strong>Control Center</strong><span>{count} session{count === 1 ? "" : "s"} on deck <i>·</i> <b>{activeCount} active now</b></span></div>
+  </div>;
+}
+
+function ControlCenter({ threads, allThreads, models, settings, defaultModel, liveText, liveToolOutput, liveItems, activityVersion, onSettings, onOpen, onRemove, onAdd, onError }: {
+  threads: Thread[]; allThreads: Thread[]; models: CodexModel[]; settings: ThreadSettings; defaultModel?: CodexModel;
+  liveText: LiveStreams; liveToolOutput: LiveStreams; liveItems: LiveItems; activityVersion: number;
+  onSettings: (threadId: string, value: { model: string; effort: string }) => void;
+  onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onAdd: (threadId: string) => void; onError: (error: unknown) => void;
+}) {
+  const columns = useControlColumns();
+  const pageSize = columns * 2;
+  const [page, setPage] = useState(0);
+  const [details, setDetails] = useState<Record<string, Thread>>({});
+  const [reload, setReload] = useState(0);
+  const errorRef = useRef(onError);
+  const pageCount = Math.max(1, Math.ceil(threads.length / pageSize));
+  const pageThreads = threads.slice(page * pageSize, page * pageSize + pageSize);
+  const idsKey = pageThreads.map((thread) => thread.id).join(",");
+  const available = allThreads.filter((thread) => !threads.some((shown) => shown.id === thread.id));
+
+  useEffect(() => { errorRef.current = onError; }, [onError]);
+  useEffect(() => { if (page >= pageCount) setPage(pageCount - 1); }, [page, pageCount]);
+
+  const refresh = useCallback(async () => {
+    if (!pageThreads.length) return;
+    const snapshots = await Promise.allSettled(pageThreads.map(async (thread) => {
+      const response = await api<{ thread: Thread }>(`/api/threads/${encodeURIComponent(thread.id)}`);
+      return response.thread;
+    }));
+    setDetails((current) => {
+      const next = { ...current };
+      for (const snapshot of snapshots) if (snapshot.status === "fulfilled") next[snapshot.value.id] = snapshot.value;
+      return next;
+    });
+  // idsKey intentionally represents the current page's stable set of threads.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idsKey]);
+
+  useEffect(() => { void refresh().catch((error) => errorRef.current(error)); }, [refresh, activityVersion, reload]);
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh().catch(() => undefined), 1_500);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  return <section className="control-center">
+    <div className="control-toolbar">
+      <div><span className="live-beacon"><i />LIVE</span><p>Agent messages and tool output stream into every panel.</p></div>
+      <div className="control-toolbar-actions">
+        {available.length > 0 && <label className="add-panel"><Plus size={14} /><select value="" onChange={(event) => { if (event.target.value) onAdd(event.target.value); }}><option value="">Add session</option>{available.map((thread) => <option key={thread.id} value={thread.id}>{threadTitle(thread)}</option>)}</select></label>}
+        <button className="icon-button" onClick={() => setReload((value) => value + 1)} title="Refresh panels"><RefreshCw size={16} /></button>
+      </div>
+    </div>
+
+    {pageThreads.length ? <div className="control-grid">
+      {pageThreads.map((summary) => {
+        const thread = details[summary.id] || summary;
+        const threadSettings = settings[thread.id] || (defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" });
+        return <ControlCard key={thread.id} thread={thread} models={models} settings={threadSettings}
+          liveText={liveText[thread.id] || {}} liveToolOutput={liveToolOutput[thread.id] || {}} liveItems={liveItems[thread.id] || {}}
+          onSettings={(next) => onSettings(thread.id, next)} onOpen={() => onOpen(thread.id)} onRemove={() => onRemove(thread.id)}
+          onRefresh={() => setReload((value) => value + 1)} onError={onError} />;
+      })}
+    </div> : <div className="control-empty"><LayoutGrid size={28} /><h2>No sessions on deck</h2><p>Create a session or add one from the session list to start your Control Center.</p></div>}
+
+    {pageCount > 1 && <div className="control-pages"><button disabled={page === 0} onClick={() => setPage((value) => value - 1)}><ArrowLeft size={14} />Previous</button><span>Page {page + 1} of {pageCount} · {columns} across × 2 rows</span><button disabled={page >= pageCount - 1} onClick={() => setPage((value) => value + 1)}>Next<ChevronRight size={14} /></button></div>}
+  </section>;
+}
+
+function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveItems, onSettings, onOpen, onRemove, onRefresh, onError }: {
+  thread: Thread; models: CodexModel[]; settings: { model: string; effort: string };
+  liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>;
+  onSettings: (value: { model: string; effort: string }) => void; onOpen: () => void; onRemove: () => void; onRefresh: () => void; onError: (error: unknown) => void;
+}) {
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const body = useRef<HTMLDivElement>(null);
+  const model = models.find((item) => item.model === settings.model) || models[0];
+  const runningTurn = [...(thread.turns || [])].reverse().find((turn) => turn.status === "inProgress");
+  const historyItems = (thread.turns || []).flatMap((turn) => turn.items);
+  const historyIds = new Set(historyItems.map((item) => item.id).filter(Boolean));
+  const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
+  const items = [...historyItems, ...Object.values(liveItems).filter((item) =>
+    (!item.id || !historyIds.has(item.id)) && !(item.type === "agentMessage" && item.id && liveText[item.id])
+  )].slice(-8);
+  const toolCount = items.filter((item) => isToolItem(item)).length;
+  const running = thread.status.type === "active" || Boolean(runningTurn);
+
+  useEffect(() => { body.current?.scrollTo({ top: body.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput]);
+
+  const send = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!text.trim() || sending || runningTurn) return;
+    const outgoing = text.trim(); setText(""); setSending(true);
+    try {
+      await api(`/api/threads/${thread.id}/messages`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      onRefresh();
+    } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
+  };
+
+  const changeModel = (modelId: string) => {
+    const next = models.find((item) => item.model === modelId);
+    if (next) onSettings({ model: next.model, effort: next.defaultReasoningEffort });
+  };
+
+  return <article className={`control-card ${running ? "running" : ""}`}>
+    <header>
+      <button className="control-title" onClick={onOpen}><span className={`status-dot ${running ? "active" : thread.status.type}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
+      <div className="control-card-actions">{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
+    </header>
+    <div className="control-feed" ref={body}>
+      {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><Bot size={21} /><span>{running ? "Agent is starting…" : "Waiting for a task"}</span></div>}
+      {items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
+      {streamingText.map(([id, value]) => value && <div className="compact-message agent live" key={id}><span><Bot size={12} /></span><div><ReactMarkdown>{value}</ReactMarkdown><i className="typing-cursor" /></div></div>)}
+      {running && !streamingText.some(([, value]) => Boolean(value)) && <div className="compact-thinking"><LoaderCircle className="spin" size={13} />Agent working…</div>}
+    </div>
+    <div className="control-models"><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{model?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></div>
+    <form className="control-composer" onSubmit={send}>
+      <input value={text} onChange={(event) => setText(event.target.value)} disabled={Boolean(runningTurn)} placeholder={runningTurn ? "Agent is working…" : "Send a task…"} />
+      {runningTurn ? <button type="button" className="stop" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).then(onRefresh).catch(onError)} title="Stop"><CircleStop size={15} /></button> : <button disabled={!text.trim() || sending} title="Send">{sending ? <LoaderCircle className="spin" size={14} /> : <Send size={14} />}</button>}
+    </form>
+  </article>;
+}
+
+function CompactItem({ item, liveOutput }: { item: ThreadItem; liveOutput?: string }) {
+  if (item.type === "userMessage") {
+    const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
+    return <div className="compact-message user"><div>{text}</div><span>YOU</span></div>;
+  }
+  if (item.type === "agentMessage") return <div className="compact-message agent"><span><Bot size={12} /></span><div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
+  if (item.type === "reasoning") return <details className="compact-reasoning"><summary><BrainCircuit size={12} />Reasoning</summary><p>{item.summary?.join("\n")}</p></details>;
+  if (item.type === "plan") return <div className="compact-tool plan"><LayoutGrid size={13} /><span><strong>Plan updated</strong><small>{truncate(item.text || "", 140)}</small></span></div>;
+  if (item.type === "commandExecution") return <details className={`compact-tool ${item.status || ""}`} {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={13} /><span><strong>Command</strong><small>{item.command}</small></span><em>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
+  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`}><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><pre>{JSON.stringify(item.changes, null, 2)}</pre></details>;
+  if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : "Codex tool"}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
+  return null;
+}
+
+function Chat({ thread, loading, liveText, liveToolOutput, liveItems, models, settings, onSettings, onRefresh, onError }: {
+  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; models: CodexModel[];
   settings: { model: string; effort: string }; onSettings: (value: { model: string; effort: string }) => void;
   onRefresh: () => Promise<void>; onError: (error: unknown) => void;
 }) {
@@ -361,6 +587,11 @@ function Chat({ thread, loading, liveText, models, settings, onSettings, onRefre
   const scroller = useRef<HTMLDivElement>(null);
   const selectedModel = models.find((model) => model.model === settings.model) || models[0];
   const runningTurn = [...thread.turns].reverse().find((turn) => turn.status === "inProgress");
+  const historyIds = new Set(thread.turns.flatMap((turn) => turn.items).map((item) => item.id).filter(Boolean));
+  const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
+  const immediateItems = Object.values(liveItems).filter((item) =>
+    (!item.id || !historyIds.has(item.id)) && !(item.type === "agentMessage" && item.id && liveText[item.id])
+  );
 
   useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText]);
 
@@ -383,9 +614,10 @@ function Chat({ thread, loading, liveText, models, settings, onSettings, onRefre
     <div className="transcript" ref={scroller}>
       {loading && <div className="transcript-loading"><LoaderCircle className="spin" /> Loading session history…</div>}
       {!loading && !thread.turns.length && <div className="empty-chat"><div><Sparkles size={26} /></div><h2>Ready at the forge</h2><p>Send the first task. It will keep running here even if you close this browser.</p></div>}
-      {thread.turns.map((turn) => <TurnView key={turn.id} turn={turn} />)}
-      {Object.entries(liveText).map(([id, value]) => value && <div className="message agent live" key={id}><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex <span>working now</span></div><ReactMarkdown>{value}</ReactMarkdown><span className="typing-cursor" /></div></div>)}
-      {runningTurn && !Object.values(liveText).some(Boolean) && <div className="thinking-line"><LoaderCircle className="spin" size={17} /><span>Codex is working</span><i /><i /><i /></div>}
+      {thread.turns.map((turn) => <TurnView key={turn.id} turn={turn} liveToolOutput={liveToolOutput} />)}
+      {immediateItems.map((item, index) => <ItemView key={item.id || `live-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
+      {streamingText.map(([id, value]) => value && <div className="message agent live" key={id}><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex <span>working now</span></div><ReactMarkdown>{value}</ReactMarkdown><span className="typing-cursor" /></div></div>)}
+      {runningTurn && !streamingText.some(([, value]) => Boolean(value)) && <div className="thinking-line"><LoaderCircle className="spin" size={17} /><span>Codex is working</span><i /><i /><i /></div>}
     </div>
 
     <div className="composer-zone">
@@ -406,25 +638,26 @@ function Chat({ thread, loading, liveText, models, settings, onSettings, onRefre
   </div>;
 }
 
-function TurnView({ turn }: { turn: Thread["turns"][number] }) {
+function TurnView({ turn, liveToolOutput = {} }: { turn: Thread["turns"][number]; liveToolOutput?: Record<string, string> }) {
   return <div className={`turn ${turn.status}`}>
-    {turn.items.map((item, index) => <ItemView key={item.id || `${item.type}-${index}`} item={item} />)}
+    {turn.items.map((item, index) => <ItemView key={item.id || `${item.type}-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
     {turn.status === "failed" && <div className="turn-error">{turn.error?.message || "This turn failed."}</div>}
   </div>;
 }
 
-function ItemView({ item }: { item: ThreadItem }) {
+function ItemView({ item, liveOutput }: { item: ThreadItem; liveOutput?: string }) {
   if (item.type === "userMessage") {
     const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
     return <div className="message user"><div className="message-body"><div className="message-meta">You</div><p>{text}</p></div><div className="message-avatar">YOU</div></div>;
   }
   if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
   if (item.type === "reasoning") return <details className="reasoning-item"><summary><BrainCircuit size={15} />Reasoning <ChevronRight size={14} /></summary><div>{item.summary?.map((part, index) => <ReactMarkdown key={index}>{part}</ReactMarkdown>)}</div></details>;
-  if (item.type === "commandExecution") return <details className="tool-item"><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{item.aggregatedOutput && <pre>{item.aggregatedOutput}</pre>}</details>;
+  if (item.type === "commandExecution") return <details className="tool-item" {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
   if (item.type === "fileChange") return <details className="tool-item"><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.changes, null, 2)}</pre></details>;
   if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || "Codex tool"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
   if (item.type === "plan") return <div className="plan-item"><LayoutGrid size={15} /><ReactMarkdown>{item.text || ""}</ReactMarkdown></div>;
-  return null;
+  if (["contextCompaction", "enteredReviewMode", "exitedReviewMode"].includes(item.type)) return null;
+  return <details className="tool-item generic-tool"><summary><Sparkles size={15} /><span><strong>{toolLabel(item.type)}</strong><code>{item.id || "Codex activity"}</code></span><em className={String(item.status || "completed")}>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item, null, 2)}</pre></details>;
 }
 
 function Welcome({ onNew }: { onNew: () => void }) {
@@ -550,3 +783,25 @@ function relativeReset(timestamp: number): string {
   return days ? `in ${days}d ${hours}h` : `in ${hours}h`;
 }
 function showError(error: unknown, setter: (value: string) => void) { setter(error instanceof Error ? error.message : String(error)); }
+function useControlColumns(): number {
+  const getColumns = () => window.innerWidth >= 1700 ? 4 : window.innerWidth >= 1150 ? 3 : window.innerWidth >= 680 ? 2 : 1;
+  const [columns, setColumns] = useState(getColumns);
+  useEffect(() => {
+    const onResize = () => setColumns(getColumns());
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return columns;
+}
+function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+function truncate(value: string, limit: number): string { return value.length > limit ? `${value.slice(0, limit - 1)}…` : value; }
+function toolLabel(type: string): string {
+  return type.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (character) => character.toUpperCase());
+}
+function isToolItem(item: ThreadItem): boolean {
+  return !["userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "hookPrompt"].includes(item.type);
+}

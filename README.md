@@ -13,6 +13,8 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Password-protected, HttpOnly browser sessions with login throttling
 - Directory-only workspace browser with configurable roots and credential-folder blocking
 - Live response streaming, command/file approval prompts, user questions, and stop controls
+- Desktop-first Control Center with live multi-session panels, adaptive 4/3/2/1-column layouts, and at most two rows per page
+- Real-time agent messages, command executions and output, file changes, MCP calls, dynamic tools, and resilient polling fallback
 - Search, pin, rename, archive, and sorting for large session collections
 - Responsive desktop/mobile UI
 
