@@ -54,6 +54,18 @@ export type Thread = {
   status: ThreadStatus;
   turns: Turn[];
   gitInfo?: { branch?: string; repositoryUrl?: string } | null;
+  goal?: ThreadGoal | null;
+};
+
+export type ThreadGoal = {
+  threadId: string;
+  objective: string;
+  status: "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type RateWindow = { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null };

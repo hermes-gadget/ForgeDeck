@@ -149,10 +149,16 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-toolbar-actions { display: flex; align-items: center; gap: 6px; }
 .add-panel { height: 30px; border: 1px solid var(--line); border-radius: 6px; background: #10141a; display: flex; align-items: center; gap: 5px; padding-left: 8px; color: #7a8490; }
 .add-panel select { max-width: 150px; border: 0; outline: 0; background: transparent; color: #9ca5af; font-size: 9px; padding-right: 5px; }
-.control-grid { flex: 1; display: grid; grid-template-columns: repeat(var(--control-columns, 4), minmax(0, 1fr)); grid-auto-rows: minmax(320px, var(--control-row-height, calc((100vh - 168px) / 2))); gap: 11px; align-content: start; }
+.control-grid { flex: 1; min-height: calc(var(--control-rows, 2) * 320px + (var(--control-rows, 2) - 1) * 11px); display: grid; grid-template-columns: repeat(var(--control-columns, 4), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(320px, 1fr)); gap: 11px; align-content: stretch; }
 .control-card { min-width: 0; min-height: 320px; border: 1px solid #252b34; border-radius: 10px; background: linear-gradient(160deg, #10141a, #0c0f14 68%); display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.16); }
 .control-card.running { border-color: rgba(86, 212, 155, .27); box-shadow: inset 0 1px rgba(86, 212, 155, .04), 0 10px 32px rgba(0,0,0,.2); }
 .control-card.completed:not(.running) { border-color: rgba(255, 107, 44, .65); animation: completedGlow 2.8s ease-in-out infinite; }
+.control-goal { flex: 0 0 27px; min-width: 0; padding: 0 8px; border: 0; border-top: 1px solid #282821; border-bottom: 1px solid #282821; background: rgba(255, 169, 58, .045); color: #9d835d; display: flex; align-items: center; gap: 6px; text-align: left; }
+.control-goal > svg { flex: 0 0 auto; color: var(--orange-2); }
+.control-goal > span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 7.5px; }
+.control-goal > em { flex: 0 0 auto; color: #7d694d; font-size: 6.5px; font-style: normal; text-transform: uppercase; letter-spacing: .5px; }
+.control-goal.paused { opacity: .72; }
+.control-goal.blocked, .control-goal.budgetLimited, .control-goal.usageLimited { border-color: rgba(225, 86, 94, .18); background: rgba(225, 86, 94, .045); }
 .control-card > header { flex: 0 0 49px; border-bottom: 1px solid var(--line-soft); background: rgba(255,255,255,.012); display: flex; align-items: center; justify-content: space-between; gap: 5px; padding: 6px 7px 6px 10px; }
 .control-title { flex: 1; min-width: 0; border: 0; padding: 0; background: transparent; display: flex; align-items: center; gap: 8px; text-align: left; }
 .control-title > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -195,7 +201,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .compact-tool pre { max-height: 120px; overflow: auto; margin: 0; padding: 7px; border-top: 1px solid #20262e; background: #07090c; color: #7c8793; white-space: pre-wrap; word-break: break-word; font-size: 7.5px; line-height: 1.5; }
 .control-models { flex: 0 0 27px; padding: 3px 7px; border-top: 1px solid var(--line-soft); display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, .9fr); gap: 4px; }
 .control-models select { min-width: 0; border: 0; border-radius: 4px; outline: 0; background: #11151a; color: #6f7985; font-size: 7.5px; padding: 0 4px; }
-.control-composer { flex: 0 0 39px; padding: 5px 6px; border-top: 1px solid var(--line-soft); background: #0a0d11; display: flex; gap: 5px; }
+.control-composer { flex: 0 0 39px; padding: 5px 6px; border-top: 1px solid var(--line-soft); background: #0a0d11; display: flex; gap: 5px; position: relative; }
 .control-composer input { min-width: 0; flex: 1; border: 1px solid #242b34; border-radius: 6px; outline: 0; background: #11151a; color: #d5dae0; padding: 0 8px; font-size: 9px; }
 .control-composer input:focus { border-color: #424b57; }
 .control-composer input::placeholder { color: #4e5763; }
@@ -243,6 +249,25 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .tool-item summary code { color: #68727f; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; font-size: 9px; }
 .tool-item summary em { font-style: normal; color: var(--green); font-size: 8px; text-transform: uppercase; }
 .tool-item pre { max-height: 320px; overflow: auto; border-top: 1px solid var(--line); margin: 0; padding: 12px; color: #8993a0; background: #080b0f; font-size: 9.5px; line-height: 1.55; white-space: pre-wrap; }
+.diff-view { border-top: 1px solid var(--line); background: #080b0f; }
+.diff-file + .diff-file { border-top: 1px solid #272d35; }
+.diff-file > header { min-height: 34px; padding: 6px 10px; display: flex; align-items: center; gap: 7px; background: #10141a; color: #818b96; }
+.diff-file > header svg { color: #9f735b; }
+.diff-file > header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 8.5px "SFMono-Regular", Consolas, monospace; color: #aeb6c0; }
+.diff-kind { padding: 2px 5px; border-radius: 4px; background: #20262e; color: #78838f; font-size: 6.5px; text-transform: uppercase; }
+.diff-kind.add { color: var(--green); background: rgba(86,212,155,.08); }
+.diff-kind.delete { color: #ef7d84; background: rgba(230,80,90,.08); }
+.diff-file > header em { display: flex; gap: 5px; font-style: normal; font-size: 7.5px; }
+.diff-file > header em b { color: var(--green); }.diff-file > header em i { color: #e87880; font-style: normal; }
+.tool-item .diff-file pre, .compact-tool .diff-file pre { max-height: 330px; overflow: auto; margin: 0; padding: 6px 0; border: 0; background: #080b0f; color: #77828e; font: 8px/1.5 "SFMono-Regular", Consolas, monospace; white-space: pre; }
+.diff-file pre > span { display: block; min-height: 12px; padding: 0 9px; }
+.diff-file pre > span.add { color: #90dcb8; background: rgba(45,147,99,.1); }
+.diff-file pre > span.remove { color: #ee9ca2; background: rgba(182,57,68,.11); }
+.diff-file pre > span.hunk { color: #8eb2ef; background: rgba(65,102,162,.1); }
+.diff-file pre > span.file { color: #b3bac4; font-weight: 600; }
+.diff-empty { padding: 10px; color: #59636f; font-size: 8px; }
+.diff-view.compact .diff-file > header { min-height: 29px; padding: 4px 7px; }
+.diff-view.compact .diff-file pre { max-height: 130px; font-size: 7px; }
 .plan-item { max-width: 760px; margin: 0 0 18px 41px; padding: 11px 13px; display: flex; align-items: flex-start; gap: 10px; border: 1px solid #283446; background: rgba(50, 78, 120, .08); border-radius: 8px; color: #aab7c9; font-size: 11px; line-height: 1.6; }
 .plan-item > svg { color: var(--blue); flex: 0 0 auto; margin-top: 3px; }
 .plan-item p { margin: 0; }
@@ -257,10 +282,35 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .empty-chat p { max-width: 420px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 
 .composer-zone { flex: 0 0 auto; padding: 0 max(24px, calc((100% - 900px) / 2)) 13px; background: linear-gradient(0deg, var(--bg) 72%, transparent); }
-.composer { border: 1px solid #2b323d; border-radius: 12px; background: #11151b; box-shadow: 0 16px 55px rgba(0,0,0,.3); overflow: hidden; transition: border .2s; }
+.goal-bar { min-height: 46px; margin-bottom: 7px; padding: 7px 8px 7px 10px; border: 1px solid rgba(255, 139, 63, .23); border-radius: 9px; background: linear-gradient(90deg, rgba(255, 107, 44, .075), rgba(255, 168, 60, .025)); display: flex; align-items: center; gap: 9px; }
+.goal-icon { width: 27px; height: 27px; flex: 0 0 auto; border-radius: 7px; display: grid; place-items: center; color: var(--orange); background: rgba(255, 107, 44, .1); }
+.goal-bar > div:nth-child(2) { flex: 1; min-width: 0; }
+.goal-bar > div:nth-child(2) > span { display: flex; align-items: center; gap: 7px; }
+.goal-bar strong { color: #d4b49e; font-size: 8.5px; text-transform: uppercase; letter-spacing: .75px; }
+.goal-bar em { padding: 2px 5px; border-radius: 4px; background: rgba(255, 107, 44, .09); color: #b47a58; font-size: 6.5px; font-style: normal; text-transform: uppercase; letter-spacing: .5px; }
+.goal-bar small { color: #765f51; font-size: 7px; }
+.goal-bar p { margin: 3px 0 0; color: #a9a098; font-size: 9.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.goal-bar.paused { opacity: .72; filter: saturate(.65); }
+.goal-bar.blocked, .goal-bar.budgetLimited, .goal-bar.usageLimited { border-color: rgba(225, 86, 94, .25); background: rgba(225, 86, 94, .045); }
+.goal-actions { display: flex; align-items: center; gap: 3px; }
+.goal-actions button { width: 27px; height: 27px; border: 1px solid #312b28; border-radius: 6px; background: #171515; color: #8e7567; display: grid; place-items: center; }
+.goal-actions button:hover { border-color: #554037; color: #df9c76; background: #1c1715; }
+.composer { border: 1px solid #2b323d; border-radius: 12px; background: #11151b; box-shadow: 0 16px 55px rgba(0,0,0,.3); transition: border .2s; position: relative; }
 .composer:focus-within { border-color: #444d5a; box-shadow: 0 16px 55px rgba(0,0,0,.3), 0 0 0 1px rgba(255, 107, 44, .07); }
 .composer textarea { width: 100%; min-height: 73px; max-height: 180px; resize: none; background: none; border: 0; outline: 0; color: var(--text); padding: 14px 15px 6px; font-size: 12.5px; line-height: 1.55; }
 .composer textarea::placeholder { color: #525b68; }
+.composer-assist { position: absolute; z-index: 30; left: -1px; right: -1px; bottom: calc(100% + 7px); max-height: 310px; overflow-y: auto; padding: 5px; border: 1px solid #303844; border-radius: 9px; background: rgba(12,15,20,.98); box-shadow: 0 18px 55px rgba(0,0,0,.58); backdrop-filter: blur(14px); }
+.composer-assist button { width: 100%; min-height: 35px; padding: 5px 8px; border: 1px solid transparent; border-radius: 6px; background: transparent; display: flex; align-items: center; gap: 8px; text-align: left; color: #8a949f; }
+.composer-assist button:hover, .composer-assist button.active { border-color: rgba(255,107,44,.21); background: rgba(255,107,44,.08); color: #d6dbe1; }
+.composer-assist button > span { width: 22px; height: 22px; flex: 0 0 auto; border-radius: 5px; background: #191e25; color: var(--orange-2); display: grid; place-items: center; }
+.composer-assist button strong { min-width: 0; color: #bec5cd; font: 9.5px "SFMono-Regular", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-assist button small { flex: 1; color: #68727e; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-assist button kbd { min-width: 20px; color: #6c7480; font-size: 7px; text-align: right; }
+.composer-assist.compact { left: 5px; right: 5px; bottom: calc(100% + 4px); max-height: 230px; }
+.composer-assist.compact button { min-height: 29px; padding: 3px 5px; gap: 5px; }
+.composer-assist.compact button > span { width: 18px; height: 18px; }
+.composer-assist.compact button strong { font-size: 8px; }
+.composer-assist.compact button small { font-size: 7px; }
 .composer-footer { min-height: 42px; padding: 5px 7px 7px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .composer-actions { display: flex; align-items: center; gap: 6px; }
 .model-controls { display: flex; align-items: center; gap: 5px; min-width: 0; }
@@ -346,10 +396,16 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .effort-grid button:hover { border-color: #404955; }
 .effort-grid button.selected { border-color: rgba(255, 107, 44, .45); background: rgba(255, 107, 44, .1); color: var(--orange-2); }
 .modal-footer { min-height: 69px; padding: 11px 20px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
-.modal-footer > div { flex: 1; display: flex; align-items: center; gap: 8px; color: #7a8490; font-size: 9.5px; }
-.modal-footer > div svg { color: var(--green); }
-.modal-footer > div span { display: flex; flex-direction: column; }
-.modal-footer > div small { color: #525b67; margin-top: 2px; }
+.yolo-toggle { flex: 1; display: flex; align-items: center; gap: 8px; color: #7a8490; font-size: 9.5px; cursor: pointer; }
+.yolo-toggle > input { position: absolute; opacity: 0; pointer-events: none; }
+.toggle-track { width: 31px; height: 18px; flex: 0 0 auto; padding: 2px; border: 1px solid #343c47; border-radius: 10px; background: #161b22; transition: .2s; }
+.toggle-track i { display: block; width: 12px; height: 12px; border-radius: 50%; background: #6c7581; transition: .2s; }
+.yolo-toggle.enabled { color: var(--orange-2); }
+.yolo-toggle.enabled .toggle-track { border-color: rgba(255,107,44,.5); background: rgba(255,107,44,.15); }
+.yolo-toggle.enabled .toggle-track i { transform: translateX(13px); background: var(--orange); box-shadow: 0 0 8px rgba(255,107,44,.45); }
+.yolo-toggle > span:last-child { display: flex; flex-direction: column; }
+.yolo-toggle small { color: #525b67; margin-top: 2px; }
+.yolo-toggle.enabled small { color: #8a5c47; }
 
 .approval-tray { position: fixed; z-index: 90; bottom: 18px; right: 18px; width: min(470px, calc(100vw - 36px)); border: 1px solid #5d3d2d; background: #121316; border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,.65), 0 0 45px rgba(255, 107, 44, .06); overflow: hidden; }
 .approval-title { height: 51px; padding: 0 15px; border-bottom: 1px solid #28221f; background: linear-gradient(90deg, rgba(255, 107, 44, .08), transparent); display: flex; align-items: center; }
@@ -404,7 +460,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 }
 
 @media (max-width: 679px) {
-  .control-grid { grid-template-columns: repeat(var(--control-columns, 1), minmax(0, 1fr)); grid-auto-rows: minmax(350px, var(--control-row-height, calc(100vh - 160px))); }
+  .control-grid { grid-template-columns: repeat(var(--control-columns, 1), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(350px, 1fr)); min-height: calc(var(--control-rows, 2) * 350px + (var(--control-rows, 2) - 1) * 11px); }
   .control-toolbar p { display: none; }
   .control-pages { justify-content: space-between; }
 }
@@ -419,7 +475,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
   .folder-list { min-height: 180px; }
   .new-modal { max-height: calc(100vh - 18px); }
   .modal-backdrop { padding: 9px; }
-  .modal-footer > div { display: none; }
+  .modal-footer .yolo-toggle { display: flex; }
   .modal-footer { justify-content: flex-end; }
   .feature-row { flex-direction: column; gap: 13px; margin-top: 35px; }
   .welcome h1 { letter-spacing: -1.6px; }

@@ -89,7 +89,7 @@ export class ExternalCodexMonitor {
 
     if (initial) {
       this.emitStatus(tracker);
-      for (const item of tracker.recent.slice(-32)) {
+      for (const item of tracker.recent.slice(-192)) {
         this.emit({ method: item.status === "inProgress" ? "item/started" : "item/completed", params: { threadId: tracker.id, turnId: "external", item } });
       }
     }
@@ -97,7 +97,7 @@ export class ExternalCodexMonitor {
 
   private processLine(tracker: Tracker, line: string, emitNow: boolean): void {
     if (!line.trim()) return;
-    let record: { type?: string; payload?: Record<string, unknown> };
+    let record: { type?: string; timestamp?: string; payload?: Record<string, unknown> };
     try { record = JSON.parse(line); } catch { return; }
     const payload = record.payload;
     if (!payload) return;
@@ -119,7 +119,36 @@ export class ExternalCodexMonitor {
       return;
     }
 
+    if (record.type === "event_msg" && payloadType === "patch_apply_end") {
+      const rawChanges = payload.changes && typeof payload.changes === "object" ? payload.changes as Record<string, Record<string, unknown>> : {};
+      const changes = Object.entries(rawChanges).map(([filePath, change]) => ({
+        path: filePath,
+        kind: { type: String(change.type || "update") },
+        diff: String(change.unified_diff || ""),
+        movePath: change.move_path == null ? null : String(change.move_path)
+      }));
+      const item: ToolItem = {
+        type: "fileChange", id: String(payload.call_id || `patch-${record.timestamp || Date.now()}`),
+        changes, status: payload.success === false ? "failed" : "completed"
+      };
+      pushRecent(tracker, item);
+      if (emitNow) this.emit({ method: "item/completed", params: { threadId: tracker.id, turnId: String(payload.turn_id || "external"), item } });
+      return;
+    }
+
     if (record.type !== "response_item") return;
+    if (payloadType === "message") {
+      const role = String(payload.role || "");
+      const text = extractMessageText(payload.content);
+      if (!text || !["assistant", "user"].includes(role)) return;
+      const id = String(payload.id || `${role}-${record.timestamp || tracker.recent.length}`);
+      const item: ToolItem = role === "assistant"
+        ? { type: "agentMessage", id, text, phase: payload.phase == null ? null : String(payload.phase), memoryCitation: null }
+        : { type: "userMessage", id, clientId: null, content: [{ type: "text", text, text_elements: [] }] };
+      pushRecent(tracker, item);
+      if (emitNow) this.emit({ method: "item/completed", params: { threadId: tracker.id, turnId: "external", item } });
+      return;
+    }
     if (payloadType === "custom_tool_call" || payloadType === "function_call") {
       const callId = String(payload.call_id || payload.id || `external-${Date.now()}`);
       const name = String(payload.name || "tool");
@@ -160,7 +189,7 @@ function pushRecent(tracker: Tracker, item: ToolItem): void {
   const index = tracker.recent.findIndex((candidate) => candidate.id === item.id);
   if (index >= 0) tracker.recent.splice(index, 1);
   tracker.recent.push(item);
-  if (tracker.recent.length > 64) tracker.recent.splice(0, tracker.recent.length - 64);
+  if (tracker.recent.length > 192) tracker.recent.splice(0, tracker.recent.length - 192);
 }
 
 function extractCommand(input: string): string {
@@ -190,4 +219,13 @@ function flattenOutput(value: unknown): string {
 function inferExitCode(output: string): number | null {
   const match = output.match(/(?:exit code|Process exited with code)\s*[:=]?\s*(-?\d+)/i);
   return match ? Number(match[1]) : null;
+}
+
+function extractMessageText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.map((part) => {
+    if (!part || typeof part !== "object") return "";
+    const content = part as { type?: unknown; text?: unknown };
+    return ["input_text", "output_text", "text"].includes(String(content.type || "")) ? String(content.text || "") : "";
+  }).filter(Boolean).join("\n");
 }

@@ -23,6 +23,9 @@ const sseClients = new Set<Response>();
 type QueuedMessage = { id: string; text: string; model: string; effort: string | null; createdAt: number };
 const queueFile = path.join(dataDir, "message-queues.json");
 const messageQueues = loadMessageQueues();
+type ThreadPolicy = "workspace-write" | "yolo";
+const policyFile = path.join(dataDir, "thread-policies.json");
+const threadPolicies = loadThreadPolicies();
 const activeThreads = new Set<string>();
 const drainingQueues = new Set<string>();
 const bridgeOwnedThreads = new Set<string>();
@@ -99,6 +102,16 @@ app.get("/api/directories", async (req, res, next) => {
   }
 });
 
+app.get("/api/files", async (req, res, next) => {
+  try {
+    const cwd = requiredString(req.query.cwd, "Directory");
+    const query = typeof req.query.q === "string" ? req.query.q : "";
+    res.json({ data: await workspaces.searchFiles(cwd, query, 30) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/threads", async (req, res, next) => {
   try {
     const params = {
@@ -120,18 +133,21 @@ app.post("/api/threads", async (req, res, next) => {
     const cwd = await workspaces.validate(requiredString(req.body?.cwd, "Directory"));
     const model = requiredString(req.body?.model, "Model");
     const effort = optionalString(req.body?.effort);
+    const yolo = req.body?.yolo === true;
     await validateModelChoice(model, effort);
     const result = await codex.request<{ thread: { id: string } }>("thread/start", {
       cwd,
       runtimeWorkspaceRoots: [cwd],
       model,
       allowProviderModelFallback: false,
-      approvalPolicy: "on-request",
-      sandbox: "workspace-write",
+      approvalPolicy: yolo ? "never" : "on-request",
+      sandbox: yolo ? "danger-full-access" : "workspace-write",
       ephemeral: false,
       serviceName: "ForgeDeck"
     });
     const threadId = result.thread.id;
+    threadPolicies.set(threadId, yolo ? "yolo" : "workspace-write");
+    persistThreadPolicies();
     const name = optionalString(req.body?.name);
     if (name) await codex.request("thread/name/set", { threadId, name: name.slice(0, 100) });
     const prompt = optionalString(req.body?.prompt);
@@ -145,7 +161,11 @@ app.post("/api/threads", async (req, res, next) => {
 app.get("/api/threads/:threadId", async (req, res, next) => {
   try {
     const threadId = validThreadId(req.params.threadId);
-    res.json(await codex.request("thread/read", { threadId, includeTurns: true }, 60_000));
+    const [snapshot, goal] = await Promise.all([
+      codex.request<{ thread: Record<string, unknown> }>("thread/read", { threadId, includeTurns: true }, 60_000),
+      codex.request<{ goal: Record<string, unknown> | null }>("thread/goal/get", { threadId }).catch(() => ({ goal: null }))
+    ]);
+    res.json({ ...snapshot, thread: { ...snapshot.thread, goal: goal.goal } });
   } catch (error) {
     next(error);
   }
@@ -161,6 +181,60 @@ app.post("/api/threads/:threadId/messages", async (req, res, next) => {
     await validateModelChoice(model, effort);
     await codex.request("thread/resume", { threadId, model, excludeTurns: true }, 60_000);
     res.status(202).json(await startTurn(threadId, text, model, effort));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/threads/:threadId/command", async (req, res, next) => {
+  try {
+    const threadId = validThreadId(req.params.threadId);
+    const command = requiredString(req.body?.command, "Command").toLowerCase();
+    const args = optionalString(req.body?.args);
+    if (command === "compact") {
+      res.json(await codex.request("thread/compact/start", { threadId }, 60_000));
+      return;
+    }
+    if (command === "stop") {
+      const snapshot = await codex.request<{ thread: { turns: Array<{ id: string; status: string }> } }>("thread/read", { threadId, includeTurns: true }, 60_000);
+      const turn = [...snapshot.thread.turns].reverse().find((item) => item.status === "inProgress");
+      if (!turn) throw httpError("This session has no active turn", 409);
+      res.json(await codex.request("turn/interrupt", { threadId, turnId: turn.id }));
+      return;
+    }
+    if (command === "rename") {
+      if (!args) throw httpError("Use /rename followed by a session name", 400);
+      res.json(await codex.request("thread/name/set", { threadId, name: args.slice(0, 100) }));
+      return;
+    }
+    if (command === "archive") {
+      const result = await codex.request("thread/archive", { threadId });
+      if (messageQueues.delete(threadId)) persistMessageQueues();
+      if (threadPolicies.delete(threadId)) persistThreadPolicies();
+      broadcastQueue(threadId);
+      res.json(result);
+      return;
+    }
+    if (command === "goal") {
+      const operation = args?.toLowerCase();
+      if (!args || operation === "view") {
+        res.json(await codex.request("thread/goal/get", { threadId }));
+        return;
+      }
+      if (operation === "clear") {
+        res.json(await codex.request("thread/goal/clear", { threadId }));
+        return;
+      }
+      if (operation === "pause" || operation === "resume") {
+        res.json(await codex.request("thread/goal/set", { threadId, status: operation === "pause" ? "paused" : "active" }));
+        return;
+      }
+      const objective = args.replace(/^set\s+/i, "").trim();
+      if (!objective) throw httpError("Use /goal followed by an objective", 400);
+      res.json(await codex.request("thread/goal/set", { threadId, objective, status: "active" }));
+      return;
+    }
+    throw httpError(`Unsupported ForgeDeck command: /${command}`, 400);
   } catch (error) {
     next(error);
   }
@@ -228,6 +302,7 @@ app.delete("/api/threads/:threadId", async (req, res, next) => {
     const threadId = validThreadId(req.params.threadId);
     const result = await codex.request("thread/archive", { threadId });
     if (messageQueues.delete(threadId)) persistMessageQueues();
+    if (threadPolicies.delete(threadId)) persistThreadPolicies();
     broadcastQueue(threadId);
     res.json(result);
   } catch (error) {
@@ -331,11 +406,16 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 }
 
 async function startTurn(threadId: string, text: string, model: string, effort: string | null): Promise<unknown> {
+  const policy = threadPolicies.get(threadId);
   return codex.request("turn/start", {
     threadId,
     input: [{ type: "text", text, text_elements: [] }],
     model,
-    effort: effort || undefined
+    effort: effort || undefined,
+    ...(policy === "yolo" ? {
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "dangerFullAccess" }
+    } : {})
   }, 60_000);
 }
 
@@ -393,6 +473,24 @@ function persistMessageQueues(): void {
   const temporary = `${queueFile}.${process.pid}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(Object.fromEntries(messageQueues), null, 2)}\n`, { mode: 0o600 });
   fs.renameSync(temporary, queueFile);
+}
+
+function loadThreadPolicies(): Map<string, ThreadPolicy> {
+  try {
+    if (!fs.existsSync(policyFile)) return new Map();
+    const parsed = JSON.parse(fs.readFileSync(policyFile, "utf8")) as Record<string, unknown>;
+    return new Map(Object.entries(parsed).filter((entry): entry is [string, ThreadPolicy] => entry[1] === "workspace-write" || entry[1] === "yolo"));
+  } catch (error) {
+    console.error("[ForgeDeck] Ignoring invalid thread policy file:", error);
+    return new Map();
+  }
+}
+
+function persistThreadPolicies(): void {
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const temporary = `${policyFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(Object.fromEntries(threadPolicies), null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, policyFile);
 }
 
 function broadcastQueue(threadId: string, error?: string): void {
@@ -473,7 +571,7 @@ function recordLiveEvent(notification: { method: string; params?: Record<string,
     if (typeof item.id === "string") {
       state.items[item.id] = item;
       if (notification.method === "item/completed" && item.type === "agentMessage") delete state.agentText[item.id];
-      trimRecord(state.items, 64);
+      trimRecord(state.items, 192);
     }
   }
   if (notification.method === "item/agentMessage/delta" && typeof params?.itemId === "string") {

@@ -5,7 +5,7 @@ import {
   Clock3, Code2, Command, Folder, FolderOpen, Gauge, GitBranch, KeyRound,
   LayoutGrid, LoaderCircle, LogOut, Menu, MessageSquareText, MoreHorizontal,
   PanelLeftClose, Pin, PinOff, Plus, RefreshCw, Search, Send, Server,
-  Settings2, ShieldCheck, Sparkles, TerminalSquare, ListPlus, X
+  Settings2, ShieldCheck, Sparkles, TerminalSquare, ListPlus, Target, Pause, Play, X
 } from "lucide-react";
 import type { Bootstrap, CodexModel, LiveThreadState, PendingRequest, QueueEntry, Thread, ThreadItem, Usage } from "./types";
 
@@ -14,6 +14,16 @@ type ViewMode = "session" | "control";
 type ThreadSettings = Record<string, { model: string; effort: string }>;
 type LiveStreams = Record<string, Record<string, string>>;
 type LiveItems = Record<string, Record<string, ThreadItem>>;
+type AssistSuggestion = { id: string; label: string; description: string; insert: string; kind: "command" | "file" | "directory" };
+
+const SLASH_COMMANDS: AssistSuggestion[] = [
+  { id: "compact", label: "/compact", description: "Compact the session context", insert: "/compact", kind: "command" },
+  { id: "goal", label: "/goal", description: "Set or manage a persistent task goal", insert: "/goal ", kind: "command" },
+  { id: "stop", label: "/stop", description: "Stop the active turn", insert: "/stop", kind: "command" },
+  { id: "rename", label: "/rename", description: "Rename this session", insert: "/rename ", kind: "command" },
+  { id: "archive", label: "/archive", description: "Archive this session", insert: "/archive", kind: "command" },
+  { id: "mention", label: "/mention", description: "Autocomplete a workspace file", insert: "@", kind: "command" }
+];
 
 const EFFORT_LABELS: Record<string, string> = {
   none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
@@ -219,7 +229,7 @@ export default function App() {
           }
         }, 300);
       }
-      if (threadId && /^(item\/|turn\/|thread\/status)/.test(notification.method) && !notification.method.endsWith("/delta")) {
+      if (threadId && /^(item\/|turn\/|thread\/(status|goal))/.test(notification.method) && !notification.method.endsWith("/delta")) {
         setActivityVersion((value) => value + 1);
       }
       if (/^(thread|turn)\//.test(notification.method)) {
@@ -537,7 +547,6 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
 
   const visibleColumns = Math.max(1, Math.min(columns, pageThreads.length));
   const visibleRows = Math.max(1, Math.ceil(pageThreads.length / visibleColumns));
-  const rowHeight = visibleRows === 1 ? "calc(100vh - 157px)" : "calc((100vh - 168px) / 2)";
 
   return <section className="control-center">
     <div className="control-toolbar">
@@ -548,7 +557,7 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
       </div>
     </div>
 
-    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-row-height": rowHeight } as React.CSSProperties}>
+    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-rows": visibleRows } as React.CSSProperties}>
       {pageThreads.map((summary) => {
         const thread = details[summary.id] || summary;
         const threadSettings = settings[thread.id] || (defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" });
@@ -570,6 +579,7 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const assist = useComposerAssist(text, setText, thread.cwd);
   const body = useRef<HTMLDivElement>(null);
   const model = models.find((item) => item.model === settings.model) || models[0];
   const runningTurn = [...(thread.turns || [])].reverse().find((turn) => turn.status === "inProgress");
@@ -589,7 +599,14 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
     if (!text.trim() || sending) return;
     const outgoing = text.trim(); setText(""); setSending(true);
     try {
-      await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      const slash = parseSlashCommand(outgoing);
+      if (slash?.command === "mention") {
+        setText("@");
+      } else if (slash) {
+        if (!await executeSlashCommand(thread, slash)) { setText(outgoing); return; }
+      } else {
+        await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      }
       onRefresh();
     } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
   };
@@ -604,6 +621,7 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
       <button className="control-title" onClick={onOpen}><span className={`status-dot ${running ? "active" : thread.status.type}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
       <div className="control-card-actions">{completed && !running && <span className="done-label">Done</span>}{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
     </header>
+    {thread.goal && <button type="button" className={`control-goal ${thread.goal.status}`} onClick={onOpen} title={thread.goal.objective}><Target size={11} /><span>{thread.goal.objective}</span><em>{goalStatusLabel(thread.goal.status)}</em></button>}
     <div className="control-feed" ref={body}>
       {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><Bot size={21} /><span>{running ? "Agent is starting…" : "Waiting for a task"}</span></div>}
       {items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
@@ -612,7 +630,8 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
     </div>
     <div className="control-models"><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{model?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></div>
     <form className="control-composer" onSubmit={send}>
-      <input value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? "Queue the next task…" : "Send a task…"} />
+      <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} compact />
+      <input value={text} onChange={(event) => setText(event.target.value)} onKeyDown={assist.onKeyDown} placeholder={running ? "Queue the next task…" : "Send a task…"} />
       <button className={running ? "queue" : ""} disabled={!text.trim() || sending} title={running ? "Queue next task" : "Send"}>{sending ? <LoaderCircle className="spin" size={14} /> : running ? <ListPlus size={14} /> : <Send size={14} />}</button>
       {runningTurn && <button type="button" className="stop" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).then(onRefresh).catch(onError)} title="Stop"><CircleStop size={15} /></button>}
     </form>
@@ -628,7 +647,7 @@ function CompactItem({ item, liveOutput }: { item: ThreadItem; liveOutput?: stri
   if (item.type === "reasoning") return <details className="compact-reasoning"><summary><BrainCircuit size={12} />Reasoning</summary><p>{item.summary?.join("\n")}</p></details>;
   if (item.type === "plan") return <div className="compact-tool plan"><LayoutGrid size={13} /><span><strong>Plan updated</strong><small>{truncate(item.text || "", 140)}</small></span></div>;
   if (item.type === "commandExecution") return <details className={`compact-tool ${item.status || ""}`} {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={13} /><span><strong>Command</strong><small>{item.command}</small></span><em>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`}><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><pre>{JSON.stringify(item.changes, null, 2)}</pre></details>;
+  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`}><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><DiffView changes={item.changes || []} compact /></details>;
   if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : "Codex tool"}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
   return null;
 }
@@ -640,6 +659,7 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const assist = useComposerAssist(text, setText, thread.cwd);
   const scroller = useRef<HTMLDivElement>(null);
   const selectedModel = models.find((model) => model.model === settings.model) || models[0];
   const runningTurn = [...thread.turns].reverse().find((turn) => turn.status === "inProgress");
@@ -657,8 +677,15 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
     if (!text.trim() || sending) return;
     const outgoing = text.trim(); setText(""); setSending(true);
     try {
-      await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
-      if (!running) await onRefresh();
+      const slash = parseSlashCommand(outgoing);
+      if (slash?.command === "mention") {
+        setText("@");
+      } else if (slash) {
+        if (!await executeSlashCommand(thread, slash)) { setText(outgoing); return; }
+      } else {
+        await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
+      }
+      await onRefresh();
     } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
   };
 
@@ -678,10 +705,12 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
     </div>
 
     <div className="composer-zone">
+      {thread.goal && <GoalBar thread={thread} onRefresh={onRefresh} onError={onError} />}
       {queue.length > 0 && <div className="queue-strip"><div><ListPlus size={14} /><strong>{queue.length} queued</strong><span>Runs automatically after the current turn</span></div><div>{queue.map((entry, index) => <div className="queue-entry" key={entry.id}><b>{index + 1}</b><span>{entry.text}</span><button onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={13} /></button></div>)}</div></div>}
       <form className="composer" onSubmit={submit}>
+        <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} />
         <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? "Queue the next task while Codex works…" : "Give Codex a task…"}
-          rows={3} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
+          rows={3} onKeyDown={(event) => { if (assist.onKeyDown(event)) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
         <div className="composer-footer">
           <div className="model-controls">
             <label><Bot size={14} /><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
@@ -692,6 +721,30 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
         </div>
       </form>
       <p className="persistence-note"><Server size={12} />Safe to close this tab — work continues on the host.</p>
+    </div>
+  </div>;
+}
+
+function GoalBar({ thread, onRefresh, onError }: { thread: Thread; onRefresh: () => Promise<void>; onError: (error: unknown) => void }) {
+  const goal = thread.goal!;
+  const run = async (args: string) => {
+    try {
+      await api(`/api/threads/${thread.id}/command`, { method: "POST", body: JSON.stringify({ command: "goal", args }) });
+      await onRefresh();
+    } catch (error) { onError(error); }
+  };
+  const edit = () => {
+    const objective = window.prompt("Goal objective", goal.objective);
+    if (objective?.trim() && objective.trim() !== goal.objective) void run(objective.trim());
+  };
+  const progress = goal.tokenBudget ? Math.min(100, Math.round(goal.tokensUsed / goal.tokenBudget * 100)) : null;
+  return <div className={`goal-bar ${goal.status}`}>
+    <span className="goal-icon"><Target size={14} /></span>
+    <div><span><strong>Goal</strong><em>{goalStatusLabel(goal.status)}</em>{progress !== null && <small>{progress}% token budget</small>}</span><p>{goal.objective}</p></div>
+    <div className="goal-actions">
+      <button type="button" onClick={() => void run(goal.status === "paused" ? "resume" : "pause")} title={goal.status === "paused" ? "Resume goal" : "Pause goal"}>{goal.status === "paused" ? <Play size={13} /> : <Pause size={13} />}</button>
+      <button type="button" onClick={edit} title="Edit goal"><Settings2 size={13} /></button>
+      <button type="button" onClick={() => void run("clear")} title="Clear goal"><X size={13} /></button>
     </div>
   </div>;
 }
@@ -711,11 +764,111 @@ function ItemView({ item, liveOutput }: { item: ThreadItem; liveOutput?: string 
   if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
   if (item.type === "reasoning") return <details className="reasoning-item"><summary><BrainCircuit size={15} />Reasoning <ChevronRight size={14} /></summary><div>{item.summary?.map((part, index) => <ReactMarkdown key={index}>{part}</ReactMarkdown>)}</div></details>;
   if (item.type === "commandExecution") return <details className="tool-item" {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className="tool-item"><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.changes, null, 2)}</pre></details>;
+  if (item.type === "fileChange") return <details className="tool-item"><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><DiffView changes={item.changes || []} /></details>;
   if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || "Codex tool"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
   if (item.type === "plan") return <div className="plan-item"><LayoutGrid size={15} /><ReactMarkdown>{item.text || ""}</ReactMarkdown></div>;
   if (["contextCompaction", "enteredReviewMode", "exitedReviewMode"].includes(item.type)) return null;
   return <details className="tool-item generic-tool"><summary><Sparkles size={15} /><span><strong>{toolLabel(item.type)}</strong><code>{item.id || "Codex activity"}</code></span><em className={String(item.status || "completed")}>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item, null, 2)}</pre></details>;
+}
+
+function DiffView({ changes, compact = false }: { changes: Array<Record<string, unknown>>; compact?: boolean }) {
+  return <div className={`diff-view ${compact ? "compact" : ""}`}>{changes.map((change, index) => {
+    const filePath = String(change.path || change.file || `File ${index + 1}`);
+    const diff = String(change.diff || change.unified_diff || "");
+    const kindValue = change.kind && typeof change.kind === "object" ? (change.kind as { type?: unknown }).type : change.kind;
+    const kind = String(kindValue || "update");
+    const additions = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
+    const deletions = diff.split("\n").filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+    return <section className="diff-file" key={`${filePath}-${index}`}>
+      <header><Code2 size={12} /><strong>{filePath}</strong><span className={`diff-kind ${kind}`}>{kind}</span><em><b>+{additions}</b><i>-{deletions}</i></em></header>
+      {diff ? <pre>{diff.split("\n").map((line, lineIndex) => <span className={line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : line.startsWith("@@") ? "hunk" : line.startsWith("+++") || line.startsWith("---") ? "file" : "context"} key={lineIndex}>{line || " "}</span>)}</pre> : <div className="diff-empty">Diff content unavailable</div>}
+    </section>;
+  })}</div>;
+}
+
+function useComposerAssist(text: string, setText: (value: string) => void, cwd: string) {
+  const [files, setFiles] = useState<AssistSuggestion[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [dismissedFor, setDismissedFor] = useState<string | null>(null);
+  const slashMatch = text.match(/^\/([^\s]*)$/);
+  const mentionMatch = text.match(/(?:^|\s)@([^\s@]*)$/);
+  const mentionQuery = mentionMatch?.[1];
+
+  useEffect(() => {
+    if (mentionQuery === undefined) { setFiles([]); return; }
+    const timer = window.setTimeout(() => {
+      void api<{ data: Array<{ name: string; relativePath: string; type: "file" | "directory" }> }>(`/api/files?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(mentionQuery)}`)
+        .then((response) => setFiles(response.data.map((entry) => ({
+          id: `${entry.type}:${entry.relativePath}`, label: entry.relativePath, description: entry.type,
+          insert: entry.relativePath, kind: entry.type
+        }))))
+        .catch(() => setFiles([]));
+    }, 120);
+    return () => clearTimeout(timer);
+  }, [cwd, mentionQuery]);
+
+  const suggestions = useMemo(() => {
+    if (dismissedFor === text) return [];
+    if (slashMatch) {
+      const needle = slashMatch[1].toLowerCase();
+      return SLASH_COMMANDS.filter((item) => item.id.startsWith(needle) || item.label.includes(needle));
+    }
+    return mentionMatch ? files : [];
+  }, [text, dismissedFor, slashMatch?.[1], mentionMatch?.[1], files]);
+
+  useEffect(() => setActiveIndex(0), [suggestions.length, text]);
+
+  const choose = (suggestion: AssistSuggestion) => {
+    if (suggestion.kind === "command") setText(suggestion.insert);
+    else setText(text.replace(/(^|\s)@[^\s@]*$/, `$1@${suggestion.insert}${suggestion.kind === "directory" ? "/" : " "}`));
+    setDismissedFor(null);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>): boolean => {
+    if (!suggestions.length) return false;
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((current) => (current + (event.key === "ArrowDown" ? 1 : -1) + suggestions.length) % suggestions.length);
+      return true;
+    }
+    if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+      event.preventDefault();
+      choose(suggestions[activeIndex] || suggestions[0]);
+      return true;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setDismissedFor(text);
+      return true;
+    }
+    return false;
+  };
+  return { suggestions, activeIndex, choose, onKeyDown };
+}
+
+function ComposerAssist({ suggestions, activeIndex, onChoose, compact = false }: { suggestions: AssistSuggestion[]; activeIndex: number; onChoose: (suggestion: AssistSuggestion) => void; compact?: boolean }) {
+  if (!suggestions.length) return null;
+  return <div className={`composer-assist ${compact ? "compact" : ""}`}>{suggestions.slice(0, compact ? 6 : 10).map((suggestion, index) => <button type="button" className={index === activeIndex ? "active" : ""} key={suggestion.id} onMouseDown={(event) => event.preventDefault()} onClick={() => onChoose(suggestion)}><span>{suggestion.kind === "command" ? <Command size={13} /> : suggestion.kind === "directory" ? <Folder size={13} /> : <Code2 size={13} />}</span><strong>{suggestion.label}</strong><small>{suggestion.description}</small><kbd>{index === activeIndex ? "Tab" : ""}</kbd></button>)}</div>;
+}
+
+function parseSlashCommand(value: string): { command: string; args: string | null } | null {
+  const match = value.match(/^\/([a-z-]+)(?:\s+([\s\S]+))?$/i);
+  return match ? { command: match[1].toLowerCase(), args: match[2]?.trim() || null } : null;
+}
+
+async function executeSlashCommand(thread: Thread, slash: { command: string; args: string | null }): Promise<boolean> {
+  let args = slash.args;
+  if (slash.command === "goal" && (!args || args.toLowerCase() === "set")) {
+    const objective = window.prompt("Goal objective", thread.goal?.objective || "");
+    if (!objective?.trim()) return false;
+    args = objective.trim();
+  }
+  await api(`/api/threads/${thread.id}/command`, { method: "POST", body: JSON.stringify({ ...slash, args }) });
+  return true;
+}
+
+function goalStatusLabel(status: NonNullable<Thread["goal"]>["status"]): string {
+  return ({ active: "Active", paused: "Paused", blocked: "Blocked", usageLimited: "Usage limited", budgetLimited: "Budget limited", complete: "Complete" })[status];
 }
 
 function Welcome({ onNew }: { onNew: () => void }) {
@@ -728,6 +881,7 @@ function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState(defaultModel.model);
   const [effort, setEffort] = useState(defaultModel.defaultReasoningEffort);
+  const [yolo, setYolo] = useState(false);
   const [browser, setBrowser] = useState<{ path: string | null; parent: string | null; entries: Array<{ name: string; path: string }> } | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -744,7 +898,7 @@ function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap
     if (!selectedPath) return;
     setBusy(true);
     try {
-      const response = await api<{ thread: Thread }>("/api/threads", { method: "POST", body: JSON.stringify({ cwd: selectedPath, model, effort, name, prompt }) });
+      const response = await api<{ thread: Thread }>("/api/threads", { method: "POST", body: JSON.stringify({ cwd: selectedPath, model, effort, name, prompt, yolo }) });
       onCreated(response.thread, model, effort);
     } catch (error) { onError(error); } finally { setBusy(false); }
   };
@@ -770,7 +924,7 @@ function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap
           <label className="field prompt-field"><span>First task <i>optional</i></span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Start the session with a task, or leave it waiting…" rows={4} /></label>
         </section>
       </div>
-      <div className="modal-footer"><div><ShieldCheck size={15} /><span>Workspace-write sandbox<br /><small>Approvals appear in ForgeDeck</small></span></div><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!selectedPath || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Launch session</button></div>
+      <div className="modal-footer"><label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!selectedPath || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Launch session</button></div>
     </form>
   </div>;
 }
