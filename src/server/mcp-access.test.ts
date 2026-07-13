@@ -48,3 +48,19 @@ test("MCP actor and ownership records survive a dashboard restart", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("MCP ownership reconciliation removes stale threads in one batch", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-mcp-reconcile-"));
+  try {
+    const access = new McpAccessManager(directory);
+    const actor = access.registerActor();
+    access.assignThread("existing-thread", actor.actorId);
+    access.assignThread("phantom-thread", actor.actorId);
+    assert.deepEqual(access.reconcileThreads(new Set(["existing-thread"])), ["phantom-thread"]);
+    assert.deepEqual(access.listOwnedThreads(actor.actorId), ["existing-thread"]);
+    const restarted = new McpAccessManager(directory);
+    assert.deepEqual(restarted.listOwnedThreads(actor.actorId), ["existing-thread"]);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

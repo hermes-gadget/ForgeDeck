@@ -56,6 +56,8 @@ export type Thread = {
   gitInfo?: { branch?: string; repositoryUrl?: string } | null;
   goal?: ThreadGoal | null;
   policy?: "workspace-write" | "yolo";
+  tags?: string[];
+  category?: string | null;
 };
 
 export type ThreadGoal = {

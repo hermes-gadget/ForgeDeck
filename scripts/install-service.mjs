@@ -7,16 +7,27 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entrypoint = path.join(projectRoot, "build/server/index.js");
-if (!fs.existsSync(entrypoint)) {
+const clientEntrypoint = path.join(projectRoot, "dist/index.html");
+if (!fs.existsSync(entrypoint) || !fs.existsSync(clientEntrypoint)) {
   console.error("ForgeDeck is not built. Run npm run build first.");
   process.exit(1);
 }
 
+try { process.loadEnvFile(path.join(projectRoot, ".env")); } catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+}
+
 let codexBin;
 try {
-  codexBin = execFileSync("bash", ["-lc", "command -v codex"], { encoding: "utf8" }).trim();
+  const configured = process.env.CODEX_BIN?.trim() || "codex";
+  if (path.isAbsolute(configured)) {
+    fs.accessSync(configured, fs.constants.X_OK);
+    codexBin = configured;
+  } else {
+    codexBin = execFileSync("which", [configured], { encoding: "utf8" }).trim();
+  }
 } catch {
-  console.error("Could not find the codex executable on PATH.");
+  console.error("Could not find the configured Codex executable. Check CODEX_BIN or PATH.");
   process.exit(1);
 }
 
@@ -80,5 +91,12 @@ if (dashboardActive) console.log("ForgeDeck is already running. Restart the dash
 console.log("View status with: systemctl --user status forgedeck");
 
 function systemdEscape(value) {
-  return value.replaceAll("%", "%%").replaceAll(" ", "\\x20");
+  return [...value].map((character) => {
+    if (character === "%") return "%%";
+    if (character === "\\" || character === "\"" || character === "'" || /\s/.test(character)) {
+      const code = character.codePointAt(0);
+      if (code <= 0xff) return `\\x${code.toString(16).padStart(2, "0")}`;
+    }
+    return character;
+  }).join("");
 }

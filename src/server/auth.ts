@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { NextFunction, Request, Response } from "express";
+import type { CookieSecureMode } from "./config.js";
 
 const COOKIE_NAME = "forgedeck_session";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -16,8 +17,9 @@ export class AuthManager {
   readonly enabled: boolean;
   readonly generatedTokenPath: string | null;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private readonly cookieSecure: CookieSecureMode = "auto") {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDir, 0o700);
     this.enabled = !["off", "false", "disabled", "none"].includes((process.env.FORGEDECK_AUTH || "on").trim().toLowerCase());
     if (!this.enabled) {
       this.secret = null;
@@ -31,6 +33,7 @@ export class AuthManager {
       this.secret = configured;
       this.generatedTokenPath = null;
     } else if (fs.existsSync(tokenPath)) {
+      fs.chmodSync(tokenPath, 0o600);
       this.secret = fs.readFileSync(tokenPath, "utf8").trim();
       this.generatedTokenPath = tokenPath;
     } else {
@@ -71,11 +74,11 @@ export class AuthManager {
     return { ok: true, sessionId };
   }
 
-  setCookie(res: Response, sessionId: string): void {
+  setCookie(req: Request, res: Response, sessionId: string): void {
     res.cookie(COOKIE_NAME, sessionId, {
       httpOnly: true,
       sameSite: "strict",
-      secure: false,
+      secure: this.secureCookieFor(req),
       path: "/",
       maxAge: SESSION_TTL_MS
     });
@@ -84,7 +87,7 @@ export class AuthManager {
   logout(req: Request, res: Response): void {
     const sessionId = readCookie(req, COOKIE_NAME);
     if (sessionId) this.sessions.delete(sessionId);
-    res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "strict", path: "/" });
+    res.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "strict", secure: this.secureCookieFor(req), path: "/" });
   }
 
   isAuthenticated(req: Request): boolean {
@@ -117,6 +120,10 @@ export class AuthManager {
       if (attempt.resetAt <= now) this.attempts.delete(ip);
     }
   }
+
+  private secureCookieFor(req: Request): boolean {
+    return this.cookieSecure === "on" || (this.cookieSecure === "auto" && req.secure);
+  }
 }
 
 function safeEqual(value: string, expected: string): boolean {
@@ -130,7 +137,9 @@ function readCookie(req: Request, name: string): string | null {
   if (!raw) return null;
   for (const part of raw.split(";")) {
     const [key, ...rest] = part.trim().split("=");
-    if (key === name) return decodeURIComponent(rest.join("="));
+    if (key === name) {
+      try { return decodeURIComponent(rest.join("=")); } catch { return null; }
+    }
   }
   return null;
 }

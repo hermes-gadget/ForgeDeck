@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { NextFunction, Request, Response } from "express";
+import { logger } from "./logger.js";
 
 type StoredActor = {
   tokenHash: string;
@@ -26,6 +27,7 @@ export class McpAccessManager {
 
   constructor(dataDir: string) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDir, 0o700);
     this.bootstrapTokenPath = path.join(dataDir, "mcp-token");
     this.accessFile = path.join(dataDir, "mcp-access.json");
     this.bootstrapSecret = loadOrCreateSecret(this.bootstrapTokenPath);
@@ -71,6 +73,19 @@ export class McpAccessManager {
     this.persist();
   }
 
+  releaseThreads(threadIds: Iterable<string>): string[] {
+    const released: string[] = [];
+    for (const threadId of threadIds) {
+      if (this.threadOwners.delete(threadId)) released.push(threadId);
+    }
+    if (released.length) this.persist();
+    return released;
+  }
+
+  reconcileThreads(existingThreadIds: ReadonlySet<string>): string[] {
+    return this.releaseThreads([...this.threadOwners.keys()].filter((threadId) => !existingThreadIds.has(threadId)));
+  }
+
   ownsThread(actorId: string, threadId: string): boolean {
     return this.threadOwners.get(threadId) === actorId;
   }
@@ -96,7 +111,7 @@ export class McpAccessManager {
     try {
       if (fs.existsSync(this.accessFile)) stored = JSON.parse(fs.readFileSync(this.accessFile, "utf8")) as StoredAccess;
     } catch (error) {
-      console.error("[ForgeDeck] Ignoring invalid MCP access file:", error);
+      logger.warn("Ignoring invalid MCP access file", { error });
     }
     for (const [actorId, actor] of Object.entries(stored.actors || {})) {
       if (!actor || typeof actor.tokenHash !== "string") continue;
@@ -120,7 +135,10 @@ export class McpAccessManager {
 }
 
 function loadOrCreateSecret(tokenPath: string): string {
-  if (fs.existsSync(tokenPath)) return fs.readFileSync(tokenPath, "utf8").trim();
+  if (fs.existsSync(tokenPath)) {
+    fs.chmodSync(tokenPath, 0o600);
+    return fs.readFileSync(tokenPath, "utf8").trim();
+  }
   const secret = crypto.randomBytes(32).toString("base64url");
   fs.writeFileSync(tokenPath, `${secret}\n`, { mode: 0o600, flag: "wx" });
   return secret;

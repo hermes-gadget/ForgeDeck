@@ -62,3 +62,41 @@ test("AuthManager permits requests without a key when authentication is disabled
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("AuthManager applies secure cookies automatically for HTTPS requests", () => {
+  const previousPassword = process.env.FORGEDECK_PASSWORD;
+  const previousAuth = process.env.FORGEDECK_AUTH;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-cookie-"));
+  process.env.FORGEDECK_PASSWORD = "a-secure-test-password";
+  delete process.env.FORGEDECK_AUTH;
+  try {
+    const auth = new AuthManager(directory, "auto");
+    let secure: boolean | undefined;
+    auth.setCookie(
+      { secure: true } as never,
+      { cookie: (_name: string, _value: string, options: { secure?: boolean }) => { secure = options.secure; } } as never,
+      "session-id"
+    );
+    assert.equal(secure, true);
+  } finally {
+    if (previousPassword === undefined) delete process.env.FORGEDECK_PASSWORD;
+    else process.env.FORGEDECK_PASSWORD = previousPassword;
+    if (previousAuth === undefined) delete process.env.FORGEDECK_AUTH;
+    else process.env.FORGEDECK_AUTH = previousAuth;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("AuthManager treats malformed cookie encoding as unauthenticated", () => {
+  const previousPassword = process.env.FORGEDECK_PASSWORD;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-cookie-"));
+  process.env.FORGEDECK_PASSWORD = "a-secure-test-password";
+  try {
+    const auth = new AuthManager(directory);
+    assert.equal(auth.isAuthenticated({ headers: { cookie: "forgedeck_session=%E0%A4%A" } } as never), false);
+  } finally {
+    if (previousPassword === undefined) delete process.env.FORGEDECK_PASSWORD;
+    else process.env.FORGEDECK_PASSWORD = previousPassword;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

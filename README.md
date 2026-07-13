@@ -62,6 +62,8 @@ npm run uninstall-service
 
 The installer creates separate `forgedeck.service` and `forgedeck-codex.service` user units. The dashboard can restart and reconnect without stopping turns because the Codex app-server runtime remains alive independently. Both services restart after crashes and start with the user's systemd session. If this machine is configured to end user services on logout, an administrator can enable lingering with `loginctl enable-linger "$USER"`.
 
+The service installer is Linux/systemd-specific. External-session liveness also uses Linux `/proc`; on other platforms ForgeDeck continues without that signal and reports monitor degradation through `/api/health` when the Codex state store is unavailable.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -71,11 +73,24 @@ The installer creates separate `forgedeck.service` and `forgedeck-codex.service`
 | `FORGEDECK_AUTH` | `on` | Set to `off` to disable the ForgeDeck login |
 | `FORGEDECK_PASSWORD` | generated token | ForgeDeck login password |
 | `FORGEDECK_ROOTS` | current home directory | Colon-separated selectable workspace roots |
+| `FORGEDECK_DATA_DIR` | `.data` | Runtime state and credential directory |
+| `FORGEDECK_COOKIE_SECURE` | `auto` | `auto`, `on`, or `off` for the session cookie's Secure flag |
+| `FORGEDECK_TRUST_PROXY` | `off` | Trust one reverse proxy hop for protocol and client IP detection |
+| `FORGEDECK_TRUSTED_ORIGINS` | none | Comma-separated explicit HTTP(S) origins allowed by CORS |
+| `FORGEDECK_RATE_LIMIT` | `300` | Maximum API requests per client and rate window |
+| `FORGEDECK_SESSION_TTL_HOURS` | `24` | Idle-session archive age; `0` disables automatic archival |
+| `FORGEDECK_QUEUE_MAX_MESSAGES` | `100` | Maximum persisted queued messages per session |
+| `FORGEDECK_MODEL_CACHE_TTL_MS` | `30000` | Account model-list cache duration |
+| `FORGEDECK_SLOW_REQUEST_MS` | `750` | API latency threshold for a warning; `0` disables warnings |
+| `FORGEDECK_SHUTDOWN_TIMEOUT_MS` | `10000` | Grace period before lingering connections are forced closed |
+| `FORGEDECK_EXTERNAL_MONITOR` | `on` | Enable read-only monitoring of other local Codex sessions |
+| `FORGEDECK_LOG_LEVEL` | `info` | Structured log threshold: `debug`, `info`, `warn`, or `error` |
 | `CODEX_BIN` | `codex` on `PATH` | Codex executable path |
 | `FORGEDECK_URL` | `http://127.0.0.1:4173` | Dashboard API URL used by the stdio MCP server |
 | `FORGEDECK_MCP_TOKEN_FILE` | `.data/mcp-token` | MCP bootstrap token path for nonstandard installations |
 
 The production start command and included systemd service automatically load `.env` when it exists.
+See [`.env.example`](.env.example) for buffer limits, monitor tuning, build diagnostics, and compatibility aliases. Invalid values fail fast during startup instead of silently using unsafe settings.
 
 ## MCP server for AI-orchestrated sessions
 
@@ -89,6 +104,8 @@ codex mcp add forgedeck -- node /absolute/path/to/forgedeck/build/server/mcp.js
 ```
 
 For another MCP client, configure an stdio server with `node` as the command and `/absolute/path/to/forgedeck/build/server/mcp.js` as its argument. The dashboard must be running. Set `FORGEDECK_URL` only when it does not use the default `http://127.0.0.1:4173`; the MCP bootstrap credential is read from `.data/mcp-token` by default.
+
+Direct `node .../mcp.js` registrations do not automatically load the project `.env`; provide `FORGEDECK_URL` and `FORGEDECK_MCP_TOKEN_FILE` in that MCP client's environment. The `npm run mcp` wrapper does load `.env`.
 
 Each MCP subprocess registers a separate actor credential. The ForgeDeck server records which sessions that actor created and enforces the boundary on every mutation. MCP callers have read-only access to user-created and other agents' sessions, while the user keeps normal Control Center access to everything. Ownership records survive dashboard restarts.
 
@@ -108,7 +125,14 @@ Each MCP subprocess registers a separate actor credential. The ForgeDeck server 
 npm run dev       # Vite on :5173, server on :4173
 npm run check     # client and server type checks
 npm run build     # production bundles
+npm test          # build the server and run all unit tests
+npm run test:coverage # emit Node's line/branch/function coverage report
+npm run build:analyze # write dist/bundle-report.html
 npm audit         # dependency audit
 ```
+
+Production browser source maps are disabled by default. Set `FORGEDECK_SOURCEMAP=true` only when a deployment needs them. Markdown rendering is loaded as a separate chunk, keeping the initial application JavaScript smaller.
+
+The authenticated `GET /api/diagnostics/performance` endpoint reports aggregate route latency and Codex bridge metrics without recording request bodies, query values, cookies, or tokens. `GET /api/health` remains a minimal unauthenticated liveness/degradation check. See [docs/API.md](docs/API.md) for the HTTP and SSE contract.
 
 ForgeDeck is intentionally a private package (`"private": true`). If you publish the source to GitHub, create the repository as private unless you deliberately want to share the code; no host credentials are required in the repository.

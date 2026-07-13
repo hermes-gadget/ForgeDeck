@@ -26,3 +26,22 @@ test("WorkspacePaths lists directories and rejects credential paths and escapes"
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("WorkspacePaths file search does not follow directory symlinks outside a root", async () => {
+  const previous = process.env.FORGEDECK_ROOTS;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-search-root-"));
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-search-outside-"));
+  const project = path.join(root, "project");
+  await fs.mkdir(project);
+  await fs.writeFile(path.join(outside, "private-name.txt"), "not exposed");
+  await fs.symlink(outside, path.join(project, "escape"), "dir");
+  process.env.FORGEDECK_ROOTS = root;
+  try {
+    const workspaces = await WorkspacePaths.create();
+    assert.deepEqual(await workspaces.searchFiles(project, "private-name"), []);
+  } finally {
+    if (previous === undefined) delete process.env.FORGEDECK_ROOTS;
+    else process.env.FORGEDECK_ROOTS = previous;
+    await Promise.all([fs.rm(root, { recursive: true, force: true }), fs.rm(outside, { recursive: true, force: true })]);
+  }
+});

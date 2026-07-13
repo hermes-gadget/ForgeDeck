@@ -79,15 +79,24 @@ export class WorkspacePaths {
     const needle = query.trim().replace(/^\.\//, "").toLowerCase();
     const results: FileSuggestion[] = [];
     const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
+    const visited = new Set<string>();
     let scanned = 0;
     while (queue.length && results.length < limit && scanned < 4_000) {
       const current = queue.shift()!;
+      let directory: string;
+      try {
+        const pathStat = await fs.lstat(current.directory);
+        if (pathStat.isSymbolicLink() || !pathStat.isDirectory()) continue;
+        directory = await fs.realpath(current.directory);
+      } catch { continue; }
+      if (visited.has(directory) || !isWithin(root, directory) || this.isSensitive(directory)) continue;
+      visited.add(directory);
       let entries: Dirent<string>[];
-      try { entries = await fs.readdir(current.directory, { withFileTypes: true, encoding: "utf8" }); } catch { continue; }
+      try { entries = await fs.readdir(directory, { withFileTypes: true, encoding: "utf8" }); } catch { continue; }
       for (const entry of entries) {
         scanned += 1;
         if (entry.name === "node_modules" || entry.name === ".git" || BLOCKED_SEGMENTS.has(entry.name) || (entry.name.startsWith(".") && !needle.startsWith("."))) continue;
-        const absolute = path.join(current.directory, entry.name);
+        const absolute = path.join(directory, entry.name);
         const relativePath = path.relative(root, absolute);
         if (entry.isDirectory() && current.depth < 6) queue.push({ directory: absolute, depth: current.depth + 1 });
         if (!entry.isFile() && !entry.isDirectory()) continue;
