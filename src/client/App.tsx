@@ -535,6 +535,10 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const visibleColumns = Math.max(1, Math.min(columns, pageThreads.length));
+  const visibleRows = Math.max(1, Math.ceil(pageThreads.length / visibleColumns));
+  const rowHeight = visibleRows === 1 ? "calc(100vh - 157px)" : "calc((100vh - 168px) / 2)";
+
   return <section className="control-center">
     <div className="control-toolbar">
       <div><span className="live-beacon"><i />LIVE</span><p>Agent messages and tool output stream into every panel.</p></div>
@@ -544,7 +548,7 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
       </div>
     </div>
 
-    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": Math.min(columns, pageThreads.length) } as React.CSSProperties}>
+    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-row-height": rowHeight } as React.CSSProperties}>
       {pageThreads.map((summary) => {
         const thread = details[summary.id] || summary;
         const threadSettings = settings[thread.id] || (defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" });
