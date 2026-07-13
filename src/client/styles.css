@@ -140,7 +140,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-header span i { font-style: normal; }
 .control-header span b { color: var(--green); font-weight: 500; }
 
-.control-center { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px 16px; display: flex; flex-direction: column; }
+.control-center { flex: 1; min-height: 0; overflow: hidden; padding: 14px 16px 16px; display: flex; flex-direction: column; }
 .control-toolbar { min-height: 38px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .control-toolbar > div:first-child { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .control-toolbar p { margin: 0; color: #626c78; font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -149,8 +149,8 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-toolbar-actions { display: flex; align-items: center; gap: 6px; }
 .add-panel { height: 30px; border: 1px solid var(--line); border-radius: 6px; background: #10141a; display: flex; align-items: center; gap: 5px; padding-left: 8px; color: #7a8490; }
 .add-panel select { max-width: 150px; border: 0; outline: 0; background: transparent; color: #9ca5af; font-size: 9px; padding-right: 5px; }
-.control-grid { flex: 1; min-height: calc(var(--control-rows, 2) * 320px + (var(--control-rows, 2) - 1) * 11px); display: grid; grid-template-columns: repeat(var(--control-columns, 4), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(320px, 1fr)); gap: 11px; align-content: stretch; }
-.control-card { min-width: 0; min-height: 320px; border: 1px solid #252b34; border-radius: 10px; background: linear-gradient(160deg, #10141a, #0c0f14 68%); display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.16); }
+.control-grid { flex: 1 1 0; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: repeat(var(--control-columns, 4), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(280px, 1fr)); gap: 11px; align-content: stretch; }
+.control-card { min-width: 0; min-height: 0; height: 100%; border: 1px solid #252b34; border-radius: 10px; background: linear-gradient(160deg, #10141a, #0c0f14 68%); display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,.16); }
 .control-card.running { border-color: rgba(86, 212, 155, .27); box-shadow: inset 0 1px rgba(86, 212, 155, .04), 0 10px 32px rgba(0,0,0,.2); }
 .control-card.completed:not(.running) { border-color: rgba(255, 107, 44, .65); animation: completedGlow 2.8s ease-in-out infinite; }
 .control-goal { flex: 0 0 27px; min-width: 0; padding: 0 8px; border: 0; border-top: 1px solid #282821; border-bottom: 1px solid #282821; background: rgba(255, 169, 58, .045); color: #9d835d; display: flex; align-items: center; gap: 6px; text-align: left; }
@@ -167,6 +167,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .control-card-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
 .control-card-actions button { width: 25px; height: 25px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: #59626e; display: grid; place-items: center; }
 .control-card-actions button:hover { background: #1a1f26; color: #aab2bc; }
+.control-card-actions .policy-button { width: auto; min-width: 39px; padding: 0 5px; display: flex; gap: 3px; }
 .tool-count { height: 20px; padding: 0 5px; margin-right: 2px; border-radius: 5px; background: #181d24; color: #68727f; display: flex; align-items: center; gap: 3px; font-size: 8px; }
 .queue-count { height: 20px; padding: 0 5px; margin-right: 2px; border-radius: 5px; background: rgba(110, 157, 255, .09); color: #85aaff; display: flex; align-items: center; gap: 3px; font-size: 8px; }
 .done-label { height: 20px; padding: 0 6px; border: 1px solid rgba(255, 107, 44, .3); border-radius: 5px; background: rgba(255, 107, 44, .1); color: var(--orange-2); display: flex; align-items: center; font-size: 7px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; }
@@ -201,6 +202,13 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .compact-tool pre { max-height: 120px; overflow: auto; margin: 0; padding: 7px; border-top: 1px solid #20262e; background: #07090c; color: #7c8793; white-space: pre-wrap; word-break: break-word; font-size: 7.5px; line-height: 1.5; }
 .control-models { flex: 0 0 27px; padding: 3px 7px; border-top: 1px solid var(--line-soft); display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, .9fr); gap: 4px; }
 .control-models select { min-width: 0; border: 0; border-radius: 4px; outline: 0; background: #11151a; color: #6f7985; font-size: 7.5px; padding: 0 4px; }
+.control-queue { flex: 0 0 auto; max-height: 86px; overflow-y: auto; border-top: 1px solid #223044; background: rgba(46, 75, 112, .08); }
+.control-queue > span { min-height: 22px; padding: 3px 7px; display: flex; align-items: center; gap: 5px; color: #7897c1; font-size: 7px; font-weight: 700; text-transform: uppercase; letter-spacing: .55px; }
+.control-queue > div { min-height: 24px; padding: 3px 5px 3px 7px; border-top: 1px solid rgba(34, 48, 68, .65); display: flex; align-items: center; gap: 5px; }
+.control-queue b { width: 14px; height: 14px; flex: 0 0 auto; border-radius: 4px; display: grid; place-items: center; background: #1c3049; color: #91b8eb; font-size: 6px; }
+.control-queue em { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #8595a9; font-size: 7.5px; font-style: normal; }
+.control-queue button { width: 20px; height: 20px; border: 0; border-radius: 4px; display: grid; place-items: center; background: transparent; color: #60758e; }
+.control-queue button:hover { background: #1b2b40; color: #b5c9e4; }
 .control-composer { flex: 0 0 39px; padding: 5px 6px; border-top: 1px solid var(--line-soft); background: #0a0d11; display: flex; gap: 5px; position: relative; }
 .control-composer input { min-width: 0; flex: 1; border: 1px solid #242b34; border-radius: 6px; outline: 0; background: #11151a; color: #d5dae0; padding: 0 8px; font-size: 9px; }
 .control-composer input:focus { border-color: #424b57; }
@@ -316,6 +324,10 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 .model-controls { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .model-controls label { min-width: 0; height: 28px; border: 1px solid #242a33; background: #0d1015; border-radius: 6px; display: flex; align-items: center; gap: 5px; padding-left: 7px; color: #6d7682; }
 .model-controls select { min-width: 0; max-width: 190px; border: 0; outline: 0; background: transparent; color: #929ba7; font-size: 9.5px; padding-right: 4px; }
+.policy-button { height: 28px; flex: 0 0 auto; padding: 0 8px; border: 1px solid #303741; border-radius: 6px; background: #11161c; color: #7d8793; display: inline-flex; align-items: center; justify-content: center; gap: 5px; font-size: 8px; }
+.policy-button:hover:not(:disabled) { border-color: #49525e; color: #bdc5ce; }
+.policy-button.yolo { border-color: rgba(255,107,44,.42); background: rgba(255,107,44,.1); color: var(--orange-2); }
+.policy-button.compact { height: 20px; border-radius: 5px; font-size: 6.5px; }
 .send-button, .stop-button { height: 31px; min-width: 72px; border: 1px solid #d65622; border-radius: 7px; background: linear-gradient(180deg, #ff7437, #df5420); display: flex; align-items: center; justify-content: center; gap: 7px; font-size: 10px; font-weight: 600; color: white; }
 .send-button:hover { filter: brightness(1.08); }
 .send-button.queue { border-color: #42658f; background: linear-gradient(180deg, #365d8b, #29496f); color: #d6e5ff; }
@@ -460,7 +472,7 @@ code, pre, kbd { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-
 }
 
 @media (max-width: 679px) {
-  .control-grid { grid-template-columns: repeat(var(--control-columns, 1), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(350px, 1fr)); min-height: calc(var(--control-rows, 2) * 350px + (var(--control-rows, 2) - 1) * 11px); }
+  .control-grid { grid-template-columns: repeat(var(--control-columns, 1), minmax(0, 1fr)); grid-template-rows: repeat(var(--control-rows, 2), minmax(320px, 1fr)); }
   .control-toolbar p { display: none; }
   .control-pages { justify-content: space-between; }
 }

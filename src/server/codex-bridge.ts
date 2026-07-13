@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
+import WebSocket from "ws";
 
 type RpcId = string | number;
 type RpcMessage = {
@@ -21,6 +22,7 @@ export type ServerRequest = { id: RpcId; method: string; params: unknown; receiv
 
 export class CodexBridge extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
+  private socket: WebSocket | null = null;
   private nextId = 1;
   private pending = new Map<RpcId, PendingCall>();
   private serverRequests = new Map<string, ServerRequest>();
@@ -28,7 +30,7 @@ export class CodexBridge extends EventEmitter {
   private stopping = false;
 
   async start(): Promise<void> {
-    if (this.child && !this.child.killed) return;
+    if ((this.child && !this.child.killed) || this.socket?.readyState === WebSocket.OPEN) return;
     if (this.startPromise) return this.startPromise;
     this.startPromise = this.launch();
     try {
@@ -40,6 +42,19 @@ export class CodexBridge extends EventEmitter {
 
   private async launch(): Promise<void> {
     const codexBin = process.env.CODEX_BIN || "codex";
+    const serverUrl = process.env.CODEX_APP_SERVER_URL?.trim();
+    if (serverUrl) await this.connectSocket(serverUrl);
+    else await this.spawnChild(codexBin);
+
+    await this.callRaw("initialize", {
+      clientInfo: { name: "forgedeck", title: "ForgeDeck", version: "0.1.0" },
+      capabilities: { experimentalApi: true, requestAttestation: false }
+    });
+    this.write({ method: "initialized" });
+    this.emit("ready");
+  }
+
+  private async spawnChild(codexBin: string): Promise<void> {
     const child = spawn(codexBin, ["app-server", "--stdio"], {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"]
@@ -66,13 +81,24 @@ export class CodexBridge extends EventEmitter {
       child.once("spawn", onSpawn);
       child.once("error", onError);
     });
+  }
 
-    await this.callRaw("initialize", {
-      clientInfo: { name: "forgedeck", title: "ForgeDeck", version: "0.1.0" },
-      capabilities: { experimentalApi: true, requestAttestation: false }
+  private async connectSocket(serverUrl: string): Promise<void> {
+    const socket = new WebSocket(serverUrl);
+    this.socket = socket;
+    socket.on("message", (data) => this.handleLine(String(data)));
+    socket.on("error", (error) => this.emit("error", error));
+    socket.on("close", () => this.handleExit(null, null));
+    await new Promise<void>((resolve, reject) => {
+      const onConnect = () => { cleanup(); resolve(); };
+      const onError = (error: Error) => { cleanup(); reject(error); };
+      const cleanup = () => {
+        socket.off("open", onConnect);
+        socket.off("error", onError);
+      };
+      socket.once("open", onConnect);
+      socket.once("error", onError);
     });
-    this.write({ method: "initialized" });
-    this.emit("ready");
   }
 
   async request<T = unknown>(method: string, params?: unknown, timeoutMs = 30_000): Promise<T> {
@@ -94,6 +120,7 @@ export class CodexBridge extends EventEmitter {
 
   stop(): void {
     this.stopping = true;
+    this.socket?.terminate();
     this.child?.kill("SIGTERM");
   }
 
@@ -118,6 +145,10 @@ export class CodexBridge extends EventEmitter {
   }
 
   private write(message: RpcMessage): void {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(message));
+      return;
+    }
     if (!this.child?.stdin.writable) throw new Error("Codex app-server is not available");
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
@@ -162,8 +193,10 @@ export class CodexBridge extends EventEmitter {
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null): void {
+    if (!this.child && !this.socket) return;
     this.child = null;
-    const error = new Error(`Codex app-server exited (${signal || code || "unknown"})`);
+    this.socket = null;
+    const error = new Error(`Codex app-server connection closed (${signal || code || "unknown"})`);
     for (const call of this.pending.values()) {
       clearTimeout(call.timer);
       call.reject(error);

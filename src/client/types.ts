@@ -55,6 +55,7 @@ export type Thread = {
   turns: Turn[];
   gitInfo?: { branch?: string; repositoryUrl?: string } | null;
   goal?: ThreadGoal | null;
+  policy?: "workspace-write" | "yolo";
 };
 
 export type ThreadGoal = {

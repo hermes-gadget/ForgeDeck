@@ -13,6 +13,7 @@ type Tracker = {
   offset: number;
   partial: string;
   active: boolean;
+  activeTurnId: string | null;
   calls: Map<string, ToolItem>;
   recent: ToolItem[];
 };
@@ -67,6 +68,7 @@ export class ExternalCodexMonitor {
         offset: Math.max(0, stat.size - 1024 * 1024),
         partial: "",
         active: false,
+        activeTurnId: null,
         calls: new Map(),
         recent: []
       };
@@ -103,6 +105,16 @@ export class ExternalCodexMonitor {
     if (!payload) return;
     const payloadType = String(payload.type || "");
 
+    if (record.type === "event_msg" && payloadType === "task_started") {
+      const changed = !tracker.active;
+      tracker.active = true;
+      tracker.activeTurnId = String(payload.turn_id || "external");
+      if (emitNow) {
+        if (changed) this.emitStatus(tracker);
+        this.emit({ method: "turn/started", params: { threadId: tracker.id, turn: { id: tracker.activeTurnId, status: "inProgress", items: [] } } });
+      }
+      return;
+    }
     if (record.type === "event_msg" && payloadType === "user_message") {
       const changed = !tracker.active;
       tracker.active = true;
@@ -111,10 +123,12 @@ export class ExternalCodexMonitor {
     }
     if (record.type === "event_msg" && ["task_complete", "turn_complete", "turn_aborted", "task_cancelled"].includes(payloadType)) {
       const changed = tracker.active;
+      const turnId = String(payload.turn_id || tracker.activeTurnId || "external");
       tracker.active = false;
+      tracker.activeTurnId = null;
       if (emitNow && changed) {
         this.emitStatus(tracker);
-        this.emit({ method: "turn/completed", params: { threadId: tracker.id, turn: { id: String(payload.turn_id || "external"), status: payloadType.includes("abort") || payloadType.includes("cancel") ? "interrupted" : "completed", items: [] } } });
+        this.emit({ method: "turn/completed", params: { threadId: tracker.id, turn: { id: turnId, status: payloadType.includes("abort") || payloadType.includes("cancel") ? "interrupted" : "completed", items: [] } } });
       }
       return;
     }
@@ -141,6 +155,7 @@ export class ExternalCodexMonitor {
       const role = String(payload.role || "");
       const text = extractMessageText(payload.content);
       if (!text || !["assistant", "user"].includes(role)) return;
+      if (role === "user" && isInjectedUserContext(text)) return;
       const id = String(payload.id || `${role}-${record.timestamp || tracker.recent.length}`);
       const item: ToolItem = role === "assistant"
         ? { type: "agentMessage", id, text, phase: payload.phase == null ? null : String(payload.phase), memoryCitation: null }
@@ -152,7 +167,11 @@ export class ExternalCodexMonitor {
     if (payloadType === "custom_tool_call" || payloadType === "function_call") {
       const callId = String(payload.call_id || payload.id || `external-${Date.now()}`);
       const name = String(payload.name || "tool");
-      const command = name === "exec" ? extractCommand(String(payload.input || payload.arguments || "")) : null;
+      const rawInput = String(payload.input || payload.arguments || "");
+      // Patch calls get a richer patch_apply_end record immediately afterward.
+      // Do not mislabel the wrapper invocation as a shell command in the meantime.
+      if (name === "exec" && isApplyPatchCall(rawInput)) return;
+      const command = name === "exec" ? extractCommand(rawInput) : null;
       const item: ToolItem = command ? {
         type: "commandExecution", id: String(payload.id || callId), command, cwd: tracker.cwd, processId: null,
         source: "externalCodex", status: "inProgress", commandActions: [], aggregatedOutput: null, exitCode: null, durationMs: null
@@ -194,12 +213,15 @@ function pushRecent(tracker: Tracker, item: ToolItem): void {
 
 function extractCommand(input: string): string {
   if (!input) return "Codex command";
-  if (input.includes("tools.apply_patch") || input.includes("*** Begin Patch")) return "Apply file patch";
   const match = input.match(/exec_command\(\{cmd:("(?:\\.|[^"\\])*")/s);
   if (match) {
     try { return JSON.parse(match[1]); } catch { /* use compact fallback */ }
   }
   return input.length > 4_000 ? `${input.slice(0, 3_999)}…` : input;
+}
+
+export function isApplyPatchCall(input: string): boolean {
+  return input.includes("tools.apply_patch") || (input.includes("apply_patch") && input.includes("*** Begin Patch"));
 }
 
 function parseArguments(value: unknown): unknown {
@@ -228,4 +250,9 @@ function extractMessageText(value: unknown): string {
     const content = part as { type?: unknown; text?: unknown };
     return ["input_text", "output_text", "text"].includes(String(content.type || "")) ? String(content.text || "") : "";
   }).filter(Boolean).join("\n");
+}
+
+export function isInjectedUserContext(text: string): boolean {
+  const trimmed = text.trim();
+  return /^<(environment_context|codex_internal_context)(?:\s[^>]*)?>[\s\S]*<\/\1>$/.test(trimmed);
 }

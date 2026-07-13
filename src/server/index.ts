@@ -27,6 +27,7 @@ type ThreadPolicy = "workspace-write" | "yolo";
 const policyFile = path.join(dataDir, "thread-policies.json");
 const threadPolicies = loadThreadPolicies();
 const activeThreads = new Set<string>();
+const activeTurnIds = new Map<string, string>();
 const drainingQueues = new Set<string>();
 const bridgeOwnedThreads = new Set<string>();
 type LiveThreadState = {
@@ -151,7 +152,10 @@ app.post("/api/threads", async (req, res, next) => {
     const name = optionalString(req.body?.name);
     if (name) await codex.request("thread/name/set", { threadId, name: name.slice(0, 100) });
     const prompt = optionalString(req.body?.prompt);
-    if (prompt) await startTurn(threadId, prompt, model, effort);
+    if (prompt) {
+      bridgeOwnedThreads.add(threadId);
+      await startTurn(threadId, prompt, model, effort);
+    }
     res.status(201).json(result);
   } catch (error) {
     next(error);
@@ -165,7 +169,7 @@ app.get("/api/threads/:threadId", async (req, res, next) => {
       codex.request<{ thread: Record<string, unknown> }>("thread/read", { threadId, includeTurns: true }, 60_000),
       codex.request<{ goal: Record<string, unknown> | null }>("thread/goal/get", { threadId }).catch(() => ({ goal: null }))
     ]);
-    res.json({ ...snapshot, thread: { ...snapshot.thread, goal: goal.goal } });
+    res.json({ ...snapshot, thread: { ...snapshot.thread, goal: goal.goal, policy: threadPolicies.get(threadId) || "workspace-write" } });
   } catch (error) {
     next(error);
   }
@@ -179,6 +183,7 @@ app.post("/api/threads/:threadId/messages", async (req, res, next) => {
     const model = requiredString(req.body?.model, "Model");
     const effort = optionalString(req.body?.effort);
     await validateModelChoice(model, effort);
+    bridgeOwnedThreads.add(threadId);
     await codex.request("thread/resume", { threadId, model, excludeTurns: true }, 60_000);
     res.status(202).json(await startTurn(threadId, text, model, effort));
   } catch (error) {
@@ -196,10 +201,9 @@ app.post("/api/threads/:threadId/command", async (req, res, next) => {
       return;
     }
     if (command === "stop") {
-      const snapshot = await codex.request<{ thread: { turns: Array<{ id: string; status: string }> } }>("thread/read", { threadId, includeTurns: true }, 60_000);
-      const turn = [...snapshot.thread.turns].reverse().find((item) => item.status === "inProgress");
-      if (!turn) throw httpError("This session has no active turn", 409);
-      res.json(await codex.request("turn/interrupt", { threadId, turnId: turn.id }));
+      const turnId = await findActiveTurnId(threadId);
+      if (!turnId) throw httpError("This session has no active turn", 409);
+      res.json(await codex.request("turn/interrupt", { threadId, turnId }));
       return;
     }
     if (command === "rename") {
@@ -280,8 +284,32 @@ app.delete("/api/threads/:threadId/queue/:queueId", (req, res, next) => {
 app.post("/api/threads/:threadId/interrupt", async (req, res, next) => {
   try {
     const threadId = validThreadId(req.params.threadId);
-    const turnId = requiredString(req.body?.turnId, "Turn id");
+    const requestedTurnId = optionalString(req.body?.turnId);
+    const turnId = requestedTurnId || await findActiveTurnId(threadId);
+    if (!turnId) throw httpError("This session has no active turn", 409);
     res.json(await codex.request("turn/interrupt", { threadId, turnId }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/threads/:threadId/policy", async (req, res, next) => {
+  try {
+    const threadId = validThreadId(req.params.threadId);
+    if (activeThreads.has(threadId) || await findActiveTurnId(threadId)) throw httpError("Stop or finish the current turn before changing permissions", 409);
+    const policy: ThreadPolicy = req.body?.yolo === true ? "yolo" : "workspace-write";
+    await codex.request("thread/resume", { threadId, excludeTurns: true }, 60_000);
+    await codex.request("thread/settings/update", policy === "yolo" ? {
+      threadId, approvalPolicy: "never", sandboxPolicy: { type: "dangerFullAccess" }
+    } : {
+      threadId, approvalPolicy: "on-request", sandboxPolicy: {
+        type: "workspaceWrite", writableRoots: [], networkAccess: false,
+        excludeTmpdirEnvVar: false, excludeSlashTmp: false
+      }
+    });
+    threadPolicies.set(threadId, policy);
+    persistThreadPolicies();
+    res.json({ policy });
   } catch (error) {
     next(error);
   }
@@ -342,12 +370,16 @@ app.get("/events", (req, res) => {
 
 codex.on("notification", (payload) => {
   const notification = payload as { method: string; params?: Record<string, unknown> };
-  if (notification.method === "thread/started") {
-    const thread = notification.params?.thread as { id?: string } | undefined;
-    if (thread?.id) bridgeOwnedThreads.add(thread.id);
+  if (notification.method === "turn/started") {
+    const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
+    if (threadId) bridgeOwnedThreads.add(threadId);
   }
   recordLiveEvent(notification);
   broadcast("codex", payload);
+  if (notification.method === "turn/completed") {
+    const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
+    if (threadId) bridgeOwnedThreads.delete(threadId);
+  }
 });
 codex.on("serverRequest", (payload) => broadcast("approval", payload));
 codex.on("serverRequestResolved", (payload) => broadcast("approval-resolved", payload));
@@ -431,22 +463,20 @@ async function drainQueue(threadId: string): Promise<void> {
       return;
     }
     const queue = messageQueues.get(threadId) || [];
-    entry = queue.shift();
+    entry = queue[0];
     if (!entry) return;
+    activeThreads.add(threadId);
+    bridgeOwnedThreads.add(threadId);
+    await codex.request("thread/resume", { threadId, model: entry.model, excludeTurns: true }, 60_000);
+    await startTurn(threadId, entry.text, entry.model, entry.effort);
+    queue.shift();
     if (queue.length) messageQueues.set(threadId, queue);
     else messageQueues.delete(threadId);
     persistMessageQueues();
     broadcastQueue(threadId);
-    activeThreads.add(threadId);
-    await codex.request("thread/resume", { threadId, model: entry.model, excludeTurns: true }, 60_000);
-    await startTurn(threadId, entry.text, entry.model, entry.effort);
   } catch (error) {
     activeThreads.delete(threadId);
     if (entry) {
-      const queue = messageQueues.get(threadId) || [];
-      queue.unshift(entry);
-      messageQueues.set(threadId, queue);
-      persistMessageQueues();
       broadcastQueue(threadId, error instanceof Error ? error.message : String(error));
     }
     console.error(`[ForgeDeck] Could not start queued turn for ${threadId}:`, error);
@@ -455,7 +485,14 @@ async function drainQueue(threadId: string): Promise<void> {
   }
 }
 
-type ThreadSnapshot = { status?: { type?: string }; turns?: Array<{ status?: string }> };
+async function findActiveTurnId(threadId: string): Promise<string | null> {
+  const known = activeTurnIds.get(threadId);
+  if (known) return known;
+  const snapshot = await codex.request<{ thread: ThreadSnapshot }>("thread/read", { threadId, includeTurns: true }, 60_000);
+  return [...(snapshot.thread.turns || [])].reverse().find((turn) => turn.status === "inProgress")?.id || null;
+}
+
+type ThreadSnapshot = { status?: { type?: string }; turns?: Array<{ id?: string; status?: string }> };
 
 function loadMessageQueues(): Map<string, QueuedMessage[]> {
   try {
@@ -538,9 +575,14 @@ function recordLiveEvent(notification: { method: string; params?: Record<string,
   const params = notification.params;
   const threadId = typeof params?.threadId === "string" ? params.threadId : null;
   if (!threadId) return;
-  if (notification.method === "turn/started") activeThreads.add(threadId);
+  if (notification.method === "turn/started") {
+    activeThreads.add(threadId);
+    const turn = params?.turn as { id?: unknown } | undefined;
+    if (typeof turn?.id === "string") activeTurnIds.set(threadId, turn.id);
+  }
   if (notification.method === "turn/completed") {
     activeThreads.delete(threadId);
+    activeTurnIds.delete(threadId);
     setTimeout(() => void drainQueue(threadId), 50).unref();
   }
   if (notification.method === "thread/status/changed") {

@@ -50,6 +50,7 @@ export default function App() {
   const [liveToolOutput, setLiveToolOutput] = useState<LiveStreams>({});
   const [liveItems, setLiveItems] = useState<LiveItems>({});
   const [liveStatuses, setLiveStatuses] = useState<Record<string, Thread["status"]>>({});
+  const [activeThreadIds, setActiveThreadIds] = useState<Set<string>>(new Set());
   const [queues, setQueues] = useState<Record<string, QueueEntry[]>>({});
   const [completedSignals, setCompletedSignals] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem("forgedeck-completed") || "[]")));
   const [activityVersion, setActivityVersion] = useState(0);
@@ -66,6 +67,7 @@ export default function App() {
     setBootstrap(data);
     setPending(data.pendingRequests);
     setQueues(data.queues || {});
+    setActiveThreadIds(new Set(data.activeThreadIds || []));
     if (data.activeThreadIds?.length) {
       setLiveStatuses((current) => Object.fromEntries([
         ...Object.entries(current),
@@ -153,6 +155,11 @@ export default function App() {
   useEffect(() => {
     if (!authenticated) return;
     const events = new EventSource("/events");
+    events.addEventListener("connected", () => {
+      setRuntime("ready");
+      void loadBootstrap().catch(() => undefined);
+      void loadThreads().catch(() => undefined);
+    });
     events.addEventListener("runtime", (event) => {
       const payload = JSON.parse((event as MessageEvent).data);
       setRuntime(payload.state);
@@ -208,10 +215,15 @@ export default function App() {
         setDetail((current) => current?.id === threadId ? { ...current, status } : current);
       }
       if (notification.method === "turn/started" && threadId) {
+        setActiveThreadIds((current) => new Set(current).add(threadId));
         setCompletedSignals((current) => withoutSetValue(current, threadId));
       }
       if (notification.method === "turn/completed" && threadId) {
+        setActiveThreadIds((current) => withoutSetValue(current, threadId));
         setCompletedSignals((current) => new Set(current).add(threadId));
+      }
+      if (notification.method === "thread/status/changed" && threadId && (notification.params.status as Thread["status"] | undefined)?.type === "active") {
+        setActiveThreadIds((current) => new Set(current).add(threadId));
       }
       if (notification.method === "account/rateLimits/updated") {
         void loadBootstrap().catch(() => undefined);
@@ -254,6 +266,14 @@ export default function App() {
     }
   }, [threads, controlIds.length]);
   useEffect(() => {
+    const activeIds = threads.filter((thread) => activeThreadIds.has(thread.id)).map((thread) => thread.id);
+    if (!activeIds.length) return;
+    setControlIds((current) => {
+      const missing = activeIds.filter((id) => !current.includes(id));
+      return missing.length ? [...current, ...missing] : current;
+    });
+  }, [threads, activeThreadIds]);
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !target?.matches("input, textarea, select, [contenteditable=true]")) {
@@ -273,8 +293,10 @@ export default function App() {
   }, [toast]);
 
   const effectiveThreads = useMemo(() => threads.map((thread) =>
-    liveStatuses[thread.id] ? { ...thread, status: liveStatuses[thread.id] } : thread
-  ), [threads, liveStatuses]);
+    activeThreadIds.has(thread.id)
+      ? { ...thread, status: { type: "active", activeFlags: [] } as Thread["status"] }
+      : liveStatuses[thread.id] ? { ...thread, status: liveStatuses[thread.id] } : thread
+  ), [threads, liveStatuses, activeThreadIds]);
 
   const sortedThreads = useMemo(() => {
     const copy = [...effectiveThreads];
@@ -296,12 +318,11 @@ export default function App() {
     : defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : null;
   const controlThreads = useMemo(() => {
     const byId = new Map(effectiveThreads.map((thread) => [thread.id, thread]));
-    const orderedIds = [...new Set([
-      ...effectiveThreads.filter((thread) => thread.status.type === "active").map((thread) => thread.id),
-      ...controlIds
-    ])];
-    return orderedIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
+    return controlIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
   }, [effectiveThreads, controlIds]);
+  const effectiveDetail = detail && activeThreadIds.has(detail.id)
+    ? { ...detail, status: { type: "active", activeFlags: [] } as Thread["status"] }
+    : detail;
 
   if (authenticated === null) return <Splash />;
   if (!authenticated) return <Login onSuccess={() => setAuthenticated(true)} />;
@@ -391,16 +412,16 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={20} /></button>
-          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={effectiveThreads.filter((thread) => thread.status.type === "active").length} /> : detail ? <ThreadHeader thread={detail} pinned={pinned.has(detail.id)} onPin={() => togglePin(detail.id)}
+          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={effectiveThreads.filter((thread) => thread.status.type === "active").length} /> : effectiveDetail ? <ThreadHeader thread={effectiveDetail} pinned={pinned.has(effectiveDetail.id)} onPin={() => togglePin(effectiveDetail.id)}
             onRename={async () => {
-              const name = prompt("Session name", threadTitle(detail));
+              const name = prompt("Session name", threadTitle(effectiveDetail));
               if (!name?.trim()) return;
-              await api(`/api/threads/${detail.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-              await Promise.all([loadThread(detail.id), loadThreads()]);
+              await api(`/api/threads/${effectiveDetail.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+              await Promise.all([loadThread(effectiveDetail.id), loadThreads()]);
             }}
             onArchive={async () => {
               if (!confirm("Archive this session? Its Codex history will be kept.")) return;
-              await api(`/api/threads/${detail.id}`, { method: "DELETE" });
+              await api(`/api/threads/${effectiveDetail.id}`, { method: "DELETE" });
               setSelectedId(null); setDetail(null); await loadThreads();
             }} /> : <div className="topbar-placeholder">Session workspace</div>}
           <div className={`runtime-pill ${runtime}`}><span />{runtime === "ready" ? "Runtime online" : "Reconnecting"}</div>
@@ -413,9 +434,9 @@ export default function App() {
             completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={toggleControl}
             onAdd={(id) => setControlIds((current) => current.includes(id) ? current : [...current, id])}
             onError={(error) => showError(error, setToast)} />
-        ) : detail ? (
-          <Chat thread={detail} loading={loadingDetail} liveText={liveText[detail.id] || {}} liveToolOutput={liveToolOutput[detail.id] || {}} liveItems={liveItems[detail.id] || {}} queue={queues[detail.id] || []} models={bootstrap.models.data}
-            settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(detail.id)} onError={(error) => showError(error, setToast)} />
+        ) : effectiveDetail ? (
+          <Chat thread={effectiveDetail} loading={loadingDetail} liveText={liveText[effectiveDetail.id] || {}} liveToolOutput={liveToolOutput[effectiveDetail.id] || {}} liveItems={liveItems[effectiveDetail.id] || {}} queue={queues[effectiveDetail.id] || []} models={bootstrap.models.data}
+            settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(effectiveDetail.id)} onError={(error) => showError(error, setToast)} />
         ) : (
           <Welcome onNew={() => setNewOpen(true)} />
         )}
@@ -586,8 +607,8 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
   const historyItems = (thread.turns || []).flatMap((turn) => turn.items);
   const historyIds = new Set(historyItems.map((item) => item.id).filter(Boolean));
   const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
-  const items = [...historyItems, ...Object.values(liveItems).filter((item) =>
-    (!item.id || !historyIds.has(item.id)) && !(item.type === "agentMessage" && item.id && liveText[item.id])
+  const items = [...historyItems, ...unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
+    !(item.type === "agentMessage" && item.id && liveText[item.id])
   )].slice(-8);
   const toolCount = items.filter((item) => isToolItem(item)).length;
   const running = thread.status.type === "active" || Boolean(runningTurn);
@@ -619,7 +640,7 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
   return <article className={`control-card ${running ? "running" : ""} ${completed && !running ? "completed" : ""}`}>
     <header>
       <button className="control-title" onClick={onOpen}><span className={`status-dot ${running ? "active" : thread.status.type}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
-      <div className="control-card-actions">{completed && !running && <span className="done-label">Done</span>}{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
+      <div className="control-card-actions">{completed && !running && <span className="done-label">Done</span>}<PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
     </header>
     {thread.goal && <button type="button" className={`control-goal ${thread.goal.status}`} onClick={onOpen} title={thread.goal.objective}><Target size={11} /><span>{thread.goal.objective}</span><em>{goalStatusLabel(thread.goal.status)}</em></button>}
     <div className="control-feed" ref={body}>
@@ -629,11 +650,12 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
       {running && !streamingText.some(([, value]) => Boolean(value)) && <div className="compact-thinking"><LoaderCircle className="spin" size={13} />Agent working…</div>}
     </div>
     <div className="control-models"><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{model?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></div>
+    {queue.length > 0 && <div className="control-queue"><span><ListPlus size={11} />Queued next</span>{queue.map((entry, index) => <div key={entry.id}><b>{index + 1}</b><em title={entry.text}>{entry.text}</em><button type="button" onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={11} /></button></div>)}</div>}
     <form className="control-composer" onSubmit={send}>
       <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} compact />
       <input value={text} onChange={(event) => setText(event.target.value)} onKeyDown={assist.onKeyDown} placeholder={running ? "Queue the next task…" : "Send a task…"} />
       <button className={running ? "queue" : ""} disabled={!text.trim() || sending} title={running ? "Queue next task" : "Send"}>{sending ? <LoaderCircle className="spin" size={14} /> : running ? <ListPlus size={14} /> : <Send size={14} />}</button>
-      {runningTurn && <button type="button" className="stop" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).then(onRefresh).catch(onError)} title="Stop"><CircleStop size={15} /></button>}
+      {running && <button type="button" className="stop" onClick={() => void stopThread(thread.id, onRefresh, onError)} title="Stop active turn"><CircleStop size={15} /></button>}
     </form>
   </article>;
 }
@@ -664,10 +686,11 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
   const selectedModel = models.find((model) => model.model === settings.model) || models[0];
   const runningTurn = [...thread.turns].reverse().find((turn) => turn.status === "inProgress");
   const running = thread.status.type === "active" || Boolean(runningTurn);
-  const historyIds = new Set(thread.turns.flatMap((turn) => turn.items).map((item) => item.id).filter(Boolean));
+  const historyItems = thread.turns.flatMap((turn) => turn.items);
+  const historyIds = new Set(historyItems.map((item) => item.id).filter(Boolean));
   const streamingText = Object.entries(liveText).filter(([id]) => !historyIds.has(id));
-  const immediateItems = Object.values(liveItems).filter((item) =>
-    (!item.id || !historyIds.has(item.id)) && !(item.type === "agentMessage" && item.id && liveText[item.id])
+  const immediateItems = unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
+    !(item.type === "agentMessage" && item.id && liveText[item.id])
   );
 
   useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput, liveItems]);
@@ -715,14 +738,35 @@ function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, mod
           <div className="model-controls">
             <label><Bot size={14} /><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
             <label><BrainCircuit size={14} /><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></label>
+            <PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} />
           </div>
-          <div className="composer-actions">{runningTurn && <button type="button" className="stop-button" onClick={() => void api(`/api/threads/${thread.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: runningTurn.id }) }).catch(onError)}><CircleStop size={16} /> Stop</button>}
+          <div className="composer-actions">{running && <button type="button" className="stop-button" onClick={() => void stopThread(thread.id, onRefresh, onError)}><CircleStop size={16} /> Stop</button>}
             <button className={`send-button ${running ? "queue" : ""}`} disabled={!text.trim() || sending}>{sending ? <LoaderCircle className="spin" size={17} /> : running ? <ListPlus size={16} /> : <Send size={16} />}<span>{running ? "Queue" : "Send"}</span></button></div>
         </div>
       </form>
       <p className="persistence-note"><Server size={12} />Safe to close this tab — work continues on the host.</p>
     </div>
   </div>;
+}
+
+function PolicyButton({ thread, running, onRefresh, onError, compact = false }: { thread: Thread; running: boolean; onRefresh: () => void | Promise<void>; onError: (error: unknown) => void; compact?: boolean }) {
+  const yolo = thread.policy === "yolo";
+  const toggle = async () => {
+    if (running) return;
+    if (!yolo && !window.confirm("Enable YOLO mode for this session? Future turns will run with full system access and no approvals.")) return;
+    try {
+      await api(`/api/threads/${thread.id}/policy`, { method: "PATCH", body: JSON.stringify({ yolo: !yolo }) });
+      await onRefresh();
+    } catch (error) { onError(error); }
+  };
+  return <button type="button" className={`policy-button ${yolo ? "yolo" : "workspace"} ${compact ? "compact" : ""}`} disabled={running} onClick={() => void toggle()} title={running ? "Finish or stop the turn to change permissions" : yolo ? "Switch to workspace-write with approvals" : "Enable YOLO mode"}><ShieldCheck size={compact ? 11 : 13} /><span>{yolo ? "YOLO" : compact ? "SAFE" : "Workspace"}</span></button>;
+}
+
+async function stopThread(threadId: string, onRefresh: () => void | Promise<void>, onError: (error: unknown) => void): Promise<void> {
+  try {
+    await api(`/api/threads/${threadId}/interrupt`, { method: "POST", body: "{}" });
+    await onRefresh();
+  } catch (error) { onError(error); }
 }
 
 function GoalBar({ thread, onRefresh, onError }: { thread: Thread; onRefresh: () => Promise<void>; onError: (error: unknown) => void }) {
@@ -1028,4 +1072,33 @@ function toolLabel(type: string): string {
 }
 function isToolItem(item: ThreadItem): boolean {
   return !["userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "hookPrompt"].includes(item.type);
+}
+
+function messageFingerprint(item: ThreadItem): string | null {
+  if (item.type === "agentMessage") return `agent:${(item.text || "").trim()}`;
+  if (item.type !== "userMessage") return null;
+  const text = item.content?.filter((part) => part.type === "text").map((part) => part.text || "").join("\n").trim() || "";
+  return `user:${text}`;
+}
+
+function unseenLiveItems(history: ThreadItem[], live: ThreadItem[]): ThreadItem[] {
+  const historyIds = new Set(history.map((item) => item.id).filter(Boolean));
+  const historyMessageCounts = new Map<string, number>();
+  const canonicalUserMessages = new Set(live.filter((item) => item.type === "userMessage" && item.id && !item.id.startsWith("user-")).map(messageFingerprint).filter((value): value is string => Boolean(value)));
+  for (const item of history) {
+    const fingerprint = messageFingerprint(item);
+    if (fingerprint) historyMessageCounts.set(fingerprint, (historyMessageCounts.get(fingerprint) || 0) + 1);
+  }
+  return live.filter((item) => {
+    if (item.id && historyIds.has(item.id)) return false;
+    const fingerprint = messageFingerprint(item);
+    if (item.type === "userMessage" && item.id?.startsWith("user-") && fingerprint && canonicalUserMessages.has(fingerprint)) return false;
+    if (!fingerprint) return true;
+    const historyCount = historyMessageCounts.get(fingerprint) || 0;
+    if (historyCount > 0) {
+      historyMessageCounts.set(fingerprint, historyCount - 1);
+      return false;
+    }
+    return true;
+  });
 }

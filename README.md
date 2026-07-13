@@ -13,13 +13,13 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Password-protected, HttpOnly browser sessions with login throttling
 - Directory-only workspace browser with configurable roots and credential-folder blocking
 - Live response streaming, command/file approval prompts, user questions, and stop controls
-- Desktop-first Control Center with live multi-session panels, adaptive 4/3/2/1-column layouts, and at most two rows per page
+- Desktop-first Control Center with fixed card positions, full-height adaptive 4/3/2/1-column layouts, and at most two rows per page
 - Real-time agent messages, command executions and output, file changes, MCP calls, dynamic tools, and resilient polling fallback
 - Server-retained live activity that restores running tool calls after a browser reconnect or refresh
 - Read-only monitoring of other local Codex processes, including their active state and command/tool records
 - Restored external-session user/assistant conversation history and colored unified file diffs
 - Slash-command palette, native persistent `/goal` controls, and `@` workspace path autocomplete with keyboard selection
-- Per-session queued messages that run in order after the current turn and survive browser closure or a ForgeDeck restart
+- Visible per-session queued messages that run in order only after the current turn finishes and survive browser closure or a ForgeDeck restart
 - Pulsing orange completion indicators that remain until the finished session is opened
 - Search, pin, rename, archive, and sorting for large session collections
 - Responsive desktop/mobile UI
@@ -56,7 +56,7 @@ systemctl --user restart forgedeck
 npm run uninstall-service
 ```
 
-The service restarts after crashes and starts with the user's systemd session. If this machine is configured to end user services on logout, an administrator can enable lingering with `loginctl enable-linger "$USER"`.
+The installer creates separate `forgedeck.service` and `forgedeck-codex.service` user units. The dashboard can restart and reconnect without stopping turns because the Codex app-server runtime remains alive independently. Both services restart after crashes and start with the user's systemd session. If this machine is configured to end user services on logout, an administrator can enable lingering with `loginctl enable-linger "$USER"`.
 
 ## Configuration
 
@@ -77,7 +77,7 @@ The production start command and included systemd service automatically load `.e
 - `FORGEDECK_AUTH=off` gives every device that can reach the service full control of Codex. Use it only on a trusted, firewalled LAN.
 - ForgeDeck uses plain HTTP so phones and tablets can connect easily on the private LAN. Do not port-forward it to the internet or use it on an untrusted network. For remote access, put it behind a private VPN such as Tailscale or a TLS reverse proxy.
 - Workspace sessions use Codex's `workspace-write` sandbox and request approval for elevated commands. ForgeDeck restricts each thread's runtime workspace root to the selected directory.
-- New sessions can explicitly enable YOLO mode, which uses `danger-full-access` and disables approvals for that thread.
+- New or idle/completed sessions can explicitly enable YOLO mode, which uses `danger-full-access` and disables approvals for subsequent turns.
 - Hidden and common credential directories are omitted from the browser and rejected as workspaces.
 
 ## Development
