@@ -23,6 +23,7 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 - Slash-command palette, native persistent `/goal` controls, and `@` workspace path autocomplete with keyboard selection
 - Visible per-session queued messages that run in order only after the current turn finishes and survive browser closure or a ForgeDeck restart
 - Pulsing orange completion indicators that remain until the finished session is opened
+- Completed Control Center panels remain visible for 15 minutes, then leave the deck without deleting session history
 - Search, pin, rename, archive, and sorting for large session collections
 - Responsive desktop/mobile UI
 - Automatic `/goal resume` recovery when Codex reports that the selected model is at capacity

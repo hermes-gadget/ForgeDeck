@@ -62,8 +62,6 @@ Environment=PATH=${systemdEscape(`${path.dirname(process.execPath)}:/usr/local/b
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
 
 [Install]
 WantedBy=default.target

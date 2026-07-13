@@ -29,6 +29,8 @@ type ThreadPolicy = "workspace-write" | "yolo";
 const policyFile = path.join(dataDir, "thread-policies.json");
 const threadPolicies = loadThreadPolicies();
 const activeThreads = new Set<string>();
+type ActivitySource = "bridge" | "external";
+const activeThreadSources = new Map<string, Set<ActivitySource>>();
 const activeTurnIds = new Map<string, string>();
 const drainingQueues = new Set<string>();
 const bridgeOwnedThreads = new Set<string>();
@@ -422,13 +424,10 @@ app.get("/events", (req, res) => {
 
 codex.on("notification", (payload) => {
   const notification = payload as { method: string; params?: Record<string, unknown> };
-  if (notification.method === "turn/started") {
-    const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
-    if (threadId) bridgeOwnedThreads.add(threadId);
-  }
   resumeGoalAfterCapacity(notification);
-  recordLiveEvent(notification);
-  broadcast("codex", payload);
+  recordLiveEvent(notification, "bridge");
+  const outbound = canonicalActivityNotification(notification);
+  if (outbound) broadcast("codex", outbound);
   if (notification.method === "turn/completed") {
     const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
     if (threadId) bridgeOwnedThreads.delete(threadId);
@@ -468,8 +467,9 @@ const externalMonitor = new ExternalCodexMonitor((notification, historical) => {
   const threadId = typeof notification.params.threadId === "string" ? notification.params.threadId : null;
   if (threadId && bridgeOwnedThreads.has(threadId)) return;
   if (!historical) resumeGoalAfterCapacity(notification);
-  recordLiveEvent(notification);
-  broadcast("codex", notification);
+  recordLiveEvent(notification, "external");
+  const outbound = canonicalActivityNotification(notification);
+  if (outbound) broadcast("codex", outbound);
 });
 externalMonitor.start();
 for (const threadId of messageQueues.keys()) void drainQueue(threadId);
@@ -483,11 +483,17 @@ const server = app.listen(port, host, () => {
   console.log("\n  Closing a browser will not stop active Codex turns.\n");
 });
 
+let shuttingDown = false;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     externalMonitor.stop();
-    codex.stop();
+    for (const client of sseClients) client.end();
+    sseClients.clear();
     server.close(() => process.exit(0));
+    server.closeAllConnections();
+    codex.stop();
     setTimeout(() => process.exit(1), 5000).unref();
   });
 }
@@ -514,13 +520,13 @@ async function drainQueue(threadId: string): Promise<void> {
     const snapshot = await codex.request<{ thread: ThreadSnapshot }>("thread/read", { threadId, includeTurns: true }, 60_000);
     const lastTurn = snapshot.thread.turns?.at(-1);
     if (snapshot.thread.status?.type === "active" || lastTurn?.status === "inProgress") {
-      activeThreads.add(threadId);
+      setThreadActivity(threadId, "bridge", true);
       return;
     }
     const queue = messageQueues.get(threadId) || [];
     entry = queue[0];
     if (!entry) return;
-    activeThreads.add(threadId);
+    setThreadActivity(threadId, "bridge", true);
     bridgeOwnedThreads.add(threadId);
     await codex.request("thread/resume", { threadId, model: entry.model, excludeTurns: true }, 60_000);
     await startTurn(threadId, entry.text, entry.model, entry.effort);
@@ -530,7 +536,7 @@ async function drainQueue(threadId: string): Promise<void> {
     persistMessageQueues();
     broadcastQueue(threadId);
   } catch (error) {
-    activeThreads.delete(threadId);
+    setThreadActivity(threadId, "bridge", false);
     if (entry) {
       broadcastQueue(threadId, error instanceof Error ? error.message : String(error));
     }
@@ -626,23 +632,25 @@ function broadcast(event: string, payload: unknown): void {
   for (const client of sseClients) client.write(message);
 }
 
-function recordLiveEvent(notification: { method: string; params?: Record<string, unknown> }): void {
+function recordLiveEvent(notification: { method: string; params?: Record<string, unknown> }, source: ActivitySource): void {
   const params = notification.params;
   const threadId = typeof params?.threadId === "string" ? params.threadId : null;
   if (!threadId) return;
   if (notification.method === "turn/started") {
-    activeThreads.add(threadId);
+    setThreadActivity(threadId, source, true);
     const turn = params?.turn as { id?: unknown } | undefined;
     if (typeof turn?.id === "string") activeTurnIds.set(threadId, turn.id);
   }
   if (notification.method === "turn/completed") {
-    activeThreads.delete(threadId);
-    activeTurnIds.delete(threadId);
+    setThreadActivity(threadId, source, false);
     setTimeout(() => void drainQueue(threadId), 50).unref();
   }
   if (notification.method === "thread/status/changed") {
     const status = params?.status as { type?: string } | undefined;
-    if (status?.type === "active") activeThreads.add(threadId);
+    setThreadActivity(threadId, source, status?.type === "active");
+    if (status?.type !== "active") {
+      setTimeout(() => void drainQueue(threadId), 50).unref();
+    }
   }
   if (notification.method === "thread/deleted" || notification.method === "thread/archived") {
     liveThreadStates.delete(threadId);
@@ -652,16 +660,15 @@ function recordLiveEvent(notification: { method: string; params?: Record<string,
   const state = liveThreadStates.get(threadId) || { items: {}, agentText: {}, toolOutput: {}, active: false, completedAt: null, updatedAt: Date.now() };
   state.updatedAt = Date.now();
   if (notification.method === "turn/started") {
-    state.active = true;
+    state.active = activeThreads.has(threadId);
     state.completedAt = null;
   }
   if (notification.method === "turn/completed") {
-    state.active = false;
-    state.completedAt = Date.now();
+    state.active = activeThreads.has(threadId);
+    if (!state.active) state.completedAt = Date.now();
   }
   if (notification.method === "thread/status/changed") {
-    const status = params?.status as { type?: string } | undefined;
-    state.active = status?.type === "active";
+    state.active = activeThreads.has(threadId);
   }
   if ((notification.method === "item/started" || notification.method === "item/completed") && params?.item && typeof params.item === "object") {
     const item = params.item as Record<string, unknown>;
@@ -680,6 +687,34 @@ function recordLiveEvent(notification: { method: string; params?: Record<string,
     trimRecord(state.toolOutput, 32);
   }
   liveThreadStates.set(threadId, state);
+}
+
+function setThreadActivity(threadId: string, source: ActivitySource, active: boolean): void {
+  const sources = activeThreadSources.get(threadId) || new Set<ActivitySource>();
+  if (active) sources.add(source);
+  else sources.delete(source);
+  if (sources.size) {
+    activeThreadSources.set(threadId, sources);
+    activeThreads.add(threadId);
+  } else {
+    activeThreadSources.delete(threadId);
+    activeThreads.delete(threadId);
+    activeTurnIds.delete(threadId);
+  }
+}
+
+function canonicalActivityNotification(notification: { method: string; params?: Record<string, unknown> }): { method: string; params?: Record<string, unknown> } | null {
+  const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
+  if (!threadId) return notification;
+  if (notification.method === "turn/completed" && activeThreads.has(threadId)) return null;
+  if (notification.method !== "thread/status/changed") return notification;
+  return {
+    ...notification,
+    params: {
+      ...notification.params,
+      status: activeThreads.has(threadId) ? { type: "active", activeFlags: [] } : notification.params?.status
+    }
+  };
 }
 
 function resumeGoalAfterCapacity(notification: { method: string; params?: Record<string, unknown> }): void {

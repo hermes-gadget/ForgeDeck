@@ -29,6 +29,7 @@ const EFFORT_LABELS: Record<string, string> = {
   none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
   xhigh: "Extra high", max: "Maximum", ultra: "Ultra"
 };
+const COMPLETED_CONTROL_TTL_MS = 15 * 60_000;
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -53,12 +54,14 @@ export default function App() {
   const [activeThreadIds, setActiveThreadIds] = useState<Set<string>>(new Set());
   const [queues, setQueues] = useState<Record<string, QueueEntry[]>>({});
   const [completedSignals, setCompletedSignals] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem("forgedeck-completed") || "[]")));
+  const [completionTimes, setCompletionTimes] = useState<Record<string, number>>({});
   const [activityVersion, setActivityVersion] = useState(0);
   const [runtime, setRuntime] = useState<"ready" | "offline" | "error">("ready");
   const [toast, setToast] = useState<string | null>(null);
   const selectedRef = useRef(selectedId);
   const refreshTimer = useRef<number | null>(null);
   const listTimer = useRef<number | null>(null);
+  const controlSelectionInitialized = useRef(localStorage.getItem("forgedeck-control-ids") !== null);
 
   useEffect(() => { selectedRef.current = selectedId; }, [selectedId]);
 
@@ -67,16 +70,24 @@ export default function App() {
     setBootstrap(data);
     setPending(data.pendingRequests);
     setQueues(data.queues || {});
-    setActiveThreadIds(new Set(data.activeThreadIds || []));
+    const activeIds = new Set(data.activeThreadIds || []);
+    setActiveThreadIds(activeIds);
     if (data.agentThreadIds?.length) {
       setControlIds((current) => [...current, ...data.agentThreadIds!.filter((threadId) => !current.includes(threadId))]);
     }
-    if (data.activeThreadIds?.length) {
-      setLiveStatuses((current) => Object.fromEntries([
-        ...Object.entries(current),
-        ...data.activeThreadIds!.map((threadId) => [threadId, { type: "active", activeFlags: [] } as Thread["status"]])
-      ]));
-    }
+    setLiveStatuses((current) => {
+      const next = { ...current };
+      for (const [threadId, status] of Object.entries(next)) {
+        if (status.type === "active" && !activeIds.has(threadId)) delete next[threadId];
+      }
+      for (const [threadId, state] of Object.entries(data.liveState || {})) {
+        next[threadId] = state.active
+          ? { type: "active", activeFlags: [] }
+          : { type: "idle" };
+      }
+      for (const threadId of activeIds) next[threadId] = { type: "active", activeFlags: [] };
+      return next;
+    });
     if (data.liveState) {
       setLiveItems((current) => mergeLiveState(current, data.liveState!, "items"));
       setLiveText((current) => mergeLiveState(current, data.liveState!, "agentText"));
@@ -86,6 +97,14 @@ export default function App() {
         const next = new Set(current);
         for (const [threadId, state] of Object.entries(data.liveState!)) {
           if (!state.active && state.completedAt && state.completedAt > (seen[threadId] || 0)) next.add(threadId);
+        }
+        return next;
+      });
+      setCompletionTimes((current) => {
+        const next = { ...current };
+        for (const [threadId, state] of Object.entries(data.liveState!)) {
+          if (state.active) delete next[threadId];
+          else if (state.completedAt) next[threadId] = state.completedAt;
         }
         return next;
       });
@@ -226,17 +245,17 @@ export default function App() {
         const status = notification.params.status as Thread["status"];
         setLiveStatuses((current) => ({ ...current, [threadId]: status }));
         setDetail((current) => current?.id === threadId ? { ...current, status } : current);
+        setActiveThreadIds((current) => status.type === "active" ? new Set(current).add(threadId) : withoutSetValue(current, threadId));
       }
       if (notification.method === "turn/started" && threadId) {
         setActiveThreadIds((current) => new Set(current).add(threadId));
         setCompletedSignals((current) => withoutSetValue(current, threadId));
+        setCompletionTimes((current) => omitKey(current, threadId));
       }
       if (notification.method === "turn/completed" && threadId) {
         setActiveThreadIds((current) => withoutSetValue(current, threadId));
         setCompletedSignals((current) => new Set(current).add(threadId));
-      }
-      if (notification.method === "thread/status/changed" && threadId && (notification.params.status as Thread["status"] | undefined)?.type === "active") {
-        setActiveThreadIds((current) => new Set(current).add(threadId));
+        setCompletionTimes((current) => ({ ...current, [threadId]: Date.now() }));
       }
       if (notification.method === "account/rateLimits/updated") {
         void loadBootstrap().catch(() => undefined);
@@ -273,11 +292,21 @@ export default function App() {
   useEffect(() => localStorage.setItem("forgedeck-control-ids", JSON.stringify(controlIds)), [controlIds]);
   useEffect(() => localStorage.setItem("forgedeck-completed", JSON.stringify([...completedSignals])), [completedSignals]);
   useEffect(() => {
-    if (threads.length && controlIds.length === 0) {
+    const prune = () => {
+      const cutoff = Date.now() - COMPLETED_CONTROL_TTL_MS;
+      setControlIds((current) => current.filter((threadId) => activeThreadIds.has(threadId) || !completionTimes[threadId] || completionTimes[threadId] > cutoff));
+    };
+    prune();
+    const timer = window.setInterval(prune, 30_000);
+    return () => clearInterval(timer);
+  }, [activeThreadIds, completionTimes]);
+  useEffect(() => {
+    if (threads.length && !controlSelectionInitialized.current) {
+      controlSelectionInitialized.current = true;
       const initial = [...threads].sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
       setControlIds(initial);
     }
-  }, [threads, controlIds.length]);
+  }, [threads]);
   useEffect(() => {
     const activeIds = threads.filter((thread) => activeThreadIds.has(thread.id)).map((thread) => thread.id);
     if (!activeIds.length) return;
@@ -347,9 +376,11 @@ export default function App() {
     return next;
   });
 
-  const toggleControl = (id: string) => setControlIds((current) =>
-    current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
-  );
+  const toggleControl = (id: string) => {
+    const adding = !controlIds.includes(id);
+    setControlIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+    if (adding) setCompletionTimes((times) => omitKey(times, id));
+  };
 
   const markCompletionSeen = (id: string) => {
     setCompletedSignals((current) => withoutSetValue(current, id));
@@ -513,7 +544,8 @@ function UsageCard({ usage, plan }: { usage: Usage | null; plan?: string }) {
 
 function SessionCard({ thread, selected, pinned, inControl, completed, onSelect, onPin, onControl }: { thread: Thread; selected: boolean; pinned: boolean; inControl: boolean; completed: boolean; onSelect: () => void; onPin: () => void; onControl: () => void }) {
   const running = thread.status.type === "active";
-  return <button className={`session-card ${selected ? "selected" : ""} ${completed && !running ? "completed" : ""}`} onClick={onSelect}>
+  const successfullyCompleted = completed && thread.status.type === "idle";
+  return <button className={`session-card ${selected ? "selected" : ""} ${successfullyCompleted ? "completed" : ""}`} onClick={onSelect}>
     <span className={`status-dot ${thread.status.type}`} />
     <span className="session-copy"><strong>{threadTitle(thread)}</strong><small><Folder size={12} />{basename(thread.cwd)}<i>·</i>{timeAgo(thread.updatedAt)}</small></span>
     <span className="session-actions" onClick={(event) => event.stopPropagation()}>
@@ -584,7 +616,7 @@ function ControlCenter({ threads, allThreads, models, settings, defaultModel, li
 
   return <section className="control-center">
     <div className="control-toolbar">
-      <div><span className="live-beacon"><i />LIVE</span><p>Agent messages and tool output stream into every panel.</p></div>
+      <div><span className="live-beacon"><i />LIVE</span><p>Agent messages stream live. Completed panels close after 15 minutes.</p></div>
       <div className="control-toolbar-actions">
         {available.length > 0 && <label className="add-panel"><Plus size={14} /><select value="" onChange={(event) => { if (event.target.value) onAdd(event.target.value); }}><option value="">Add session</option>{available.map((thread) => <option key={thread.id} value={thread.id}>{threadTitle(thread)}</option>)}</select></label>}
         <button className="icon-button" onClick={() => setReload((value) => value + 1)} title="Refresh panels"><RefreshCw size={16} /></button>
@@ -627,6 +659,7 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
   const items = selectControlItems(allItems, 12);
   const toolCount = items.filter((item) => isToolItem(item)).length;
   const running = thread.status.type === "active" || Boolean(runningTurn);
+  const successfullyCompleted = completed && !running && thread.status.type === "idle";
 
   useEffect(() => { body.current?.scrollTo({ top: body.current.scrollHeight, behavior: "smooth" }); }, [thread.turns, liveText, liveToolOutput, liveItems]);
 
@@ -652,10 +685,10 @@ function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveI
     if (next) onSettings({ model: next.model, effort: next.defaultReasoningEffort });
   };
 
-  return <article className={`control-card ${running ? "running" : ""} ${completed && !running ? "completed" : ""}`}>
+  return <article className={`control-card ${running ? "running" : ""} ${successfullyCompleted ? "completed" : ""}`}>
     <header>
       <button className="control-title" onClick={onOpen}><span className={`status-dot ${running ? "active" : thread.status.type}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
-      <div className="control-card-actions">{completed && !running && <span className="done-label">Done</span>}<PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
+      <div className="control-card-actions">{successfullyCompleted && <span className="done-label">Done</span>}<PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={onOpen} title="Open full session"><ChevronRight size={16} /></button><button onClick={onRemove} title="Remove from Control Center"><X size={15} /></button></div>
     </header>
     {thread.goal && <button type="button" className={`control-goal ${thread.goal.status}`} onClick={onOpen} title={thread.goal.objective}><Target size={11} /><span>{thread.goal.objective}</span><em>{goalStatusLabel(thread.goal.status)}</em></button>}
     <div className="control-feed" ref={body}>

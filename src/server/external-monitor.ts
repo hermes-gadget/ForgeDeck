@@ -20,12 +20,14 @@ type Tracker = {
 
 export class ExternalCodexMonitor {
   private readonly db: DatabaseSync;
+  private readonly sessionsRoot: string;
   private readonly trackers = new Map<string, Tracker>();
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
 
   constructor(private readonly emit: (notification: Notification, historical?: boolean) => void, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
     this.db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
+    this.sessionsRoot = path.join(codexHome, "sessions");
   }
 
   start(): void {
@@ -44,10 +46,12 @@ export class ExternalCodexMonitor {
     if (this.polling) return;
     this.polling = true;
     try {
+      const writableRollouts = findWritableRolloutPaths("/proc", this.sessionsRoot);
       const rows = this.db.prepare(
         "SELECT id, rollout_path, cwd FROM threads WHERE archived = 0 ORDER BY updated_at_ms DESC LIMIT 32"
       ).all() as unknown as ThreadRow[];
-      for (const row of rows) this.readThread(row);
+      for (const row of rows) this.readThread(row, writableRollouts);
+      for (const tracker of this.trackers.values()) this.reconcileProcessState(tracker, writableRollouts, false);
     } catch (error) {
       console.error("[ForgeDeck] External Codex monitor failed:", error);
     } finally {
@@ -55,7 +59,7 @@ export class ExternalCodexMonitor {
     }
   }
 
-  private readThread(row: ThreadRow): void {
+  private readThread(row: ThreadRow, writableRollouts: Set<string> | null): void {
     let stat: fs.Stats;
     try { stat = fs.statSync(row.rollout_path); } catch { return; }
     let tracker = this.trackers.get(row.id);
@@ -72,13 +76,21 @@ export class ExternalCodexMonitor {
         calls: new Map(),
         recent: []
       };
+      const lifecycle = readLatestLifecycle(row.rollout_path, stat.size);
+      if (lifecycle) {
+        tracker.active = lifecycle.active;
+        tracker.activeTurnId = lifecycle.turnId;
+      }
       this.trackers.set(row.id, tracker);
     }
     if (stat.size < tracker.offset) {
       tracker.offset = 0;
       tracker.partial = "";
     }
-    if (stat.size === tracker.offset) return;
+    if (stat.size === tracker.offset) {
+      this.reconcileProcessState(tracker, writableRollouts, initial);
+      return;
+    }
 
     const length = stat.size - tracker.offset;
     const buffer = Buffer.alloc(length);
@@ -88,6 +100,8 @@ export class ExternalCodexMonitor {
     const chunks = `${tracker.partial}${buffer.toString("utf8")}`.split("\n");
     tracker.partial = chunks.pop() || "";
     for (const line of chunks) this.processLine(tracker, line, !initial);
+
+    this.reconcileProcessState(tracker, writableRollouts, initial);
 
     if (initial) {
       this.emitStatus(tracker, true);
@@ -202,6 +216,88 @@ export class ExternalCodexMonitor {
   private emitStatus(tracker: Tracker, historical = false): void {
     this.emit({ method: "thread/status/changed", params: { threadId: tracker.id, status: tracker.active ? { type: "active", activeFlags: [] } : { type: "idle" } } }, historical);
   }
+
+  private reconcileProcessState(tracker: Tracker, writableRollouts: Set<string> | null, initial: boolean): void {
+    if (!tracker.active || writableRollouts === null || writableRollouts.has(tracker.path)) return;
+    const turnId = tracker.activeTurnId || "external";
+    tracker.active = false;
+    tracker.activeTurnId = null;
+    if (initial) return;
+    this.emitStatus(tracker);
+    this.emit({ method: "turn/completed", params: { threadId: tracker.id, turn: { id: turnId, status: "interrupted", items: [] } } });
+  }
+}
+
+// A standalone Codex process can be killed before it appends task_complete or
+// turn_aborted. In that case the rollout looks active forever. Linux exposes
+// writable file descriptors through /proc, which gives us a definitive liveness
+// check without guessing based on how long a model or tool has been quiet.
+export function findWritableRolloutPaths(
+  procRoot = "/proc",
+  sessionsRoot = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sessions")
+): Set<string> | null {
+  let processEntries: fs.Dirent[];
+  try {
+    processEntries = fs.readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const rollouts = new Set<string>();
+  const sessionsPrefix = `${path.resolve(sessionsRoot)}${path.sep}`;
+  for (const processEntry of processEntries) {
+    if (!processEntry.isDirectory() || !/^\d+$/.test(processEntry.name)) continue;
+    const fdDirectory = path.join(procRoot, processEntry.name, "fd");
+    let descriptors: string[];
+    try { descriptors = fs.readdirSync(fdDirectory); } catch { continue; }
+    for (const descriptor of descriptors) {
+      const fdPath = path.join(fdDirectory, descriptor);
+      let target: string;
+      let flags: number;
+      try {
+        target = fs.readlinkSync(fdPath).replace(/ \(deleted\)$/, "");
+        target = path.resolve(target);
+        if (!target.startsWith(sessionsPrefix) || !target.endsWith(".jsonl")) continue;
+        const match = /^flags:\s*([0-7]+)/m.exec(fs.readFileSync(path.join(procRoot, processEntry.name, "fdinfo", descriptor), "utf8"));
+        if (!match) continue;
+        flags = Number.parseInt(match[1], 8);
+      } catch {
+        continue;
+      }
+      const accessMode = flags & 0b11;
+      if (accessMode === 1 || accessMode === 2) rollouts.add(target);
+    }
+  }
+  return rollouts;
+}
+
+export function readLatestLifecycle(rolloutPath: string, size = fs.statSync(rolloutPath).size): { active: boolean; turnId: string | null } | null {
+  const descriptor = fs.openSync(rolloutPath, "r");
+  const chunkSize = 64 * 1024;
+  let position = size;
+  let trailingPartial = "";
+  try {
+    while (position > 0) {
+      const start = Math.max(0, position - chunkSize);
+      const buffer = Buffer.alloc(position - start);
+      fs.readSync(descriptor, buffer, 0, buffer.length, start);
+      const lines = `${buffer.toString("utf8")}${trailingPartial}`.split("\n");
+      trailingPartial = start > 0 ? lines.shift() || "" : "";
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let record: { type?: string; payload?: Record<string, unknown> };
+        try { record = JSON.parse(lines[index]); } catch { continue; }
+        const payload = record.payload;
+        if (record.type !== "event_msg" || !payload) continue;
+        const type = String(payload.type || "");
+        if (type === "task_started") return { active: true, turnId: String(payload.turn_id || "external") };
+        if (["task_complete", "turn_complete", "turn_aborted", "task_cancelled"].includes(type)) return { active: false, turnId: null };
+      }
+      position = start;
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return null;
 }
 
 function pushRecent(tracker: Tracker, item: ToolItem): void {
