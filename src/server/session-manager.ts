@@ -2,13 +2,24 @@ import fs from "node:fs";
 import path from "node:path";
 import { logger } from "./logger.js";
 
-export const DEFAULT_SESSION_TTL_MS = 24 * 60 * 60_000;
+export const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60_000;
+
+export type SessionClass = "standard" | "spark";
+export type SessionBackend = "codex" | "claude";
 
 export type SessionMetadata = {
   tags: string[];
   category: string | null;
   createdAt: number;
   updatedAt: number;
+  sessionClass: SessionClass;
+  backend: SessionBackend;
+  cwd: string | null;
+  name: string | null;
+  model: string | null;
+  effort: string | null;
+  permissionMode: string | null;
+  maxTurns: number | null;
 };
 
 export type SessionAuditEvent = {
@@ -20,7 +31,18 @@ export type SessionAuditEvent = {
   details?: Record<string, unknown>;
 };
 
-type MetadataUpdate = { tags?: unknown; category?: unknown };
+type MetadataUpdate = {
+  tags?: unknown;
+  category?: unknown;
+  sessionClass?: SessionClass;
+  backend?: SessionBackend;
+  cwd?: string | null;
+  name?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  permissionMode?: string | null;
+  maxTurns?: number | null;
+};
 type ThreadLike = Record<string, unknown> & { id?: unknown; updatedAt?: unknown; recencyAt?: unknown; status?: unknown };
 
 /**
@@ -52,13 +74,34 @@ export class SessionManager {
 
   metadataFor(threadId: string): SessionMetadata {
     const stored = this.metadata.get(threadId);
-    return stored ? { ...stored, tags: [...stored.tags] } : { tags: [], category: null, createdAt: 0, updatedAt: 0 };
+    return stored ? cloneMetadata(stored) : emptyMetadata();
   }
 
-  enrich<T extends ThreadLike>(thread: T): T & Pick<SessionMetadata, "tags" | "category"> {
+  enrich<T extends ThreadLike>(thread: T): T & Pick<SessionMetadata, "tags" | "category" | "sessionClass" | "backend"> & {
+    claudeModel?: string;
+    claudeEffort?: string;
+    claudePermissionMode?: string;
+    claudeMaxTurns?: number;
+  } {
     const threadId = typeof thread.id === "string" ? thread.id : "";
-    const metadata = this.metadataFor(threadId);
-    return { ...thread, tags: metadata.tags, category: metadata.category };
+    const stored = this.metadata.get(threadId);
+    const metadata = stored ? cloneMetadata(stored) : emptyMetadata();
+    const backend = stored?.backend || "codex";
+    const model = typeof thread.model === "string" ? thread.model : metadata.model;
+    const sessionClass = stored?.sessionClass || (model === "gpt-5.3-codex-spark" ? "spark" : "standard");
+    return {
+      ...thread,
+      tags: metadata.tags,
+      category: metadata.category,
+      sessionClass,
+      backend,
+      ...(backend === "claude" ? {
+        ...(metadata.model ? { claudeModel: metadata.model } : {}),
+        ...(metadata.effort ? { claudeEffort: metadata.effort } : {}),
+        ...(metadata.permissionMode ? { claudePermissionMode: metadata.permissionMode } : {}),
+        ...(metadata.maxTurns ? { claudeMaxTurns: metadata.maxTurns } : {})
+      } : {})
+    };
   }
 
   setMetadata(threadId: string, update: MetadataUpdate, actor = "user"): SessionMetadata {
@@ -68,12 +111,36 @@ export class SessionManager {
       tags: update.tags === undefined ? [...(previous?.tags || [])] : normalizeTags(update.tags),
       category: update.category === undefined ? previous?.category || null : normalizeCategory(update.category),
       createdAt: previous?.createdAt || timestamp,
-      updatedAt: timestamp
+      updatedAt: timestamp,
+      sessionClass: update.sessionClass || previous?.sessionClass || "standard",
+      backend: update.backend || previous?.backend || "codex",
+      cwd: update.cwd === undefined ? previous?.cwd || null : normalizeNullableString(update.cwd),
+      name: update.name === undefined ? previous?.name || null : normalizeNullableString(update.name),
+      model: update.model === undefined ? previous?.model || null : normalizeNullableString(update.model),
+      effort: update.effort === undefined ? previous?.effort || null : normalizeNullableString(update.effort),
+      permissionMode: update.permissionMode === undefined ? previous?.permissionMode || null : normalizeNullableString(update.permissionMode),
+      maxTurns: update.maxTurns === undefined ? previous?.maxTurns || null : normalizeNullableInteger(update.maxTurns)
     };
     this.metadata.set(threadId, next);
     this.persistMetadata();
     this.record(threadId, "organized", actor, { tags: next.tags, category: next.category });
-    return { ...next, tags: [...next.tags] };
+    return cloneMetadata(next);
+  }
+
+  touch(threadId: string): void {
+    const metadata = this.metadata.get(threadId);
+    if (!metadata) return;
+    metadata.updatedAt = this.now();
+    this.persistMetadata();
+  }
+
+  listAllSessions(sessionClass?: SessionClass): Array<SessionMetadata & { id: string }> {
+    const result: Array<SessionMetadata & { id: string }> = [];
+    for (const [id, metadata] of this.metadata) {
+      if (sessionClass && metadata.sessionClass !== sessionClass) continue;
+      result.push({ id, ...cloneMetadata(metadata) });
+    }
+    return result;
   }
 
   removeMetadata(threadId: string): boolean {
@@ -84,6 +151,10 @@ export class SessionManager {
 
   trackedThreadIds(): string[] {
     return [...this.metadata.keys()];
+  }
+
+  hasMetadata(threadId: string): boolean {
+    return this.metadata.has(threadId);
   }
 
   record(threadId: string, action: string, actor = "system", details?: Record<string, unknown>): SessionAuditEvent {
@@ -157,7 +228,15 @@ export class SessionManager {
           tags: normalizeTags(candidate.tags),
           category: normalizeCategory(candidate.category),
           createdAt: finiteNumber(candidate.createdAt),
-          updatedAt: finiteNumber(candidate.updatedAt)
+          updatedAt: finiteNumber(candidate.updatedAt),
+          sessionClass: candidate.sessionClass === "spark" ? "spark" : "standard",
+          backend: candidate.backend === "claude" ? "claude" : "codex",
+          cwd: normalizeNullableString(candidate.cwd),
+          name: normalizeNullableString(candidate.name),
+          model: normalizeNullableString(candidate.model),
+          effort: normalizeNullableString(candidate.effort),
+          permissionMode: normalizeNullableString(candidate.permissionMode),
+          maxTurns: normalizeNullableInteger(candidate.maxTurns)
         });
       } catch {
         // Invalid records are skipped independently so one entry cannot hide all metadata.
@@ -232,4 +311,24 @@ function normalizeTimestamp(value: unknown): number {
 function finiteNumber(value: unknown): number {
   const number = Number(value || 0);
   return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+function emptyMetadata(): SessionMetadata {
+  return {
+    tags: [], category: null, createdAt: 0, updatedAt: 0, sessionClass: "standard", backend: "codex",
+    cwd: null, name: null, model: null, effort: null, permissionMode: null, maxTurns: null
+  };
+}
+
+function cloneMetadata(metadata: SessionMetadata): SessionMetadata {
+  return { ...metadata, tags: [...metadata.tags] };
+}
+
+function normalizeNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeNullableInteger(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
 }

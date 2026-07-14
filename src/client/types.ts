@@ -11,6 +11,13 @@ export type CodexModel = {
   serviceTiers: Array<{ id: string; name: string; description: string }>;
 };
 
+export type ClaudeModelOption = {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+};
+
 export type ThreadStatus = { type: "notLoaded" | "idle" | "systemError" | "active"; activeFlags?: string[] };
 
 export type ThreadItem = {
@@ -58,6 +65,11 @@ export type Thread = {
   policy?: "workspace-write" | "yolo";
   tags?: string[];
   category?: string | null;
+  backend?: "codex" | "claude";
+  sessionClass?: "standard" | "spark";
+  claudeModel?: string;
+  claudeEffort?: string;
+  claudePermissionMode?: string;
 };
 
 export type ThreadGoal = {
@@ -105,10 +117,18 @@ export type Bootstrap = {
   models: { data: CodexModel[] };
   account: { account: { type: string; email?: string | null; planType?: string } | null; requiresOpenaiAuth: boolean };
   usage: Usage | null;
+  backendStatus?: {
+    codex: { available: boolean; rateLimit?: { primary?: { usedPercent: number } } | null; activeCount: number };
+    spark: { available: boolean; rateLimit?: { primary?: { usedPercent: number } } | null; activeCount: number };
+    claude: { available: boolean; rateLimit?: { primary?: { usedPercent: number } } | null; activeCount: number };
+  };
   roots: string[];
   pendingRequests: PendingRequest[];
   liveState?: Record<string, LiveThreadState>;
   queues?: Record<string, QueueEntry[]>;
   activeThreadIds?: string[];
   agentThreadIds?: string[];
+  sparkAgentThreadIds?: string[];
+  claudeAvailable?: boolean;
+  claudeModelOptions?: ClaudeModelOption[];
 };

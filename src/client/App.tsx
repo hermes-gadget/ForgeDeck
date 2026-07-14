@@ -1,16 +1,20 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   Archive, ArrowLeft, Bot, BrainCircuit, Check, ChevronRight, CircleStop,
   Clock3, Code2, Command, Folder, FolderOpen, Gauge, GitBranch, KeyRound,
-  LayoutGrid, LoaderCircle, LogOut, Menu, MessageSquareText,
+  FileText, LayoutGrid, LoaderCircle, LogOut, Menu, MessageSquareText,
   PanelLeftClose, Pin, PinOff, Plus, RefreshCw, Search, Send, Server,
   Settings2, ShieldCheck, Sparkles, TerminalSquare, ListPlus, Target, Pause, Play,
   Moon, Sun, Tags, Trash2, X
 } from "lucide-react";
-import type { Bootstrap, CodexModel, LiveThreadState, PendingRequest, QueueEntry, Thread, ThreadItem, Usage } from "./types";
+import type { Bootstrap, ClaudeModelOption, CodexModel, LiveThreadState, PendingRequest, QueueEntry, Thread, ThreadItem, Usage } from "./types";
 
 type SortMode = "updated" | "created" | "name" | "directory" | "status";
-type ViewMode = "session" | "control";
+type ViewMode = "session" | "control" | "spark";
+type SessionClass = "standard" | "spark";
+type SessionBackend = "codex" | "claude";
+type BoardVariant = "control" | "spark";
+type ClaudePermissionMode = "default" | "plan" | "bypassPermissions";
 type ThreadSettings = Record<string, { model: string; effort: string }>;
 type LiveStreams = Record<string, Record<string, string>>;
 type LiveItems = Record<string, Record<string, ThreadItem>>;
@@ -45,6 +49,10 @@ const CLIENT_LIVE_OUTPUT_MAX_CHARS = 200_000;
 const EMPTY_TEXT_STREAM: Record<string, string> = {};
 const EMPTY_LIVE_ITEMS: Record<string, ThreadItem> = {};
 const EMPTY_QUEUE: QueueEntry[] = [];
+const EMPTY_CLAUDE_MODELS: ClaudeModelOption[] = [];
+const SPARK_MODEL = "gpt-5.3-codex-spark";
+const CLAUDE_EFFORTS = ["low", "medium", "high", "max"] as const;
+const CLAUDE_LIVE_POLL_MS = 2_000;
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -59,10 +67,16 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>(() => readTheme());
   const [pinned, setPinned] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-pins")));
   const [settings, setSettings] = useState<ThreadSettings>(readThreadSettings);
-  const [view, setView] = useState<ViewMode>(() => readStoredString("forgedeck-view") === "control" ? "control" : "session");
+  const [view, setView] = useState<ViewMode>(() => {
+    const stored = readStoredString("forgedeck-view");
+    return stored === "control" || stored === "spark" ? stored : "session";
+  });
   const [controlIds, setControlIds] = useState<string[]>(() => readStoredStringArray("forgedeck-control-ids"));
   const [dismissedControlIds, setDismissedControlIds] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-control-dismissed")));
+  const [sparkIds, setSparkIds] = useState<string[]>(() => readStoredStringArray("forgedeck-spark-ids"));
+  const [dismissedSparkIds, setDismissedSparkIds] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-spark-dismissed")));
   const [newOpen, setNewOpen] = useState(false);
+  const [newSessionClass, setNewSessionClass] = useState<SessionClass>("standard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [pending, setPending] = useState<PendingRequest[]>([]);
   const [liveText, setLiveText] = useState<LiveStreams>({});
@@ -81,18 +95,22 @@ export default function App() {
   const searchRef = useRef(search);
   const activeThreadIdsRef = useRef(activeThreadIds);
   const dismissedControlIdsRef = useRef(dismissedControlIds);
+  const dismissedSparkIdsRef = useRef(dismissedSparkIds);
   const activitySequence = useRef(0);
   const threadActivitySequence = useRef<Record<string, number>>({});
   const statusConfirmTimers = useRef<Record<string, number>>({});
   const refreshTimer = useRef<number | null>(null);
   const listTimer = useRef<number | null>(null);
   const listRequestSequence = useRef(0);
+  const removedThreadIdsRef = useRef<Set<string>>(new Set());
   const detailRequestSequence = useRef<Record<string, number>>({});
   const controlSelectionInitialized = useRef(readStoredString("forgedeck-control-initialized") === "true" || readStoredString("forgedeck-control-ids") !== null);
+  const sparkSelectionInitialized = useRef(readStoredString("forgedeck-spark-ids") !== null);
 
   useEffect(() => { selectedRef.current = selectedId; }, [selectedId]);
   searchRef.current = search;
   useEffect(() => { dismissedControlIdsRef.current = dismissedControlIds; }, [dismissedControlIds]);
+  useEffect(() => { dismissedSparkIdsRef.current = dismissedSparkIds; }, [dismissedSparkIds]);
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
@@ -111,8 +129,15 @@ export default function App() {
     activeThreadIdsRef.current = activeIds;
     setActiveThreadIds((current) => sameSet(current, activeIds) ? current : activeIds);
     if (data.agentThreadIds?.length) {
+      const sparkAgentIds = new Set(data.sparkAgentThreadIds || []);
       setControlIds((current) => {
-        const missing = data.agentThreadIds!.filter((threadId) => !dismissedControlIdsRef.current.has(threadId) && !current.includes(threadId));
+        const missing = data.agentThreadIds!.filter((threadId) => !sparkAgentIds.has(threadId) && !dismissedControlIdsRef.current.has(threadId) && !current.includes(threadId));
+        return missing.length ? [...current, ...missing] : current;
+      });
+    }
+    if (data.sparkAgentThreadIds?.length) {
+      setSparkIds((current) => {
+        const missing = data.sparkAgentThreadIds!.filter((threadId) => !dismissedSparkIdsRef.current.has(threadId) && !current.includes(threadId));
         return missing.length ? [...current, ...missing] : current;
       });
     }
@@ -157,19 +182,30 @@ export default function App() {
   const loadThreads = useCallback(async () => {
     const requestId = ++listRequestSequence.current;
     const requestedSearch = searchRef.current.trim();
-    const collected: Thread[] = [];
-    let cursor: string | null = null;
-    do {
-      const query = new URLSearchParams({ limit: "200", sortKey: "updated_at", sortDirection: "desc" });
-      if (cursor) query.set("cursor", cursor);
-      const response = await api<{ data: Thread[]; nextCursor: string | null }>(`/api/threads?${query}`);
-      collected.push(...response.data);
-      cursor = response.nextCursor;
-    } while (cursor);
+    const collect = async (sessionClass: SessionClass) => {
+      const inventory: Thread[] = [];
+      let cursor: string | null = null;
+      do {
+        const query = new URLSearchParams({ limit: "200", sortKey: "updated_at", sortDirection: "desc" });
+        if (cursor) query.set("cursor", cursor);
+        query.set("class", sessionClass);
+        const response = await api<{ data: Thread[]; nextCursor: string | null }>(`/api/threads?${query}`);
+        inventory.push(...response.data);
+        cursor = response.nextCursor;
+      } while (cursor);
+      return inventory;
+    };
+    // Fetch both creation-time partitions explicitly so neither board depends
+    // on an unfiltered endpoint's default behavior.
+    const [standardInventory, sparkInventory] = await Promise.all([collect("standard"), collect("spark")]);
+    const byId = new Map<string, Thread>();
+    for (const thread of [...standardInventory, ...sparkInventory]) byId.set(thread.id, thread);
+    const collected = [...byId.values()];
     if (requestId !== listRequestSequence.current || requestedSearch !== searchRef.current.trim()) return;
+    const eligible = collected.filter((thread) => !removedThreadIdsRef.current.has(thread.id));
     const visible = requestedSearch
-      ? collected.filter((thread) => sessionSearchText(thread).includes(requestedSearch.toLocaleLowerCase()))
-      : collected;
+      ? eligible.filter((thread) => sessionSearchText(thread).includes(requestedSearch.toLocaleLowerCase()))
+      : eligible;
     setThreads((current) => reconcileThreads(current, visible));
     setTokenUsage((current) => mergeThreadTokenUsage(current, visible));
     setSelectedId((current) => current && visible.some((thread) => thread.id === current) ? current : visible[0]?.id || null);
@@ -223,10 +259,55 @@ export default function App() {
   }, [authenticated, loadThreads, pollInterval, runtime]);
 
   useEffect(() => {
-    if (!authenticated || runtime === "ready" || pollInterval === 0 || view !== "session" || !selectedId) return;
-    const timer = window.setInterval(() => void loadThread(selectedId, true).catch(() => undefined), pollInterval);
+    if (!authenticated) return;
+    const threadIds = threads.filter((thread) => isClaudeThread(thread) && (thread.status.type === "active" || hasInProgressTurn(thread))).map((thread) => thread.id);
+    if (!threadIds.length) return;
+    const refresh = async () => {
+      const response = await api<{ results: Array<{ threadId: string; ok: boolean; value?: Thread }> }>("/api/threads/batch", {
+        method: "POST",
+        body: JSON.stringify({ operation: "read", threadIds })
+      });
+      const snapshots = new Map(response.results.filter((result) => result.ok && result.value).map((result) => [result.threadId, result.value!]));
+      const completedIds = [...snapshots.values()].filter((thread) => thread.status.type !== "active" && !hasInProgressTurn(thread)).map((thread) => thread.id);
+      setThreads((current) => {
+        let changed = false;
+        const next = current.map((thread) => {
+          const snapshot = snapshots.get(thread.id);
+          if (!snapshot || sameThreadSnapshot(thread, snapshot)) return thread;
+          changed = true;
+          return snapshot;
+        });
+        return changed ? next : current;
+      });
+      if (completedIds.length) {
+        const completedAt = Date.now();
+        setCompletedSignals((current) => {
+          const next = new Set(current);
+          for (const threadId of completedIds) next.add(threadId);
+          return sameSet(current, next) ? current : next;
+        });
+        setCompletionTimes((current) => {
+          const next = { ...current };
+          for (const threadId of completedIds) next[threadId] = completedAt;
+          return next;
+        });
+        const nextActiveIds = new Set(activeThreadIdsRef.current);
+        for (const threadId of completedIds) nextActiveIds.delete(threadId);
+        activeThreadIdsRef.current = nextActiveIds;
+        setActiveThreadIds(nextActiveIds);
+      }
+    };
+    const timer = window.setInterval(() => void refresh().catch(() => undefined), CLAUDE_LIVE_POLL_MS);
     return () => clearInterval(timer);
-  }, [authenticated, view, selectedId, loadThread, pollInterval, runtime]);
+  }, [authenticated, threads]);
+
+  useEffect(() => {
+    if (!authenticated || view !== "session" || !selectedId) return;
+    const selectedIsClaude = threads.some((thread) => thread.id === selectedId && isClaudeThread(thread));
+    if (!selectedIsClaude && (runtime === "ready" || pollInterval === 0)) return;
+    const timer = window.setInterval(() => void loadThread(selectedId, true).catch(() => undefined), selectedIsClaude ? CLAUDE_LIVE_POLL_MS : pollInterval);
+    return () => clearInterval(timer);
+  }, [authenticated, view, selectedId, loadThread, pollInterval, runtime, threads]);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -354,19 +435,38 @@ export default function App() {
       if (typeof payload.error === "string" && payload.error) setToast(`Queued turn could not start: ${payload.error}`);
     });
     events.addEventListener("threads", (event) => {
-      const payload = parseEventData<{ action?: unknown; threadId?: unknown }>(event);
+      const payload = parseEventData<{ action?: unknown; threadId?: unknown; reason?: unknown }>(event);
       if (!payload || typeof payload.threadId !== "string" || !["created", "updated", "removed"].includes(String(payload.action))) return;
       const threadId = payload.threadId;
       if (payload.action === "created") {
-        setControlIds((current) => dismissedControlIdsRef.current.has(threadId) || current.includes(threadId) ? current : [...current, threadId]);
+        removedThreadIdsRef.current.delete(threadId);
+      }
+      if (payload.action === "updated" && payload.reason === "archive_failed") {
+        removedThreadIdsRef.current.delete(threadId);
       }
       if (payload.action === "removed") {
+        removedThreadIdsRef.current.add(threadId);
+        listRequestSequence.current += 1;
+        delete pendingTextDeltas[threadId];
+        delete pendingToolDeltas[threadId];
+        delete pendingTokenUsage[threadId];
+        setThreads((current) => current.filter((thread) => thread.id !== threadId));
+        setSelectedId((current) => current === threadId ? null : current);
+        setDetail((current) => current?.id === threadId ? null : current);
         setControlIds((current) => current.filter((id) => id !== threadId));
+        setSparkIds((current) => current.filter((id) => id !== threadId));
+        setLiveStatuses((current) => omitKey(current, threadId));
+        setLiveText((current) => omitKey(current, threadId));
+        setLiveToolOutput((current) => omitKey(current, threadId));
+        setLiveItems((current) => omitKey(current, threadId));
+        setQueues((current) => omitKey(current, threadId));
+        setCompletedSignals((current) => withoutSetValue(current, threadId));
+        setCompletionTimes((current) => omitKey(current, threadId));
         const next = withoutSetValue(activeThreadIdsRef.current, threadId);
         activeThreadIdsRef.current = next;
         setActiveThreadIds(next);
       }
-      scheduleListRefresh();
+      scheduleListRefresh(payload.action === "removed" ? 0 : 250);
     });
     events.addEventListener("codex", (event) => {
       const notification = parseEventData<{ method?: unknown; params?: unknown }>(event);
@@ -466,6 +566,8 @@ export default function App() {
   useEffect(() => writeStoredString("forgedeck-view", view), [view]);
   useEffect(() => writeStoredJson("forgedeck-control-ids", controlIds), [controlIds]);
   useEffect(() => writeStoredJson("forgedeck-control-dismissed", [...dismissedControlIds]), [dismissedControlIds]);
+  useEffect(() => writeStoredJson("forgedeck-spark-ids", sparkIds), [sparkIds]);
+  useEffect(() => writeStoredJson("forgedeck-spark-dismissed", [...dismissedSparkIds]), [dismissedSparkIds]);
   useEffect(() => writeStoredJson("forgedeck-completed", [...completedSignals]), [completedSignals]);
   useEffect(() => {
     const timer = window.setTimeout(() => writeStoredJson("forgedeck-token-usage", tokenUsage), 500);
@@ -480,6 +582,10 @@ export default function App() {
         const next = current.filter((threadId) => activeThreadIds.has(threadId) || !completionTimes[threadId] || completionTimes[threadId] > cutoff);
         return next.length === current.length ? current : next;
       });
+      setSparkIds((current) => {
+        const next = current.filter((threadId) => activeThreadIds.has(threadId) || !completionTimes[threadId] || completionTimes[threadId] > cutoff);
+        return next.length === current.length ? current : next;
+      });
     };
     prune();
     const timer = window.setInterval(prune, 30_000);
@@ -489,23 +595,39 @@ export default function App() {
     if (threads.length && !controlSelectionInitialized.current) {
       controlSelectionInitialized.current = true;
       writeStoredString("forgedeck-control-initialized", "true");
-      const initial = [...threads].sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
+      const initial = threads.filter((thread) => !isSparkThread(thread)).sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
       setControlIds(initial);
     }
   }, [threads]);
   useEffect(() => {
-    const activeIds = threads.filter((thread) => activeThreadIds.has(thread.id) && !dismissedControlIds.has(thread.id)).map((thread) => thread.id);
-    if (!activeIds.length) return;
+    const activeIds = threads.filter((thread) => !isSparkThread(thread) && activeThreadIds.has(thread.id) && !dismissedControlIds.has(thread.id)).map((thread) => thread.id);
+    const sparkThreadIdSet = new Set(threads.filter(isSparkThread).map((thread) => thread.id));
     setControlIds((current) => {
+      const retained = current.filter((id) => !sparkThreadIdSet.has(id));
+      const missing = activeIds.filter((id) => !retained.includes(id));
+      return retained.length === current.length && !missing.length ? current : [...retained, ...missing];
+    });
+  }, [threads, activeThreadIds, dismissedControlIds]);
+  useEffect(() => {
+    if (!threads.length || sparkSelectionInitialized.current) return;
+    sparkSelectionInitialized.current = true;
+    const initialIds = threads.filter((thread) => isSparkThread(thread) && !dismissedSparkIds.has(thread.id)).map((thread) => thread.id);
+    if (initialIds.length) setSparkIds(initialIds);
+  }, [threads, dismissedSparkIds]);
+  useEffect(() => {
+    const activeIds = threads.filter((thread) => isSparkThread(thread) && activeThreadIds.has(thread.id) && !dismissedSparkIds.has(thread.id)).map((thread) => thread.id);
+    if (!activeIds.length) return;
+    setSparkIds((current) => {
       const missing = activeIds.filter((id) => !current.includes(id));
       return missing.length ? [...current, ...missing] : current;
     });
-  }, [threads, activeThreadIds, dismissedControlIds]);
+  }, [threads, activeThreadIds, dismissedSparkIds]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !target?.matches("input, textarea, select, [contenteditable=true]")) {
         event.preventDefault();
+        setNewSessionClass("standard");
         setNewOpen(true);
       }
     };
@@ -521,7 +643,9 @@ export default function App() {
   }, [toast]);
 
   const effectiveThreads = useMemo(() => threads.map((thread) => {
-    const status = activeThreadIds.has(thread.id) || liveStatuses[thread.id]?.type === "active" || hasInProgressTurn(thread)
+    const status = isClaudeThread(thread)
+      ? hasInProgressTurn(thread) ? { type: "active", activeFlags: [] } as Thread["status"] : thread.status
+      : activeThreadIds.has(thread.id) || liveStatuses[thread.id]?.type === "active" || hasInProgressTurn(thread)
       ? { type: "active", activeFlags: [] } as Thread["status"]
       : liveStatuses[thread.id] || thread.status;
     return sameThreadStatus(thread.status, status) ? thread : { ...thread, status };
@@ -544,16 +668,25 @@ export default function App() {
   }, [effectiveThreads, sortMode, pinned, completedSignals]);
 
   const defaultModel = bootstrap?.models.data.find((model) => model.isDefault) || bootstrap?.models.data[0];
+  const selectedThread = useMemo(() => effectiveThreads.find((thread) => thread.id === selectedId), [effectiveThreads, selectedId]);
   const activeSettings = useMemo(() => selectedId && settings[selectedId]
     ? settings[selectedId]
-    : defaultModel ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort } : null,
-  [defaultModel, selectedId, settings]);
+    : selectedThread ? defaultSettingsForThread(selectedThread, bootstrap?.models.data || [], bootstrap?.claudeModelOptions || [], defaultModel) : null,
+  [bootstrap?.claudeModelOptions, bootstrap?.models.data, defaultModel, selectedId, selectedThread, settings]);
   const controlThreads = useMemo(() => {
     const byId = new Map(effectiveThreads.map((thread) => [thread.id, thread]));
-    return controlIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
+    return controlIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread) && !isSparkThread(thread!));
   }, [effectiveThreads, controlIds]);
+  const allStandardThreads = useMemo(() => effectiveThreads.filter((thread) => !isSparkThread(thread)), [effectiveThreads]);
+  const sparkThreads = useMemo(() => {
+    const byId = new Map(effectiveThreads.filter(isSparkThread).map((thread) => [thread.id, thread]));
+    return sparkIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
+  }, [effectiveThreads, sparkIds]);
+  const allSparkThreads = useMemo(() => effectiveThreads.filter(isSparkThread), [effectiveThreads]);
   const controlIdSet = useMemo(() => new Set(controlIds), [controlIds]);
+  const sparkIdSet = useMemo(() => new Set(sparkIds), [sparkIds]);
   const effectiveDetail = useMemo(() => {
+    if (detail && isClaudeThread(detail)) return detail;
     if (!detail || !(activeThreadIds.has(detail.id) || liveStatuses[detail.id]?.type === "active" || hasInProgressTurn(detail)) || detail.status.type === "active") return detail;
     return { ...detail, status: { type: "active", activeFlags: [] } as Thread["status"] };
   }, [activeThreadIds, detail, liveStatuses]);
@@ -589,6 +722,25 @@ export default function App() {
     else addControl(id);
   };
 
+  const addSpark = (id: string) => {
+    const nextDismissed = withoutSetValue(dismissedSparkIdsRef.current, id);
+    dismissedSparkIdsRef.current = nextDismissed;
+    setDismissedSparkIds(nextDismissed);
+    setSparkIds((current) => current.includes(id) ? current : [...current, id]);
+    setCompletionTimes((times) => omitKey(times, id));
+  };
+
+  const removeSpark = (id: string) => {
+    dismissedSparkIdsRef.current = new Set(dismissedSparkIdsRef.current).add(id);
+    setDismissedSparkIds(new Set(dismissedSparkIdsRef.current));
+    setSparkIds((current) => current.filter((item) => item !== id));
+  };
+
+  const toggleSpark = (id: string) => {
+    if (sparkIds.includes(id)) removeSpark(id);
+    else addSpark(id);
+  };
+
   const markCompletionSeen = (id: string) => {
     setCompletedSignals((current) => withoutSetValue(current, id));
     const seen = readStoredNumberRecord("forgedeck-completion-seen");
@@ -596,17 +748,20 @@ export default function App() {
     writeStoredJson("forgedeck-completion-seen", seen);
   };
 
-  const clearCompleted = () => {
+  const clearCompleted = (sessionClass: SessionClass) => {
     const ids = effectiveThreads
-      .filter((thread) => completedSignals.has(thread.id) && thread.status.type !== "active")
+      .filter((thread) => (sessionClass === "spark") === isSparkThread(thread) && completedSignals.has(thread.id) && thread.status.type !== "active")
       .map((thread) => thread.id);
     if (!ids.length) return;
     const completedIds = new Set(ids);
-    setControlIds((current) => current.filter((id) => !completedIds.has(id)));
-    const nextDismissed = new Set(dismissedControlIdsRef.current);
+    const setBoardIds = sessionClass === "spark" ? setSparkIds : setControlIds;
+    setBoardIds((current) => current.filter((id) => !completedIds.has(id)));
+    const dismissedRef = sessionClass === "spark" ? dismissedSparkIdsRef : dismissedControlIdsRef;
+    const setDismissed = sessionClass === "spark" ? setDismissedSparkIds : setDismissedControlIds;
+    const nextDismissed = new Set(dismissedRef.current);
     for (const id of ids) nextDismissed.add(id);
-    dismissedControlIdsRef.current = nextDismissed;
-    setDismissedControlIds(nextDismissed);
+    dismissedRef.current = nextDismissed;
+    setDismissed(nextDismissed);
     setCompletedSignals((current) => {
       const next = new Set(current);
       for (const id of ids) next.delete(id);
@@ -622,9 +777,10 @@ export default function App() {
     setSettings((current) => ({ ...current, [selectedId]: next }));
   };
 
-  const onCreated = async (thread: Thread, model: string, effort: string) => {
+  const onCreated = async (thread: Thread, model: string, effort: string, sessionClass: SessionClass) => {
     setSettings((current) => ({ ...current, [thread.id]: { model, effort } }));
-    addControl(thread.id);
+    if (sessionClass === "spark") addSpark(thread.id);
+    else addControl(thread.id);
     setNewOpen(false);
     await loadThreads();
     setSelectedId(thread.id);
@@ -648,14 +804,15 @@ export default function App() {
           <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><PanelLeftClose size={19} /></button>
         </div>
 
-        <button className="new-session" onClick={() => setNewOpen(true)}><Plus size={18} /> New session <kbd>N</kbd></button>
+        <button className="new-session" onClick={() => { setNewSessionClass("standard"); setNewOpen(true); }}><Plus size={18} /> New session <kbd>N</kbd></button>
 
-        <div className="view-switch">
-          <button className={view === "session" ? "active" : ""} onClick={() => { setView("session"); setSidebarOpen(false); }}><MessageSquareText size={14} />Session</button>
-          <button className={view === "control" ? "active" : ""} onClick={() => { setView("control"); setSidebarOpen(false); }}><LayoutGrid size={14} />Control center<span>{controlThreads.length}</span></button>
+        <div className="view-switch" style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
+          <button className={view === "session" ? "active" : ""} onClick={() => { setView("session"); setSidebarOpen(false); }}><MessageSquareText size={14} />{view === "session" ? "Session" : ""}</button>
+          <button className={view === "control" ? "active" : ""} onClick={() => { setView("control"); setSidebarOpen(false); }}><LayoutGrid size={14} />{view === "control" ? "Control center" : ""}<span>{controlThreads.length}</span></button>
+          <button className={view === "spark" ? "active" : ""} style={view === "spark" ? { color: "#f5c451", background: "rgba(245, 196, 81, .1)", boxShadow: "inset 0 0 0 1px rgba(245, 196, 81, .2)" } : undefined} onClick={() => { setView("spark"); setSidebarOpen(false); }}><Sparkles size={14} />{view === "spark" ? "SparkBoard" : ""}<span>{sparkThreads.length}</span></button>
         </div>
 
-        <UsageCard usage={bootstrap.usage} plan={bootstrap.account.account?.planType} />
+        <UsageCard usage={bootstrap.usage} plan={bootstrap.account.account?.planType} backendStatus={bootstrap.backendStatus} />
 
         <div className="session-tools">
           <label className="search-box"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a session…" /></label>
@@ -671,8 +828,8 @@ export default function App() {
         <div className="session-heading"><span>Sessions</span><span>{threads.length}</span></div>
         <nav className="session-list">
           {sortedThreads.map((thread) => (
-            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inControl={controlIdSet.has(thread.id)} completed={completedSignals.has(thread.id)}
-              tokens={tokensForThread(thread, tokenUsage[thread.id])} onSelect={() => { setSelectedId(thread.id); setView("session"); markCompletionSeen(thread.id); }} onPin={() => togglePin(thread.id)} onControl={() => toggleControl(thread.id)} />
+            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inBoard={isSparkThread(thread) ? sparkIdSet.has(thread.id) : controlIdSet.has(thread.id)} completed={completedSignals.has(thread.id)}
+              tokens={tokensForThread(thread, tokenUsage[thread.id])} onSelect={() => { setSelectedId(thread.id); setView("session"); markCompletionSeen(thread.id); }} onPin={() => togglePin(thread.id)} onBoard={() => isSparkThread(thread) ? toggleSpark(thread.id) : toggleControl(thread.id)} />
           ))}
           {!sortedThreads.length && <div className="empty-list"><MessageSquareText size={20} /><span>No sessions found</span></div>}
         </nav>
@@ -688,7 +845,7 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={20} /></button>
-          {view === "control" ? <ControlHeader count={controlThreads.length} activeCount={effectiveThreads.filter((thread) => thread.status.type === "active").length} /> : effectiveDetail ? <ThreadHeader thread={effectiveDetail} pinned={pinned.has(effectiveDetail.id)} onPin={() => togglePin(effectiveDetail.id)}
+          {view === "control" ? <BoardHeader variant="control" count={controlThreads.length} activeCount={controlThreads.filter((thread) => thread.status.type === "active").length} /> : view === "spark" ? <BoardHeader variant="spark" count={sparkThreads.length} activeCount={sparkThreads.filter((thread) => thread.status.type === "active").length} /> : effectiveDetail ? <ThreadHeader thread={effectiveDetail} pinned={pinned.has(effectiveDetail.id)} onPin={() => togglePin(effectiveDetail.id)}
             onRename={() => runUiAction(async () => {
               const name = prompt("Session name", threadTitle(effectiveDetail));
               if (!name?.trim()) return;
@@ -710,14 +867,18 @@ export default function App() {
               if (!confirm("Archive this session? Its Codex history will be kept.")) return;
               const archivedId = effectiveDetail.id;
               const nextId = sortedThreads.find((thread) => thread.id !== archivedId)?.id || null;
+              removedThreadIdsRef.current.add(archivedId);
+              listRequestSequence.current += 1;
               setThreads((current) => current.filter((thread) => thread.id !== archivedId));
               setControlIds((current) => current.filter((id) => id !== archivedId));
+              setSparkIds((current) => current.filter((id) => id !== archivedId));
               setSelectedId(nextId);
               setDetail(null);
               try {
                 await api(`/api/threads/${archivedId}`, { method: "DELETE" });
                 await loadThreads();
               } catch (error) {
+                removedThreadIdsRef.current.delete(archivedId);
                 await loadThreads().catch(() => undefined);
                 showError(error, setToast);
               }
@@ -727,22 +888,30 @@ export default function App() {
         </header>
 
         {view === "control" ? (
-          <ControlCenter threads={controlThreads} allThreads={effectiveThreads} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel}
+          <ControlCenter threads={controlThreads} allThreads={allStandardThreads} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || EMPTY_CLAUDE_MODELS} settings={settings} defaultModel={defaultModel}
+            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} queues={queues} activityVersion={activityVersion}
+            tokenUsage={tokenUsage} pollInterval={controlThreads.some(isClaudeThread) ? CLAUDE_LIVE_POLL_MS : runtime === "ready" ? 0 : pollInterval}
+            onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
+            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={removeControl}
+            onAdd={addControl} onClearCompleted={() => clearCompleted("standard")}
+            onError={(error) => showError(error, setToast)} />
+        ) : view === "spark" ? (
+          <SparkBoard threads={sparkThreads} allThreads={allSparkThreads} models={bootstrap.models.data} claudeModels={EMPTY_CLAUDE_MODELS} settings={settings} defaultModel={defaultModel}
             liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} queues={queues} activityVersion={activityVersion}
             tokenUsage={tokenUsage} pollInterval={runtime === "ready" ? 0 : pollInterval}
             onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
-            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={removeControl}
-            onAdd={addControl} onClearCompleted={clearCompleted}
+            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={removeSpark}
+            onAdd={addSpark} onClearCompleted={() => clearCompleted("spark")} onLaunch={() => { setNewSessionClass("spark"); setNewOpen(true); }}
             onError={(error) => showError(error, setToast)} />
         ) : effectiveDetail ? (
-          <Chat key={effectiveDetail.id} thread={effectiveDetail} loading={loadingDetail} liveText={liveText[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveToolOutput={liveToolOutput[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveItems={liveItems[effectiveDetail.id] || EMPTY_LIVE_ITEMS} queue={queues[effectiveDetail.id] || EMPTY_QUEUE} models={bootstrap.models.data}
+          <Chat key={effectiveDetail.id} thread={effectiveDetail} loading={loadingDetail} liveText={liveText[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveToolOutput={liveToolOutput[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveItems={liveItems[effectiveDetail.id] || EMPTY_LIVE_ITEMS} queue={queues[effectiveDetail.id] || EMPTY_QUEUE} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || EMPTY_CLAUDE_MODELS}
             settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(effectiveDetail.id)} onError={(error) => showError(error, setToast)} />
         ) : (
-          <Welcome onNew={() => setNewOpen(true)} />
+          <Welcome onNew={() => { setNewSessionClass("standard"); setNewOpen(true); }} />
         )}
       </main>
 
-      {newOpen && <NewSessionModal bootstrap={bootstrap} onClose={() => setNewOpen(false)} onCreated={onCreated} onError={(error) => showError(error, setToast)} />}
+      {newOpen && <NewSessionModal bootstrap={bootstrap} sessionClass={newSessionClass} onClose={() => setNewOpen(false)} onCreated={onCreated} onError={(error) => showError(error, setToast)} />}
       {pending.length > 0 && <ApprovalTray requests={pending} onResolved={(id) => setPending((items) => items.filter((item) => String(item.id) !== String(id)))} onError={(error) => showError(error, setToast)} />}
       {toast && <div className="toast"><ShieldCheck size={17} />{toast}<button onClick={() => setToast(null)}><X size={15} /></button></div>}
     </div>
@@ -785,42 +954,66 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
   </div>;
 }
 
-function UsageCard({ usage, plan }: { usage: Usage | null; plan?: string }) {
-  const snapshot = usage?.rateLimitsByLimitId?.codex || usage?.rateLimits;
-  const percent = Math.min(100, Math.max(0, snapshot?.primary?.usedPercent || 0));
-  const reset = snapshot?.primary?.resetsAt ? relativeReset(snapshot.primary.resetsAt) : "Not available";
+type ProviderUsageRowProps = { icon: ReactNode; name: string; color: string; available: boolean; percent?: number | null; subscription?: boolean };
+
+function ProviderUsageRow({ icon, name, color, available, percent = null, subscription = false }: ProviderUsageRowProps) {
+  const statusColor = available ? color : "#737b87";
+  return <div style={{ display: "grid", gridTemplateColumns: "16px 43px minmax(0, 1fr)", alignItems: "center", gap: 7, minHeight: 18 }}>
+    <span style={{ display: "grid", placeItems: "center", color: statusColor }}>{icon}</span>
+    <strong style={{ color: available ? "var(--text)" : statusColor, fontSize: 11 }}>{name}</strong>
+    {!available ? <span style={{ color: statusColor, fontSize: 10, textAlign: "right" }}>Unavailable</span> : subscription ?
+      <span title="Subscription-based" style={{ color, fontSize: 10, fontWeight: 700, textAlign: "right" }}>Active</span> :
+      <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+        <span style={{ width: 30, color, fontSize: 10, fontWeight: 700, textAlign: "right" }}>{percent === null ? "—" : `${Math.round(percent)}%`}</span>
+        <span style={{ flex: 1, height: 5, overflow: "hidden", borderRadius: 999, background: "rgba(127, 136, 148, .24)" }}>
+          <span style={{ display: "block", width: `${percent ?? 0}%`, height: "100%", borderRadius: "inherit", background: color }} />
+        </span>
+      </span>}
+  </div>;
+}
+
+function UsageCard({ usage, plan, backendStatus }: { usage: Usage | null; plan?: string; backendStatus?: Bootstrap["backendStatus"] }) {
+  const legacyCodex = usage?.rateLimitsByLimitId?.codex || usage?.rateLimits;
+  const clampPercent = (value?: number) => value === undefined ? null : Math.min(100, Math.max(0, value));
+  const codexPercent = clampPercent(backendStatus?.codex.rateLimit?.primary?.usedPercent ?? legacyCodex?.primary?.usedPercent);
+  const sparkPercent = clampPercent(backendStatus?.spark.rateLimit?.primary?.usedPercent);
+  const claudePercent = clampPercent(backendStatus?.claude.rateLimit?.primary?.usedPercent);
+  const codexAvailable = backendStatus?.codex.available ?? Boolean(legacyCodex?.primary);
   return <section className="usage-card">
-    <div className="usage-top"><span><Gauge size={15} /> Plan usage</span><strong>{formatPlan(plan)}</strong></div>
-    <div className="usage-main">
-      <div className="usage-ring" style={{ "--usage": `${percent * 3.6}deg` } as React.CSSProperties}><div><b>{Math.round(percent)}%</b><span>used</span></div></div>
-      <div className="usage-copy"><strong>{100 - Math.round(percent)}% remaining</strong><span><Clock3 size={13} /> Resets {reset}</span></div>
+    <div className="usage-top"><span><Gauge size={15} /> Usage</span><strong>{formatPlan(plan)}</strong></div>
+    <div style={{ display: "grid", gap: 9 }}>
+      <ProviderUsageRow icon={<Bot size={14} />} name="Codex" color="#6e9dff" available={codexAvailable} percent={codexPercent} />
+      <ProviderUsageRow icon={<Sparkles size={14} />} name="Spark" color="#f5c451" available={backendStatus?.spark.available ?? false} percent={sparkPercent} />
+      <ProviderUsageRow icon={<BrainCircuit size={14} />} name="Claude" color="#cf75ff" available={backendStatus?.claude.available ?? false} percent={claudePercent} />
     </div>
   </section>;
 }
 
-type SessionCardProps = { thread: Thread; selected: boolean; pinned: boolean; inControl: boolean; completed: boolean; tokens: number | null; onSelect: () => void; onPin: () => void; onControl: () => void };
+type SessionCardProps = { thread: Thread; selected: boolean; pinned: boolean; inBoard: boolean; completed: boolean; tokens: number | null; onSelect: () => void; onPin: () => void; onBoard: () => void };
 
-const SessionCard = memo(function SessionCard({ thread, selected, pinned, inControl, completed, tokens, onSelect, onPin, onControl }: SessionCardProps) {
+const SessionCard = memo(function SessionCard({ thread, selected, pinned, inBoard, completed, tokens, onSelect, onPin, onBoard }: SessionCardProps) {
   const state = sessionVisualState(thread, completed);
   const running = state === "running";
-  return <button className={`session-card state-${state} ${selected ? "selected" : ""}`} onClick={onSelect}>
+  const spark = isSparkThread(thread);
+  const claude = isClaudeThread(thread);
+  return <button className={`session-card state-${state} ${selected ? "selected" : ""}`} style={spark ? { boxShadow: "inset 2px 0 rgba(245, 196, 81, .55)" } : claude ? { boxShadow: "inset 2px 0 rgba(201, 105, 255, .5)" } : undefined} onClick={onSelect}>
     <span className={`status-dot ${state === "running" ? "active" : state}`} />
     <span className="session-copy">
-      <span className="session-title-row"><strong>{threadTitle(thread)}</strong><em className={`session-state ${state}`}>{sessionStateLabel(state)}</em></span>
+      <span className="session-title-row"><ThreadProviderIcon thread={thread} size={11} /><strong>{threadTitle(thread)}</strong>{(spark || claude) && <em style={providerBadgeStyle(thread)}>{spark ? "Spark" : "Claude"}</em>}<em className={`session-state ${state}`}>{sessionStateLabel(state)}</em></span>
       <small><Folder size={12} />{basename(thread.cwd)}<i>·</i>{timeAgo(thread.updatedAt)}</small>
       {(thread.category || thread.tags?.length) && <span className="session-labels">{thread.category && <b>{thread.category}</b>}{thread.tags?.slice(0, 2).map((tag) => <i key={tag}>{tag}</i>)}</span>}
       <span className="session-metrics"><span><Clock3 size={11} />{formatDuration(threadDurationSeconds(thread))}</span><span><Gauge size={11} />{tokens === null ? "— tokens" : `${formatTokenCount(tokens)} tokens`}</span></span>
     </span>
     <span className="session-actions" onClick={(event) => event.stopPropagation()}>
       {running && <LoaderCircle className="spin running-icon" size={14} />}
-      <span role="button" tabIndex={0} onClick={onControl} title={inControl ? "Remove from Control Center" : "Add to Control Center"}><LayoutGrid size={14} className={inControl ? "control-active" : ""} /></span>
+      <span role="button" tabIndex={0} onClick={onBoard} title={inBoard ? `Remove from ${spark ? "SparkBoard" : "Control Center"}` : `Add to ${spark ? "SparkBoard" : "Control Center"}`}>{spark ? <Sparkles size={14} style={inBoard ? { color: "#f5c451" } : undefined} /> : <LayoutGrid size={14} className={inBoard ? "control-active" : ""} />}</span>
       <span role="button" tabIndex={0} onClick={onPin} title={pinned ? "Unpin" : "Pin"}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</span>
     </span>
   </button>;
 }, (previous, next) => previous.thread === next.thread
   && previous.selected === next.selected
   && previous.pinned === next.pinned
-  && previous.inControl === next.inControl
+  && previous.inBoard === next.inBoard
   && previous.completed === next.completed
   && previous.tokens === next.tokens);
 
@@ -844,26 +1037,31 @@ function AppPreferences({ pollInterval, onPollInterval, theme, onTheme }: { poll
 
 function ThreadHeader({ thread, pinned, onPin, onRename, onOrganize, onArchive }: { thread: Thread; pinned: boolean; onPin: () => void; onRename: () => void; onOrganize: () => void; onArchive: () => void }) {
   return <div className="thread-header">
-    <div className="thread-title"><div className="thread-icon"><Code2 size={18} /></div><div><strong>{threadTitle(thread)}</strong><span><FolderOpen size={13} />{thread.cwd}{thread.gitInfo?.branch && <><i>·</i><GitBranch size={12} />{thread.gitInfo.branch}</>}{thread.category && <><i>·</i><b>{thread.category}</b></>}{thread.tags?.map((tag) => <em key={tag}>#{tag}</em>)}</span></div></div>
+    <div className="thread-title"><div className="thread-icon" style={providerIconContainerStyle(thread)}><ThreadProviderIcon thread={thread} size={18} /></div><div><strong>{threadTitle(thread)}</strong><span><FolderOpen size={13} />{thread.cwd}{thread.gitInfo?.branch && <><i>·</i><GitBranch size={12} />{thread.gitInfo.branch}</>}{thread.category && <><i>·</i><b>{thread.category}</b></>}{thread.tags?.map((tag) => <em key={tag}>#{tag}</em>)}</span></div></div>
     <div className="header-actions"><button className="icon-button" onClick={onPin} title={pinned ? "Unpin" : "Pin"}>{pinned ? <PinOff size={17} /> : <Pin size={17} />}</button><button className="icon-button" onClick={onOrganize} title="Edit category and tags"><Tags size={17} /></button><button className="icon-button" onClick={onRename} title="Rename"><Settings2 size={17} /></button><button className="icon-button" onClick={onArchive} title="Archive"><Archive size={17} /></button></div>
   </div>;
 }
 
-function ControlHeader({ count, activeCount }: { count: number; activeCount: number }) {
+function BoardHeader({ variant, count, activeCount }: { variant: BoardVariant; count: number; activeCount: number }) {
+  const spark = variant === "spark";
   return <div className="control-header">
-    <div className="control-header-icon"><LayoutGrid size={18} /></div>
-    <div><strong>Control Center</strong><span>{count} session{count === 1 ? "" : "s"} on deck <i>·</i> <b>{activeCount} active now</b></span></div>
+    <div className="control-header-icon" style={spark ? { color: "#f5c451", background: "rgba(245, 196, 81, .09)", borderColor: "rgba(245, 196, 81, .22)" } : undefined}>{spark ? <Sparkles size={18} /> : <LayoutGrid size={18} />}</div>
+    <div><strong>{spark ? "SparkBoard" : "Control Center"}</strong><span>{count} session{count === 1 ? "" : "s"} on deck <i>·</i> <b style={spark ? { color: "#f5c451" } : undefined}>{activeCount} active now</b></span></div>
   </div>;
 }
 
 type ControlCenterProps = {
-  threads: Thread[]; allThreads: Thread[]; models: CodexModel[]; settings: ThreadSettings; defaultModel?: CodexModel;
+  threads: Thread[]; allThreads: Thread[]; models: CodexModel[]; claudeModels: ClaudeModelOption[]; settings: ThreadSettings; defaultModel?: CodexModel;
   liveText: LiveStreams; liveToolOutput: LiveStreams; liveItems: LiveItems; queues: Record<string, QueueEntry[]>; completedSignals: Set<string>; tokenUsage: Record<string, ThreadTokenUsage>; activityVersion: number; pollInterval: number;
   onSettings: (threadId: string, value: { model: string; effort: string }) => void;
   onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onAdd: (threadId: string) => void; onClearCompleted: () => void; onError: (error: unknown) => void;
+  onLaunch?: () => void;
 };
 
-const ControlCenter = memo(function ControlCenter({ threads, allThreads, models, settings, defaultModel, liveText, liveToolOutput, liveItems, queues, completedSignals, tokenUsage, activityVersion, pollInterval, onSettings, onOpen, onRemove, onAdd, onClearCompleted, onError }: ControlCenterProps) {
+type SessionBoardProps = ControlCenterProps & { variant: BoardVariant };
+
+const SessionBoard = memo(function SessionBoard({ variant, threads, allThreads, models, claudeModels, settings, defaultModel, liveText, liveToolOutput, liveItems, queues, completedSignals, tokenUsage, activityVersion, pollInterval, onSettings, onOpen, onRemove, onAdd, onClearCompleted, onLaunch, onError }: SessionBoardProps) {
+  const spark = variant === "spark";
   const columns = useControlColumns();
   const pageSize = columns * 2;
   const [page, setPage] = useState(0);
@@ -880,9 +1078,6 @@ const ControlCenter = memo(function ControlCenter({ threads, allThreads, models,
     return allThreads.filter((thread) => !shownIds.has(thread.id));
   }, [allThreads, threads]);
   const completedCount = useMemo(() => allThreads.filter((thread) => completedSignals.has(thread.id) && thread.status.type !== "active").length, [allThreads, completedSignals]);
-  const fallbackSettings = useMemo(() => defaultModel
-    ? { model: defaultModel.model, effort: defaultModel.defaultReasoningEffort }
-    : { model: models[0]?.model || "", effort: models[0]?.defaultReasoningEffort || "medium" }, [defaultModel, models]);
 
   useEffect(() => { errorRef.current = onError; }, [onError]);
   useEffect(() => { if (page >= pageCount) setPage(pageCount - 1); }, [page, pageCount]);
@@ -920,36 +1115,40 @@ const ControlCenter = memo(function ControlCenter({ threads, allThreads, models,
   const displayThreads = useMemo(() => pageThreads.map((summary) => {
     const snapshot = details[summary.id];
     if (!snapshot) return summary;
+    if (isClaudeThread(snapshot)) return snapshot;
     return sameThreadStatus(snapshot.status, summary.status) ? snapshot : { ...snapshot, status: summary.status };
   }), [details, pageThreads]);
   const requestRefresh = useCallback(() => setReload((value) => value + 1), []);
 
-  return <section className="control-center">
+  return <section className="control-center" data-board={variant}>
     <div className="control-toolbar">
       <div><span className="live-beacon"><i />LIVE</span><p>Agent messages stream live. Completed panels close after 15 minutes.</p></div>
       <div className="control-toolbar-actions">
         <button className="clear-completed" onClick={onClearCompleted} disabled={completedCount === 0} title="Remove completed panels and acknowledge their notifications"><Trash2 size={13} /><span>Clear completed</span>{completedCount > 0 && <b>{completedCount}</b>}</button>
-        {available.length > 0 && <label className="add-panel"><Plus size={14} /><select value="" onChange={(event) => { if (event.target.value) onAdd(event.target.value); }}><option value="">Add session</option>{available.map((thread) => <option key={thread.id} value={thread.id}>{threadTitle(thread)}</option>)}</select></label>}
+        {spark && onLaunch && <button className="clear-completed" style={{ color: "#f5c451", borderColor: "rgba(245, 196, 81, .28)", background: "rgba(245, 196, 81, .07)" }} onClick={onLaunch}><Sparkles size={13} /><span>Launch Spark session</span></button>}
+        {!spark && available.length > 0 && <label className="add-panel"><Plus size={14} /><select value="" onChange={(event) => { if (event.target.value) onAdd(event.target.value); }}><option value="">Add session</option>{available.map((thread) => <option key={thread.id} value={thread.id}>{threadTitle(thread)}</option>)}</select></label>}
         <button className="icon-button" onClick={requestRefresh} title="Refresh panels"><RefreshCw size={16} /></button>
       </div>
     </div>
 
     {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-rows": visibleRows } as React.CSSProperties}>
       {displayThreads.map((thread) => {
-        const threadSettings = settings[thread.id] || fallbackSettings;
-        return <ControlCard key={thread.id} thread={thread} models={models} settings={threadSettings}
+        const threadSettings = settings[thread.id] || defaultSettingsForThread(thread, models, claudeModels, defaultModel);
+        return <ControlCard key={thread.id} thread={thread} variant={variant} models={models} claudeModels={claudeModels} settings={threadSettings}
           liveText={liveText[thread.id] || EMPTY_TEXT_STREAM} liveToolOutput={liveToolOutput[thread.id] || EMPTY_TEXT_STREAM} liveItems={liveItems[thread.id] || EMPTY_LIVE_ITEMS} queue={queues[thread.id] || EMPTY_QUEUE} completed={completedSignals.has(thread.id)}
           tokens={tokensForThread(thread, tokenUsage[thread.id])}
           onSettings={onSettings} onOpen={onOpen} onRemove={onRemove}
           onRefresh={requestRefresh} onError={onError} />;
       })}
-    </div> : <div className="control-empty"><LayoutGrid size={28} /><h2>No sessions on deck</h2><p>Create a session or add one from the session list to start your Control Center.</p></div>}
+    </div> : spark ? <div className="control-empty"><Sparkles size={32} color="#f5c451" /><span style={{ marginTop: 14, color: "#8d762d", fontSize: 8, fontWeight: 700, letterSpacing: 1.2, textTransform: "uppercase" }}>No spark sessions</span><h2>SparkBoard — Quick task fleet</h2><p>Launch a spark session for fast, lightweight tasks.</p>{onLaunch && <button className="primary-button" style={{ marginTop: 18, background: "#b88919", borderColor: "#d5ad3f" }} onClick={onLaunch}><Sparkles size={16} />Launch Spark session</button>}</div> : <div className="control-empty"><LayoutGrid size={28} /><h2>No sessions on deck</h2><p>Create a session or add one from the session list to start your Control Center.</p></div>}
 
     {pageCount > 1 && <div className="control-pages"><button disabled={page === 0} onClick={() => setPage((value) => value - 1)}><ArrowLeft size={14} />Previous</button><span>Page {page + 1} of {pageCount} · {columns} across × 2 rows</span><button disabled={page >= pageCount - 1} onClick={() => setPage((value) => value + 1)}>Next<ChevronRight size={14} /></button></div>}
   </section>;
-}, (previous, next) => previous.threads === next.threads
+}, (previous, next) => previous.variant === next.variant
+  && previous.threads === next.threads
   && previous.allThreads === next.allThreads
   && previous.models === next.models
+  && previous.claudeModels === next.claudeModels
   && previous.settings === next.settings
   && previous.defaultModel === next.defaultModel
   && previous.liveText === next.liveText
@@ -961,18 +1160,28 @@ const ControlCenter = memo(function ControlCenter({ threads, allThreads, models,
   && previous.activityVersion === next.activityVersion
   && previous.pollInterval === next.pollInterval);
 
+const ControlCenter = memo(function ControlCenter(props: ControlCenterProps) {
+  return <SessionBoard {...props} variant="control" />;
+});
+
+const SparkBoard = memo(function SparkBoard(props: ControlCenterProps) {
+  return <SessionBoard {...props} variant="spark" />;
+});
+
 type ControlCardProps = {
-  thread: Thread; models: CodexModel[]; settings: { model: string; effort: string };
+  thread: Thread; variant: BoardVariant; models: CodexModel[]; claudeModels: ClaudeModelOption[]; settings: { model: string; effort: string };
   liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; completed: boolean; tokens: number | null;
   onSettings: (threadId: string, value: { model: string; effort: string }) => void; onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onRefresh: () => void; onError: (error: unknown) => void;
 };
 
-const ControlCard = memo(function ControlCard({ thread, models, settings, liveText, liveToolOutput, liveItems, queue, completed, tokens, onSettings, onOpen, onRemove, onRefresh, onError }: ControlCardProps) {
+const ControlCard = memo(function ControlCard({ thread, variant, models, claudeModels, settings, liveText, liveToolOutput, liveItems, queue, completed, tokens, onSettings, onOpen, onRemove, onRefresh, onError }: ControlCardProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const assist = useComposerAssist(text, setText, thread.cwd);
   const body = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const claude = isClaudeThread(thread);
+  const spark = variant === "spark" || isSparkThread(thread);
   const model = models.find((item) => item.model === settings.model) || models[0];
   const runningTurn = useMemo(() => [...(thread.turns || [])].reverse().find((turn) => turn.status === "inProgress"), [thread.turns]);
   const historyItems = useMemo(() => (thread.turns || []).flatMap((turn) => turn.items), [thread.turns]);
@@ -1018,24 +1227,27 @@ const ControlCard = memo(function ControlCard({ thread, models, settings, liveTe
   };
 
   const changeModel = (modelId: string) => {
+    if (claude || spark) return;
     const next = models.find((item) => item.model === modelId);
     if (next) onSettings(thread.id, { model: next.model, effort: next.defaultReasoningEffort });
   };
 
-  return <article className={`control-card state-${state} ${running ? "running" : ""} ${successfullyCompleted ? "completed" : ""}`}>
+  const effortOptions = claude ? CLAUDE_EFFORTS : spark ? ["high"] : model?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
+
+  return <article className={`control-card state-${state} ${running ? "running" : ""} ${successfullyCompleted ? "completed" : ""}`} style={controlCardAccentStyle(thread, variant)}>
     <header>
-      <button className="control-title" onClick={() => onOpen(thread.id)}><span className={`status-dot ${state === "running" ? "active" : state}`} /><span><strong>{threadTitle(thread)}</strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
-      <div className="control-card-actions"><span className={`done-label ${state}`}>{sessionStateLabel(state)}</span><PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={() => onOpen(thread.id)} title="Open full session"><ChevronRight size={16} /></button><button onClick={() => onRemove(thread.id)} title="Remove from Control Center"><X size={15} /></button></div>
+      <button className="control-title" onClick={() => onOpen(thread.id)}><span className={`status-dot ${state === "running" ? "active" : state}`} /><span><strong style={{ display: "flex", alignItems: "center", gap: 4 }}><ThreadProviderIcon thread={thread} size={11} /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{threadTitle(thread)}</span></strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
+      <div className="control-card-actions"><span className={`done-label ${state}`}><b style={{ color: providerAccent(thread), font: "inherit" }}>{providerLabel(thread)}</b><i style={{ margin: "0 3px", opacity: .55, fontStyle: "normal" }}>·</i>{sessionStateLabel(state)}</span><PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={() => onOpen(thread.id)} title="Open full session"><ChevronRight size={16} /></button><button onClick={() => onRemove(thread.id)} title={`Remove from ${spark ? "SparkBoard" : "Control Center"}`}><X size={15} /></button></div>
     </header>
     {thread.goal && <button type="button" className={`control-goal ${thread.goal.status}`} onClick={() => onOpen(thread.id)} title={thread.goal.objective}><Target size={11} /><span>{thread.goal.objective}</span><em>{goalStatusLabel(thread.goal.status)}</em></button>}
     <div className="control-metrics"><span><Clock3 size={10} />{formatDuration(threadDurationSeconds(thread))}</span><span><Gauge size={10} />{tokens === null ? "Token usage unavailable" : `${formatTokenCount(tokens)} tokens`}</span></div>
     <div className="control-feed" ref={body} onScroll={onFeedScroll}>
-      {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><Bot size={21} /><span>{running ? "Agent is starting…" : "Waiting for a task"}</span></div>}
-      {items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
-      {streamingText.map(([id, value]) => value && <div className="compact-message agent live" key={id}><span><Bot size={12} /></span><div><ReactMarkdown>{value}</ReactMarkdown><i className="typing-cursor" /></div></div>)}
-      {running && !streamingText.some(([, value]) => Boolean(value)) && <div className="compact-thinking"><LoaderCircle className="spin" size={13} />Agent working…</div>}
+      {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><ThreadProviderIcon thread={thread} size={21} /><span>{running ? `${providerLabel(thread)} is starting…` : "Waiting for a task"}</span></div>}
+      {items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} provider={thread.backend} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
+      {streamingText.map(([id, value]) => value && <div className="compact-message agent live" key={id}><span><ThreadProviderIcon thread={thread} size={12} /></span><div><ReactMarkdown>{value}</ReactMarkdown><i className="typing-cursor" /></div></div>)}
+      {running && !streamingText.some(([, value]) => Boolean(value)) && <div className="compact-thinking"><LoaderCircle className="spin" size={13} />{providerLabel(thread)} working…</div>}
     </div>
-    <div className="control-models"><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} onChange={(event) => onSettings(thread.id, { ...settings, effort: event.target.value })}>{model?.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></div>
+    <div className="control-models"><select value={settings.model} disabled={claude || spark} onChange={(event) => changeModel(event.target.value)}>{claude ? claudeModels.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>) : spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} disabled={spark} onChange={(event) => onSettings(thread.id, { ...settings, effort: event.target.value })}>{effortOptions.map((effort) => <option key={effort} value={effort}>{EFFORT_LABELS[effort] || effort}</option>)}</select></div>
     {queue.length > 0 && <div className="control-queue"><span><ListPlus size={11} />Queued next</span>{queue.map((entry, index) => <div key={entry.id}><b>{index + 1}</b><em title={entry.text}>{entry.text}</em><button type="button" onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={11} /></button></div>)}</div>}
     <form className="control-composer" onSubmit={send}>
       <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} compact />
@@ -1045,7 +1257,9 @@ const ControlCard = memo(function ControlCard({ thread, models, settings, liveTe
     </form>
   </article>;
 }, (previous, next) => previous.thread === next.thread
+  && previous.variant === next.variant
   && previous.models === next.models
+  && previous.claudeModels === next.claudeModels
   && previous.settings === next.settings
   && previous.liveText === next.liveText
   && previous.liveToolOutput === next.liveToolOutput
@@ -1054,32 +1268,36 @@ const ControlCard = memo(function ControlCard({ thread, models, settings, liveTe
   && previous.completed === next.completed
   && previous.tokens === next.tokens);
 
-const CompactItem = memo(function CompactItem({ item, liveOutput }: { item: ThreadItem; liveOutput?: string }) {
+const CompactItem = memo(function CompactItem({ item, provider = "codex", liveOutput }: { item: ThreadItem; provider?: Thread["backend"]; liveOutput?: string }) {
+  const providerName = provider === "claude" ? "Claude" : "Codex";
   if (item.type === "userMessage") {
     const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
     return <div className="compact-message user"><div>{text}</div><span>YOU</span></div>;
   }
-  if (item.type === "agentMessage") return <div className="compact-message agent"><span><Bot size={12} /></span><div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
+  if (item.type === "agentMessage") return <div className="compact-message agent"><span>{provider === "claude" ? <BrainCircuit size={12} /> : <Bot size={12} />}</span><div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
   if (item.type === "reasoning") return <details className="compact-reasoning"><summary><BrainCircuit size={12} />Reasoning</summary><p>{item.summary?.join("\n")}</p></details>;
   if (item.type === "plan") return <div className="compact-tool plan"><LayoutGrid size={13} /><span><strong>Plan updated</strong><small>{truncate(item.text || "", 140)}</small></span></div>;
   if (item.type === "commandExecution") return <details className={`compact-tool ${item.status || ""}`} {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={13} /><span><strong>Command</strong><small>{item.command}</small></span><em>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
   if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`} open><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><DiffView changes={item.changes || []} compact /></details>;
-  if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : "Codex tool"}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
+  if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : `${providerName} tool`}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
   return null;
 });
 
 type ChatProps = {
-  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; models: CodexModel[];
+  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; models: CodexModel[]; claudeModels: ClaudeModelOption[];
   settings: { model: string; effort: string }; onSettings: (value: { model: string; effort: string }) => void;
   onRefresh: () => Promise<void>; onError: (error: unknown) => void;
 };
 
-const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, models, settings, onSettings, onRefresh, onError }: ChatProps) {
+const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, models, claudeModels, settings, onSettings, onRefresh, onError }: ChatProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const assist = useComposerAssist(text, setText, thread.cwd);
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const claude = isClaudeThread(thread);
+  const spark = isSparkThread(thread);
+  const providerName = providerLabel(thread);
   const selectedModel = models.find((model) => model.model === settings.model) || models[0];
   const runningTurn = useMemo(() => [...thread.turns].reverse().find((turn) => turn.status === "inProgress"), [thread.turns]);
   const running = thread.status.type === "active" || Boolean(runningTurn);
@@ -1121,18 +1339,21 @@ const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liv
   };
 
   const changeModel = (modelId: string) => {
+    if (claude || spark) return;
     const model = models.find((item) => item.model === modelId)!;
     onSettings({ model: model.model, effort: model.defaultReasoningEffort });
   };
+
+  const effortOptions = claude ? CLAUDE_EFFORTS : spark ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
 
   return <div className="chat-layout">
     <div className="transcript" ref={scroller} onScroll={onTranscriptScroll}>
       {loading && <div className="transcript-loading"><LoaderCircle className="spin" /> Loading session history…</div>}
       {!loading && !thread.turns.length && <div className="empty-chat"><div><Sparkles size={26} /></div><h2>Ready at the forge</h2><p>Send the first task. It will keep running here even if you close this browser.</p></div>}
-      {thread.turns.map((turn) => <TurnView key={turn.id} turn={turn} liveToolOutput={liveToolOutput} />)}
-      {immediateItems.map((item, index) => <ItemView key={item.id || `live-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
-      {streamingText.map(([id, value]) => value && <div className="message agent live" key={id}><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex <span>working now</span></div><ReactMarkdown>{value}</ReactMarkdown><span className="typing-cursor" /></div></div>)}
-      {runningTurn && !streamingText.some(([, value]) => Boolean(value)) && <div className="thinking-line"><LoaderCircle className="spin" size={17} /><span>Codex is working</span><i /><i /><i /></div>}
+      {thread.turns.map((turn) => <TurnView key={turn.id} turn={turn} provider={thread.backend} liveToolOutput={liveToolOutput} />)}
+      {immediateItems.map((item, index) => <ItemView key={item.id || `live-${index}`} item={item} provider={thread.backend} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
+      {streamingText.map(([id, value]) => value && <div className="message agent live" key={id}><div className="message-avatar" style={claude ? { color: "#cf75ff", background: "rgba(126, 54, 160, .13)", borderColor: "rgba(201, 105, 255, .3)" } : spark ? { color: "#f5c451", background: "rgba(153, 113, 20, .12)", borderColor: "rgba(245, 196, 81, .28)" } : undefined}><ThreadProviderIcon thread={thread} size={16} /></div><div className="message-body"><div className="message-meta">{providerName} <span>working now</span></div><ReactMarkdown>{value}</ReactMarkdown><span className="typing-cursor" /></div></div>)}
+      {runningTurn && !streamingText.some(([, value]) => Boolean(value)) && <div className="thinking-line"><LoaderCircle className="spin" size={17} /><span>{providerName} is working</span><i /><i /><i /></div>}
     </div>
 
     <div className="composer-zone">
@@ -1140,12 +1361,12 @@ const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liv
       {queue.length > 0 && <div className="queue-strip"><div><ListPlus size={14} /><strong>{queue.length} queued</strong><span>Runs automatically after the current turn</span></div><div>{queue.map((entry, index) => <div className="queue-entry" key={entry.id}><b>{index + 1}</b><span>{entry.text}</span><button onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={13} /></button></div>)}</div></div>}
       <form className="composer" onSubmit={submit}>
         <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} />
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? "Queue the next task while Codex works…" : "Give Codex a task…"}
+        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? `Queue the next task while ${providerName} works…` : `Give ${providerName} a task…`}
           rows={3} onKeyDown={(event) => { if (assist.onKeyDown(event)) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
         <div className="composer-footer">
           <div className="model-controls">
-            <label><Bot size={14} /><select value={settings.model} onChange={(event) => changeModel(event.target.value)}>{models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
-            <label><BrainCircuit size={14} /><select value={settings.effort} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{selectedModel.supportedReasoningEfforts.map((option) => <option key={option.reasoningEffort} value={option.reasoningEffort}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</option>)}</select></label>
+            <label>{claude ? <BrainCircuit size={14} /> : spark ? <Sparkles size={14} /> : <Bot size={14} />}<select value={settings.model} disabled={claude || spark} onChange={(event) => changeModel(event.target.value)}>{claude ? claudeModels.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>) : spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
+            <label><BrainCircuit size={14} /><select value={settings.effort} disabled={spark} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{effortOptions.map((effort) => <option key={effort} value={effort}>{EFFORT_LABELS[effort] || effort}</option>)}</select></label>
             <PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} />
           </div>
           <div className="composer-actions">{running && <button type="button" className="stop-button" onClick={() => void stopThread(thread.id, onRefresh, onError)}><CircleStop size={16} /> Stop</button>}
@@ -1162,9 +1383,16 @@ const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liv
   && previous.liveItems === next.liveItems
   && previous.queue === next.queue
   && previous.models === next.models
+  && previous.claudeModels === next.claudeModels
   && previous.settings === next.settings);
 
 function PolicyButton({ thread, running, onRefresh, onError, compact = false }: { thread: Thread; running: boolean; onRefresh: () => void | Promise<void>; onError: (error: unknown) => void; compact?: boolean }) {
+  if (isClaudeThread(thread)) {
+    const mode = thread.claudePermissionMode || "default";
+    const plan = mode === "plan";
+    const bypass = mode === "bypassPermissions";
+    return <button type="button" className={`policy-button ${bypass ? "yolo" : "workspace"} ${compact ? "compact" : ""}`} disabled title={plan ? "Claude plan mode: read and plan only" : bypass ? "Claude bypassPermissions mode" : "Claude workspace-write sandbox"} style={plan ? { color: "#9d85ff", borderColor: "rgba(157, 133, 255, .28)", background: "rgba(157, 133, 255, .07)" } : undefined}>{plan ? <FileText size={compact ? 11 : 13} /> : <ShieldCheck size={compact ? 11 : 13} />}<span>{plan ? "PLAN" : bypass ? "YOLO" : compact ? "SAFE" : "Workspace"}</span></button>;
+  }
   const yolo = thread.policy === "yolo";
   const toggle = async () => {
     if (running) return;
@@ -1208,26 +1436,27 @@ function GoalBar({ thread, onRefresh, onError }: { thread: Thread; onRefresh: ()
   </div>;
 }
 
-const TurnView = memo(function TurnView({ turn, liveToolOutput = EMPTY_TEXT_STREAM }: { turn: Thread["turns"][number]; liveToolOutput?: Record<string, string> }) {
+const TurnView = memo(function TurnView({ turn, provider, liveToolOutput = EMPTY_TEXT_STREAM }: { turn: Thread["turns"][number]; provider?: Thread["backend"]; liveToolOutput?: Record<string, string> }) {
   return <div className={`turn ${turn.status}`}>
-    {turn.items.map((item, index) => <ItemView key={item.id || `${item.type}-${index}`} item={item} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
+    {turn.items.map((item, index) => <ItemView key={item.id || `${item.type}-${index}`} item={item} provider={provider} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
     {turn.status === "failed" && <div className="turn-error">{turn.error?.message || "This turn failed."}</div>}
   </div>;
-}, (previous, next) => previous.turn === next.turn && previous.turn.items.every((item) => !item.id || previous.liveToolOutput?.[item.id] === next.liveToolOutput?.[item.id]));
+}, (previous, next) => previous.turn === next.turn && previous.provider === next.provider && previous.turn.items.every((item) => !item.id || previous.liveToolOutput?.[item.id] === next.liveToolOutput?.[item.id]));
 
-const ItemView = memo(function ItemView({ item, liveOutput }: { item: ThreadItem; liveOutput?: string }) {
+const ItemView = memo(function ItemView({ item, provider = "codex", liveOutput }: { item: ThreadItem; provider?: Thread["backend"]; liveOutput?: string }) {
+  const providerName = provider === "claude" ? "Claude" : "Codex";
   if (item.type === "userMessage") {
     const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
     return <div className="message user"><div className="message-body"><div className="message-meta">You</div><p>{text}</p></div><div className="message-avatar">YOU</div></div>;
   }
-  if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar"><Bot size={16} /></div><div className="message-body"><div className="message-meta">Codex</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
+  if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar" style={provider === "claude" ? { color: "#cf75ff", background: "rgba(126, 54, 160, .13)", borderColor: "rgba(201, 105, 255, .3)" } : undefined}>{provider === "claude" ? <BrainCircuit size={16} /> : <Bot size={16} />}</div><div className="message-body"><div className="message-meta">{providerName}</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
   if (item.type === "reasoning") return <details className="reasoning-item"><summary><BrainCircuit size={15} />Reasoning <ChevronRight size={14} /></summary><div>{item.summary?.map((part, index) => <ReactMarkdown key={index}>{part}</ReactMarkdown>)}</div></details>;
   if (item.type === "commandExecution") return <details className="tool-item" {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
   if (item.type === "fileChange") return <details className="tool-item" open><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><DiffView changes={item.changes || []} /></details>;
-  if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || "Codex tool"}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
+  if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || `${providerName} tool`}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
   if (item.type === "plan") return <div className="plan-item"><LayoutGrid size={15} /><ReactMarkdown>{item.text || ""}</ReactMarkdown></div>;
   if (["contextCompaction", "enteredReviewMode", "exitedReviewMode"].includes(item.type)) return null;
-  return <details className="tool-item generic-tool"><summary><Sparkles size={15} /><span><strong>{toolLabel(item.type)}</strong><code>{item.id || "Codex activity"}</code></span><em className={String(item.status || "completed")}>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item, null, 2)}</pre></details>;
+  return <details className="tool-item generic-tool"><summary><Sparkles size={15} /><span><strong>{toolLabel(item.type)}</strong><code>{item.id || `${providerName} activity`}</code></span><em className={String(item.status || "completed")}>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item, null, 2)}</pre></details>;
 });
 
 function DiffView({ changes, compact = false }: { changes: Array<Record<string, unknown>>; compact?: boolean }) {
@@ -1334,19 +1563,38 @@ function Welcome({ onNew }: { onNew: () => void }) {
   return <div className="welcome"><div className="welcome-mark"><div className="brand-mark large"><span /><span /><span /></div></div><span className="eyebrow">LOCAL · PERSISTENT · YOUR ACCOUNT</span><h1>Your Codex fleet,<br /><em>one command deck.</em></h1><p>Launch independent coding sessions in any workspace. They keep moving when your browser doesn’t.</p><button className="primary-button" onClick={onNew}><Plus size={17} />Launch a session</button><div className="feature-row"><span><Server size={17} />Runs on this machine</span><span><ShieldCheck size={17} />Private by default</span><span><LayoutGrid size={17} />Unlimited workspaces</span></div></div>;
 }
 
-function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap: Bootstrap; onClose: () => void; onCreated: (thread: Thread, model: string, effort: string) => Promise<void>; onError: (error: unknown) => void }) {
+function NewSessionModal({ bootstrap, sessionClass = "standard", onClose, onCreated, onError }: { bootstrap: Bootstrap; sessionClass?: SessionClass; onClose: () => void; onCreated: (thread: Thread, model: string, effort: string, sessionClass: SessionClass) => Promise<void>; onError: (error: unknown) => void }) {
+  const spark = sessionClass === "spark";
   const defaultModel = bootstrap.models.data.find((model) => model.isDefault) || bootstrap.models.data[0];
+  const claudeModels = bootstrap.claudeModelOptions || [];
+  const claudeAvailable = bootstrap.claudeAvailable === true && claudeModels.length > 0;
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
   const [tags, setTags] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [model, setModel] = useState(defaultModel.model);
-  const [effort, setEffort] = useState(defaultModel.defaultReasoningEffort);
+  const [backend, setBackend] = useState<SessionBackend>("codex");
+  const [model, setModel] = useState(spark ? SPARK_MODEL : defaultModel?.model || "");
+  const [effort, setEffort] = useState(spark ? "high" : defaultModel?.defaultReasoningEffort || "medium");
   const [yolo, setYolo] = useState(false);
+  const [claudePermissionMode, setClaudePermissionMode] = useState<ClaudePermissionMode>("default");
   const [browser, setBrowser] = useState<{ path: string | null; parent: string | null; entries: Array<{ name: string; path: string }> } | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const selectedModel = bootstrap.models.data.find((item) => item.model === model) || defaultModel;
+  const selectedCodexModel = bootstrap.models.data.find((item) => item.model === model) || defaultModel;
+  const selectedClaudeModel = claudeModels.find((item) => item.model === model) || claudeModels[0];
+  const effortOptions = spark ? ["high"] : backend === "claude" ? CLAUDE_EFFORTS : selectedCodexModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
+
+  const chooseBackend = (next: SessionBackend) => {
+    if (spark || next === backend || (next === "claude" && !claudeAvailable)) return;
+    setBackend(next);
+    if (next === "claude") {
+      setModel(claudeModels[0].model);
+      setEffort("high");
+      return;
+    }
+    setModel(defaultModel?.model || "");
+    setEffort(defaultModel?.defaultReasoningEffort || "medium");
+  };
 
   const browse = useCallback(async (target?: string) => {
     const query = target ? `?path=${encodeURIComponent(target)}` : "";
@@ -1361,15 +1609,26 @@ function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap
     try {
       const response = await api<{ thread: Thread }>("/api/threads", {
         method: "POST",
-        body: JSON.stringify({ cwd: selectedPath, model, effort, name, category, tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean), prompt, yolo })
+        body: JSON.stringify({
+          cwd: selectedPath,
+          model: spark ? SPARK_MODEL : model,
+          effort: spark ? "high" : effort,
+          name,
+          category,
+          tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean),
+          prompt,
+          backend: spark ? "codex" : backend,
+          class: sessionClass,
+          ...(backend === "claude" && !spark ? { permissionMode: claudePermissionMode } : { yolo })
+        })
       });
-      await onCreated(response.thread, model, effort);
+      await onCreated(response.thread, spark ? SPARK_MODEL : model, spark ? "high" : effort, sessionClass);
     } catch (error) { onError(error); } finally { setBusy(false); }
   };
 
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <form className="new-modal" onSubmit={submit}>
-      <div className="modal-header"><div><span className="eyebrow">NEW CODEX SESSION</span><h2>Choose your launch settings</h2></div><button type="button" className="icon-button" onClick={onClose}><X size={19} /></button></div>
+      <div className="modal-header"><div><span className="eyebrow" style={spark ? { color: "#f5c451" } : backend === "claude" ? { color: "#cf75ff" } : undefined}>{spark ? "NEW SPARK SESSION" : backend === "claude" ? "NEW CLAUDE SESSION" : "NEW CODEX SESSION"}</span><h2>{spark ? "Launch a quick task" : "Choose your launch settings"}</h2></div><button type="button" className="icon-button" onClick={onClose}><X size={19} /></button></div>
       <div className="new-grid">
         <section className="directory-picker">
           <div className="section-label"><FolderOpen size={15} />Workspace directory</div>
@@ -1384,12 +1643,20 @@ function NewSessionModal({ bootstrap, onClose, onCreated, onError }: { bootstrap
         <section className="launch-settings">
           <label className="field"><span>Session name <i>optional</i></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Uses the first task line automatically" maxLength={100} /></label>
           <div className="organization-fields"><label className="field"><span>Category <i>optional</i></span><input value={category} onChange={(event) => setCategory(event.target.value)} placeholder="e.g. Product" maxLength={50} /></label><label className="field"><span>Tags <i>comma-separated</i></span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="bug, release" /></label></div>
-          <label className="field"><span>Model</span><select value={model} onChange={(event) => { const next = bootstrap.models.data.find((item) => item.model === event.target.value)!; setModel(next.model); setEffort(next.defaultReasoningEffort); }}>{bootstrap.models.data.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><small>{selectedModel.description}</small></label>
-          <div className="field"><span>Thinking amount</span><div className="effort-grid">{selectedModel.supportedReasoningEfforts.map((option) => <button type="button" key={option.reasoningEffort} className={effort === option.reasoningEffort ? "selected" : ""} onClick={() => setEffort(option.reasoningEffort)}>{EFFORT_LABELS[option.reasoningEffort] || option.reasoningEffort}</button>)}</div></div>
+          {!spark && <div className="field"><span>Backend</span><div className="effort-grid"><button type="button" className={backend === "codex" ? "selected" : ""} onClick={() => chooseBackend("codex")}><Bot size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Codex</button><span title={!claudeAvailable ? "Claude Code CLI not installed or not authenticated" : undefined}><button type="button" aria-disabled={!claudeAvailable} className={backend === "claude" ? "selected" : ""} style={!claudeAvailable ? { opacity: .42, cursor: "not-allowed" } : backend === "claude" ? { color: "#cf75ff", borderColor: "rgba(201, 105, 255, .42)", background: "rgba(201, 105, 255, .09)" } : undefined} onClick={() => chooseBackend("claude")}><BrainCircuit size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Claude</button></span></div>{!claudeAvailable && <small>Claude Code CLI not installed or not authenticated</small>}</div>}
+          <label className="field"><span>Model</span><select value={model} disabled={spark} onChange={(event) => {
+            const nextModel = event.target.value;
+            setModel(nextModel);
+            if (backend === "codex") {
+              const next = bootstrap.models.data.find((item) => item.model === nextModel);
+              if (next) setEffort(next.defaultReasoningEffort);
+            }
+          }}>{spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : backend === "claude" ? claudeModels.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>) : bootstrap.models.data.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><small>{spark ? "Fast, lightweight Codex model locked for SparkBoard tasks." : backend === "claude" ? selectedClaudeModel?.description : selectedCodexModel?.description}</small></label>
+          <div className="field"><span>Thinking amount</span><div className="effort-grid">{effortOptions.map((option) => <button type="button" key={option} className={effort === option ? "selected" : ""} style={backend === "claude" && effort === option ? { color: "#cf75ff", borderColor: "rgba(201, 105, 255, .42)", background: "rgba(201, 105, 255, .09)" } : spark && effort === option ? { color: "#f5c451", borderColor: "rgba(245, 196, 81, .42)", background: "rgba(245, 196, 81, .09)" } : undefined} onClick={() => setEffort(option)}>{EFFORT_LABELS[option] || option}</button>)}</div></div>
           <label className="field prompt-field"><span>First task <i>optional</i></span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Start the session with a task, or leave it waiting…" rows={4} /></label>
         </section>
       </div>
-      <div className="modal-footer"><label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!selectedPath || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Launch session</button></div>
+      <div className="modal-footer">{backend === "claude" && !spark ? <div style={{ flex: 1, minWidth: 0 }}><span style={{ display: "block", marginBottom: 5, color: "#7a8490", fontSize: 8, textTransform: "uppercase", letterSpacing: .7 }}>Claude permissions</span><div className="effort-grid" style={{ flexWrap: "nowrap" }}><button type="button" className={claudePermissionMode === "default" ? "selected" : ""} onClick={() => setClaudePermissionMode("default")} title="Claude default permission mode"><ShieldCheck size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Workspace-write sandbox</button><button type="button" className={claudePermissionMode === "plan" ? "selected" : ""} style={claudePermissionMode === "plan" ? { color: "#9d85ff", borderColor: "rgba(157, 133, 255, .42)", background: "rgba(157, 133, 255, .09)" } : undefined} onClick={() => setClaudePermissionMode("plan")} title="Read and plan only; no edits"><FileText size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Plan mode</button><button type="button" className={claudePermissionMode === "bypassPermissions" ? "selected" : ""} onClick={() => setClaudePermissionMode("bypassPermissions")} title="No approvals; full system access"><Sparkles size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />YOLO mode</button></div></div> : <label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label>}<button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" style={spark ? { background: "#b88919", borderColor: "#d5ad3f" } : backend === "claude" ? { background: "#8746a6", borderColor: "#b16bd1" } : undefined} disabled={!selectedPath || !model || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : spark ? <Sparkles size={17} /> : backend === "claude" ? <BrainCircuit size={17} /> : <Sparkles size={17} />}Launch {spark ? "Spark session" : backend === "claude" ? "Claude session" : "session"}</button></div>
     </form>
   </div>;
 }
@@ -1443,7 +1710,36 @@ async function api<T = unknown>(url: string, options: ApiOptions = {}): Promise<
 
 function threadTitle(thread: Thread): string { return thread.name || thread.preview || "Untitled session"; }
 function sessionSearchText(thread: Thread): string {
-  return [threadTitle(thread), thread.preview, thread.cwd, thread.category, ...(thread.tags || [])].filter(Boolean).join(" ").toLocaleLowerCase();
+  return [threadTitle(thread), thread.preview, thread.cwd, thread.category, thread.backend, thread.sessionClass, ...(thread.tags || [])].filter(Boolean).join(" ").toLocaleLowerCase();
+}
+function isClaudeThread(thread: Thread): boolean { return thread.backend === "claude"; }
+function isSparkThread(thread: Thread): boolean { return thread.sessionClass === "spark"; }
+function providerLabel(thread: Thread): "Codex" | "Claude" { return isClaudeThread(thread) ? "Claude" : "Codex"; }
+function providerAccent(thread: Thread): string { return isClaudeThread(thread) ? "#cf75ff" : isSparkThread(thread) ? "#f5c451" : "#6e9dff"; }
+function ThreadProviderIcon({ thread, size }: { thread: Thread; size: number }) {
+  if (isClaudeThread(thread)) return <BrainCircuit size={size} color="#cf75ff" />;
+  if (isSparkThread(thread)) return <Sparkles size={size} color="#f5c451" />;
+  return <Bot size={size} color="#6e9dff" />;
+}
+function providerBadgeStyle(thread: Thread): React.CSSProperties {
+  const accent = providerAccent(thread);
+  return { flex: "0 0 auto", padding: "2px 4px", border: `1px solid ${accent}4d`, borderRadius: 4, color: accent, background: `${accent}12`, fontSize: 6.5, fontStyle: "normal", fontWeight: 700, letterSpacing: .45, textTransform: "uppercase" };
+}
+function providerIconContainerStyle(thread: Thread): React.CSSProperties | undefined {
+  if (!isClaudeThread(thread) && !isSparkThread(thread)) return undefined;
+  const accent = providerAccent(thread);
+  return { color: accent, background: `${accent}14`, borderColor: `${accent}38` };
+}
+function controlCardAccentStyle(thread: Thread, variant: BoardVariant): React.CSSProperties | undefined {
+  if (isClaudeThread(thread)) return { borderColor: "rgba(201, 105, 255, .38)", boxShadow: "inset 0 1px rgba(201, 105, 255, .05), 0 10px 32px rgba(75, 24, 99, .16)" };
+  if (variant === "spark" || isSparkThread(thread)) return { borderColor: "rgba(245, 196, 81, .36)", boxShadow: "inset 0 1px rgba(245, 196, 81, .05), 0 10px 32px rgba(105, 77, 12, .14)" };
+  return undefined;
+}
+function defaultSettingsForThread(thread: Thread, models: CodexModel[], claudeModels: ClaudeModelOption[], defaultModel?: CodexModel): { model: string; effort: string } {
+  if (isSparkThread(thread)) return { model: SPARK_MODEL, effort: "high" };
+  if (isClaudeThread(thread)) return { model: thread.claudeModel || claudeModels[0]?.model || "", effort: thread.claudeEffort || "high" };
+  const model = defaultModel || models[0];
+  return { model: model?.model || "", effort: model?.defaultReasoningEffort || "medium" };
 }
 function basename(value: string): string { return value.split("/").filter(Boolean).pop() || value; }
 function initials(value: string): string { return value.split(/[@.\s_-]/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "CD"; }
@@ -1607,17 +1903,11 @@ function timeAgo(timestamp: number): string {
   if (seconds < 604800) return `${Math.floor(seconds / 86400)}d`;
   return new Date(timestamp * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
-function relativeReset(timestamp: number): string {
-  const seconds = Math.max(0, timestamp - Date.now() / 1000);
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  return days ? `in ${days}d ${hours}h` : `in ${hours}h`;
-}
 function showError(error: unknown, setter: (value: string) => void) { setter(error instanceof Error ? error.message : String(error)); }
 function sameBootstrapSummary(current: Bootstrap | null, next: Bootstrap): boolean {
   if (!current) return false;
-  return JSON.stringify([current.models, current.account, current.usage, current.roots])
-    === JSON.stringify([next.models, next.account, next.usage, next.roots]);
+  return JSON.stringify([current.models, current.account, current.usage, current.backendStatus, current.roots, current.sparkAgentThreadIds, current.claudeAvailable, current.claudeModelOptions])
+    === JSON.stringify([next.models, next.account, next.usage, next.backendStatus, next.roots, next.sparkAgentThreadIds, next.claudeAvailable, next.claudeModelOptions]);
 }
 function samePendingRequests(current: PendingRequest[], next: PendingRequest[]): boolean {
   return current.length === next.length && current.every((request, index) => request.id === next[index].id
@@ -1675,6 +1965,11 @@ function sameThreadSnapshot(current: Thread | undefined | null, next: Thread): b
     || current.updatedAt !== next.updatedAt
     || current.recencyAt !== next.recencyAt
     || current.policy !== next.policy
+    || current.backend !== next.backend
+    || current.sessionClass !== next.sessionClass
+    || current.claudeModel !== next.claudeModel
+    || current.claudeEffort !== next.claudeEffort
+    || current.claudePermissionMode !== next.claudePermissionMode
     || current.category !== next.category
     || current.gitInfo?.branch !== next.gitInfo?.branch
     || !sameThreadStatus(current.status, next.status)
@@ -1684,6 +1979,7 @@ function sameThreadSnapshot(current: Thread | undefined | null, next: Thread): b
     || current.goal?.tokensUsed !== next.goal?.tokensUsed) return false;
   const currentTurn = current.turns.at(-1);
   const nextTurn = next.turns.at(-1);
+  if (next.backend === "claude" && currentTurn?.items.at(-1)?.text !== nextTurn?.items.at(-1)?.text) return false;
   return currentTurn?.id === nextTurn?.id
     && currentTurn?.status === nextTurn?.status
     && currentTurn?.startedAt === nextTurn?.startedAt

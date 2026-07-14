@@ -13,6 +13,11 @@ export type ForgeDeckConfig = {
   apiRateLimit: number;
   apiRateWindowMs: number;
   sessionTtlMs: number;
+  sparkTtlMs: number;
+  standardMaxConcurrent: number;
+  sparkMaxConcurrent: number;
+  claudeMaxConcurrent: number;
+  claudeBin: string;
   queueMaxMessages: number;
   modelCacheTtlMs: number;
   slowRequestMs: number;
@@ -42,7 +47,12 @@ export function loadConfig(projectRoot: string, env: NodeJS.ProcessEnv = process
     ].filter(Boolean).join(","))),
     apiRateLimit: integerSetting(env, "FORGEDECK_RATE_LIMIT", 300, 1, 100_000),
     apiRateWindowMs: integerSetting(env, "FORGEDECK_RATE_WINDOW_MS", 60_000, 1_000, 3_600_000),
-    sessionTtlMs: hoursSetting(env, "FORGEDECK_SESSION_TTL_HOURS", 24, 0, 24 * 365) * 3_600_000,
+    sessionTtlMs: hoursSetting(env, "FORGEDECK_SESSION_TTL_HOURS", 2, 0, 24 * 365) * 3_600_000,
+    sparkTtlMs: hoursSetting(env, "FORGEDECK_SPARK_TTL_HOURS", 1, 0, 24 * 365) * 3_600_000,
+    standardMaxConcurrent: integerSetting(env, "FORGEDECK_STANDARD_MAX_CONCURRENT", 6, 1, 50),
+    sparkMaxConcurrent: integerSetting(env, "FORGEDECK_SPARK_MAX_CONCURRENT", 16, 1, 50),
+    claudeMaxConcurrent: integerSetting(env, "FORGEDECK_CLAUDE_MAX_CONCURRENT", 4, 1, 50),
+    claudeBin: env.FORGEDECK_CLAUDE_BIN?.trim() || "claude",
     queueMaxMessages: integerSetting(env, "FORGEDECK_QUEUE_MAX_MESSAGES", 100, 1, 10_000),
     modelCacheTtlMs: integerSetting(env, "FORGEDECK_MODEL_CACHE_TTL_MS", 30_000, 0, 3_600_000),
     slowRequestMs: integerSetting(env, "FORGEDECK_SLOW_REQUEST_MS", 750, 0, 60_000),
