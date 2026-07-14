@@ -9,9 +9,14 @@ import { asObject, compactValue, summarizeThread, summarizeTurns, type JsonObjec
 type Actor = { actorId: string; token: string };
 type Bootstrap = {
   models?: { data?: JsonObject[] };
+  account?: JsonObject;
+  usage?: JsonObject | null;
   roots?: string[];
   activeThreadIds?: string[];
   queues?: Record<string, unknown[]>;
+  runtime?: JsonObject;
+  claudeAvailable?: boolean;
+  claudeModelOptions?: JsonObject[];
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -83,10 +88,25 @@ server.registerTool("forgedeck_list_options", {
       default_reasoning_effort: model.defaultReasoningEffort,
       supported_reasoning_efforts: model.supportedReasoningEfforts
     })),
-    defaults: { yolo: false },
+    claude_available: bootstrap.claudeAvailable === true,
+    claude_models: (bootstrap.claudeModelOptions || []).map((model) => ({
+      id: model.id,
+      model: model.model,
+      display_name: model.displayName,
+      description: model.description
+    })),
+    usage: usageSnapshot(bootstrap),
+    defaults: { yolo: false, class: "standard" },
     yolo_warning: "YOLO mode uses danger-full-access and never asks for command or file approvals."
   };
 }));
+
+server.registerTool("forgedeck_get_usage", {
+  title: "Get ForgeDeck backend usage",
+  description: "Report current Codex and Spark rate-limit usage plus Claude subscription availability so work can be routed to an available backend.",
+  inputSchema: z.object({}),
+  annotations: { readOnlyHint: true, openWorldHint: false }
+}, () => safely(async () => usageSnapshot(await api.get<Bootstrap>("/api/bootstrap"))));
 
 server.registerTool("forgedeck_list_directories", {
   title: "Browse ForgeDeck workspaces",
@@ -107,6 +127,7 @@ server.registerTool("forgedeck_spawn_session", {
     cwd: z.string().min(1).describe("Absolute working directory inside a configured ForgeDeck workspace root."),
     model: z.string().min(1).describe("Exact model value returned by forgedeck_list_options."),
     reasoning_effort: z.string().min(1).describe("Exact supported reasoning effort returned for the selected model."),
+    class: z.enum(["standard", "spark"]).default("standard").describe("Use spark for short GPT-5.3-Codex-Spark tasks; standard keeps the normal Control Center pool."),
     yolo: z.boolean().default(false).describe("Enable danger-full-access with no approvals for this session."),
     name: z.string().max(100).optional().describe("Optional Control Center session name."),
     category: z.string().max(50).optional().describe("Optional category used to organize the session."),
@@ -114,10 +135,10 @@ server.registerTool("forgedeck_spawn_session", {
     prompt: z.string().max(100_000).optional().describe("Optional first task. When omitted, the session is created idle.")
   }),
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
-}, ({ cwd, model, reasoning_effort, yolo, name, category, tags, prompt }) => safely(async () => {
+}, ({ cwd, model, reasoning_effort, class: sessionClass, yolo, name, category, tags, prompt }) => safely(async () => {
   const result = await api.request<JsonObject>("/api/threads", {
     method: "POST",
-    body: { cwd, model, effort: reasoning_effort, yolo, name, category, tags, prompt }
+    body: { cwd, model, effort: reasoning_effort, class: sessionClass, yolo, name, category, tags, prompt }
   });
   listSessionsCache.clear();
   const createdThread = asObject(result.thread);
@@ -127,7 +148,8 @@ server.registerTool("forgedeck_spawn_session", {
   return {
     session: summarizeThread(thread, new Set(), true),
     agent_owned: true,
-    visible_in_control_center: true,
+    visible_in_control_center: sessionClass === "standard",
+    visible_in_sparkboard: sessionClass === "spark",
     first_turn_started: Boolean(prompt)
   };
 }));
@@ -261,6 +283,52 @@ server.registerTool("forgedeck_remove_session", {
 }));
 
 await server.connect(new StdioServerTransport());
+}
+
+function usageSnapshot(bootstrap: Bootstrap): JsonObject {
+  const usage = asObject(bootstrap.usage);
+  const byLimitId = asObject(usage.rateLimitsByLimitId);
+  const defaultLimits = asObject(usage.rateLimits);
+  const codexLimits = Object.keys(asObject(byLimitId.codex)).length ? asObject(byLimitId.codex) : defaultLimits;
+  const sparkEntry = Object.entries(byLimitId).find(([key]) => key.toLowerCase().includes("spark"))?.[1];
+  const sparkLimits = asObject(sparkEntry);
+  const account = asObject(asObject(bootstrap.account).account);
+  const runtimeAvailable = asObject(bootstrap.runtime).available !== false;
+  const codexAvailable = runtimeAvailable && (bootstrap.models?.data?.length || 0) > 0;
+  const claudeAvailable = bootstrap.claudeAvailable === true;
+  return {
+    codex: {
+      available: codexAvailable,
+      rateLimit: publicRateLimit(codexLimits),
+      planType: stringValue(codexLimits.planType) || stringValue(account.planType)
+    },
+    spark: {
+      available: codexAvailable,
+      rateLimit: publicRateLimit(sparkLimits)
+    },
+    claude: {
+      available: claudeAvailable,
+      subscriptionActive: claudeAvailable,
+      modelOptions: (bootstrap.claudeModelOptions || []).map((model) => model.model).filter((model): model is string => typeof model === "string")
+    }
+  };
+}
+
+function publicRateLimit(snapshot: JsonObject): JsonObject | null {
+  const primary = asObject(snapshot.primary);
+  const usedPercent = Number(primary.usedPercent);
+  if (!Number.isFinite(usedPercent)) return null;
+  const resetsAt = Number(primary.resetsAt);
+  return {
+    usedPercent,
+    resetsAt: Number.isFinite(resetsAt) && resetsAt > 0
+      ? new Date(resetsAt < 10_000_000_000 ? resetsAt * 1_000 : resetsAt).toISOString()
+      : null
+  };
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value ? value : null;
 }
 
 class ForgeDeckApi {

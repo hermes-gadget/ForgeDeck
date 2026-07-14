@@ -60,3 +60,39 @@ test("invalid and excessive tags are rejected", () => {
   assert.throws(() => normalizeTags("bug"), /array/);
   assert.throws(() => normalizeTags(Array.from({ length: 11 }, (_, index) => `tag-${index}`)), /at most 10/);
 });
+
+test("session class and Claude metadata persist, enrich, and filter", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-sessions-"));
+  try {
+    const manager = new SessionManager(directory, () => 10_000);
+    manager.setMetadata("spark-thread", { sessionClass: "spark", backend: "codex", model: "gpt-5.3-codex-spark" });
+    manager.setMetadata("claude-thread", {
+      sessionClass: "standard",
+      backend: "claude",
+      cwd: "/workspace",
+      name: "Claude task",
+      model: "claude-sonnet-4-6",
+      effort: "high",
+      permissionMode: "plan",
+      maxTurns: 15
+    });
+
+    const restored = new SessionManager(directory, () => 20_000);
+    assert.deepEqual(restored.listAllSessions("spark").map((session) => session.id), ["spark-thread"]);
+    assert.equal(restored.enrich({ id: "spark-thread" }).sessionClass, "spark");
+    assert.deepEqual(restored.enrich({ id: "claude-thread" }), {
+      id: "claude-thread",
+      tags: [],
+      category: null,
+      sessionClass: "standard",
+      backend: "claude",
+      claudeModel: "claude-sonnet-4-6",
+      claudeEffort: "high",
+      claudePermissionMode: "plan",
+      claudeMaxTurns: 15
+    });
+    assert.equal(restored.enrich({ id: "untracked", model: "gpt-5.3-codex-spark" }).sessionClass, "spark");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

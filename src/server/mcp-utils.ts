@@ -18,6 +18,8 @@ export function summarizeThread(thread: JsonObject, activeIds: Set<string>, owne
     updated_at: thread.updatedAt || null,
     category: thread.category || null,
     tags: Array.isArray(thread.tags) ? thread.tags : [],
+    backend: thread.backend || "codex",
+    session_class: thread.sessionClass || "standard",
     state: running ? "running" : lastTurn?.status || "idle",
     agent_owned: owned,
     mutation_access: owned ? "allowed" : "view-only"
