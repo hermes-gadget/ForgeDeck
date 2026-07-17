@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { logger } from "./logger.js";
@@ -13,6 +12,10 @@ type Tracker = {
   cwd: string;
   offset: number;
   partial: string;
+  hydrating: boolean;
+  hydrationEndOffset: number;
+  dev: number;
+  ino: number;
   active: boolean;
   activeTurnId: string | null;
   missingWritablePolls: number;
@@ -31,7 +34,7 @@ export type ExternalCodexMonitorOptions = {
   livenessMs?: number;
   threadLimit?: number;
   maxReadBytes?: number;
-  maxOutputChars?: number;
+  maxOutputBytes?: number;
 };
 
 const INVENTORY_REFRESH_MS = 3_000;
@@ -43,7 +46,7 @@ const DEFAULT_OPTIONS: Required<ExternalCodexMonitorOptions> = {
   livenessMs: 2_500,
   threadLimit: 64,
   maxReadBytes: 512 * 1024,
-  maxOutputChars: 200_000
+  maxOutputBytes: 384 * 1024
 };
 
 export class ExternalCodexMonitor {
@@ -57,6 +60,7 @@ export class ExternalCodexMonitor {
   private lastInventorySignature = "";
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
+  private stopToken = 0;
   private state: "stopped" | "starting" | "ready" | "degraded" = "stopped";
   private lastPollAt: number | null = null;
   private lastSuccessAt: number | null = null;
@@ -69,7 +73,7 @@ export class ExternalCodexMonitor {
 
   constructor(
     private readonly emit: (notification: Notification, historical?: boolean) => void,
-    codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
+    codexHome: string,
     private readonly reconcileInventory?: (inventory: ExternalSessionInventory) => void,
     options: ExternalCodexMonitorOptions = {}
   ) {
@@ -80,13 +84,15 @@ export class ExternalCodexMonitor {
 
   start(): void {
     if (this.timer) return;
+    const token = ++this.stopToken;
     this.state = "starting";
-    void this.poll();
-    this.timer = setInterval(() => void this.poll(), this.options.pollMs);
+    void this.poll(token);
+    this.timer = setInterval(() => void this.poll(token), this.options.pollMs);
     this.timer.unref();
   }
 
   stop(): void {
+    this.stopToken += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.db?.close();
@@ -114,14 +120,18 @@ export class ExternalCodexMonitor {
 
   /** Re-emit authoritative external states after the app-server disconnects. */
   emitCurrentStatuses(): void {
-    for (const tracker of this.trackers.values()) this.emitStatus(tracker);
+    for (const tracker of this.trackers.values()) {
+      if (!tracker.hydrating) this.emitStatus(tracker);
+    }
   }
 
-  private async poll(): Promise<void> {
-    if (this.polling) return;
+  private async poll(token = this.stopToken): Promise<void> {
+    if (token !== this.stopToken || this.polling) return;
     this.polling = true;
+    if (token !== this.stopToken) { this.polling = false; return; }
     this.lastPollAt = Date.now();
     try {
+      if (token !== this.stopToken) return;
       const db = this.openDatabase();
       const now = Date.now();
       if (!this.lastLivenessAt || now - this.lastLivenessAt >= this.options.livenessMs) {
@@ -136,6 +146,7 @@ export class ExternalCodexMonitor {
       );
       const candidateIds = new Set(candidates.map((row) => row.id));
       for (const row of candidates) this.readThread(row, writableRollouts);
+      if (token !== this.stopToken) return;
       for (const [threadId, tracker] of this.trackers) {
         if (!this.rows.has(threadId)) {
           this.removeTracker(threadId, tracker, this.inventoryInitialized, true);
@@ -143,10 +154,12 @@ export class ExternalCodexMonitor {
         }
         if (!candidateIds.has(threadId) && !tracker.active && now - tracker.lastObservedAt > INACTIVE_TRACKER_TTL_MS) this.trackers.delete(threadId);
       }
+      if (token !== this.stopToken) return;
       this.state = "ready";
       this.lastSuccessAt = Date.now();
       this.lastError = null;
     } catch (error) {
+      if (token !== this.stopToken) return;
       this.state = "degraded";
       const message = error instanceof Error ? error.message : String(error);
       const changed = message !== this.lastError;
@@ -207,7 +220,6 @@ export class ExternalCodexMonitor {
     }
     const { canonicalPath, stat } = rollout;
     let tracker = this.trackers.get(row.id);
-    const initial = !tracker;
     if (!tracker) {
       tracker = {
         id: row.id,
@@ -215,6 +227,10 @@ export class ExternalCodexMonitor {
         cwd: row.cwd,
         offset: Math.max(0, stat.size - 1024 * 1024),
         partial: "",
+        hydrating: true,
+        hydrationEndOffset: stat.size,
+        dev: stat.dev,
+        ino: stat.ino,
         active: false,
         activeTurnId: null,
         missingWritablePolls: 0,
@@ -230,39 +246,70 @@ export class ExternalCodexMonitor {
       this.trackers.set(row.id, tracker);
     }
     tracker.lastObservedAt = Date.now();
-    if (stat.size < tracker.offset) {
-      tracker.offset = 0;
-      tracker.partial = "";
+    if (tracker.dev !== stat.dev || tracker.ino !== stat.ino || stat.size < tracker.offset) {
+      this.resetTrackerForHydration(tracker, stat);
     }
-    if (stat.size === tracker.offset) {
-      this.reconcileProcessState(tracker, writableRollouts, initial);
+    const readableEnd = tracker.hydrating ? Math.min(stat.size, tracker.hydrationEndOffset) : stat.size;
+    if (readableEnd <= tracker.offset) {
+      const hydrationCompleted = this.finishHydration(tracker);
+      if (!tracker.hydrating) this.reconcileProcessState(tracker, writableRollouts, hydrationCompleted);
       return;
     }
 
     const descriptor = fs.openSync(tracker.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    let length = 0;
+    let bytesRead = 0;
     let buffer: Buffer;
     try {
       const openedStat = fs.fstatSync(descriptor);
       if (!openedStat.isFile() || openedStat.dev !== stat.dev || openedStat.ino !== stat.ino) return;
-      length = Math.min(Math.max(0, openedStat.size - tracker.offset), this.options.maxReadBytes);
+      const openedReadableEnd = tracker.hydrating
+        ? Math.min(openedStat.size, tracker.hydrationEndOffset)
+        : openedStat.size;
+      const length = Math.min(Math.max(0, openedReadableEnd - tracker.offset), this.options.maxReadBytes);
       buffer = Buffer.alloc(length);
-      fs.readSync(descriptor, buffer, 0, length, tracker.offset);
+      bytesRead = fs.readSync(descriptor, buffer, 0, length, tracker.offset);
     } finally { fs.closeSync(descriptor); }
-    if (!length) return;
-    tracker.offset += length;
-    const chunks = `${tracker.partial}${buffer!.toString("utf8")}`.split("\n");
-    tracker.partial = truncateTail(chunks.pop() || "", this.options.maxOutputChars);
-    for (const line of chunks) this.processLine(tracker, line, !initial);
+    if (!bytesRead) return;
+    const emitNow = !tracker.hydrating;
+    tracker.offset += bytesRead;
+    const chunks = `${tracker.partial}${buffer!.subarray(0, bytesRead).toString("utf8")}`.split("\n");
+    tracker.partial = truncateTailBytes(chunks.pop() || "", this.options.maxReadBytes);
+    for (const line of chunks) this.processLine(tracker, line, emitNow);
 
-    this.reconcileProcessState(tracker, writableRollouts, initial);
+    const hydrationCompleted = this.finishHydration(tracker);
+    if (!tracker.hydrating) this.reconcileProcessState(tracker, writableRollouts, hydrationCompleted);
+  }
 
-    if (initial) {
-      this.emitStatus(tracker, true);
-      for (const item of tracker.recent.slice(-192)) {
-        this.emit({ method: item.status === "inProgress" ? "item/started" : "item/completed", params: { threadId: tracker.id, turnId: "external", item } }, true);
-      }
+  private resetTrackerForHydration(tracker: Tracker, stat: fs.Stats): void {
+    tracker.offset = Math.max(0, stat.size - 1024 * 1024);
+    tracker.partial = "";
+    tracker.hydrating = true;
+    tracker.hydrationEndOffset = stat.size;
+    tracker.dev = stat.dev;
+    tracker.ino = stat.ino;
+    tracker.active = false;
+    tracker.activeTurnId = null;
+    tracker.missingWritablePolls = 0;
+    tracker.calls.clear();
+    tracker.recent.length = 0;
+    const lifecycle = readLatestLifecycle(tracker.path, stat.size);
+    if (lifecycle) {
+      tracker.active = lifecycle.active;
+      tracker.activeTurnId = lifecycle.turnId;
     }
+  }
+
+  private finishHydration(tracker: Tracker): boolean {
+    if (!tracker.hydrating || tracker.offset < tracker.hydrationEndOffset) return false;
+    tracker.hydrating = false;
+    this.emitStatus(tracker, true);
+    for (const item of tracker.recent.slice(-192)) {
+      this.emit({
+        method: item.status === "inProgress" ? "item/started" : "item/completed",
+        params: { threadId: tracker.id, turnId: tracker.activeTurnId || "external", item }
+      }, true);
+    }
+    return true;
   }
 
   private resolveRolloutFile(candidate: string): { canonicalPath: string; stat: fs.Stats } | null {
@@ -323,14 +370,14 @@ export class ExternalCodexMonitor {
       const changes = Object.entries(rawChanges).map(([filePath, change]) => ({
         path: filePath,
         kind: { type: String(change.type || "update") },
-        diff: truncateTail(String(change.unified_diff || ""), this.options.maxOutputChars),
+        diff: String(change.unified_diff || ""),
         movePath: change.move_path == null ? null : String(change.move_path)
       }));
       const item: ToolItem = {
         type: "fileChange", id: String(payload.call_id || `patch-${record.timestamp || Date.now()}`),
         changes, status: payload.success === false ? "failed" : "completed"
       };
-      pushRecent(tracker, item);
+      pushRecent(tracker, item, this.options.maxOutputBytes);
       if (emitNow) this.emit({ method: "item/completed", params: { threadId: tracker.id, turnId: String(payload.turn_id || "external"), item } });
       return;
     }
@@ -343,9 +390,9 @@ export class ExternalCodexMonitor {
       if (role === "user" && isInjectedUserContext(text)) return;
       const id = String(payload.id || `${role}-${record.timestamp || tracker.recent.length}`);
       const item: ToolItem = role === "assistant"
-        ? { type: "agentMessage", id, text: truncateTail(text, this.options.maxOutputChars), phase: payload.phase == null ? null : String(payload.phase), memoryCitation: null }
+        ? { type: "agentMessage", id, text, phase: payload.phase == null ? null : String(payload.phase), memoryCitation: null }
         : { type: "userMessage", id, clientId: null, content: [{ type: "text", text, text_elements: [] }] };
-      pushRecent(tracker, item);
+      pushRecent(tracker, item, this.options.maxOutputBytes);
       if (emitNow) this.emit({ method: "item/completed", params: { threadId: tracker.id, turnId: "external", item } });
       return;
     }
@@ -365,7 +412,7 @@ export class ExternalCodexMonitor {
         arguments: parseArguments(payload.arguments ?? payload.input), status: "inProgress", contentItems: null, success: null, durationMs: null
       };
       tracker.calls.set(callId, item);
-      pushRecent(tracker, item);
+      pushRecent(tracker, item, this.options.maxOutputBytes);
       if (emitNow) this.emit({ method: "item/started", params: { threadId: tracker.id, turnId: "external", item } });
       return;
     }
@@ -374,12 +421,12 @@ export class ExternalCodexMonitor {
       const callId = String(payload.call_id || "");
       const existing = tracker.calls.get(callId);
       if (!existing) return;
-      const output = truncateTail(flattenOutput(payload.output), this.options.maxOutputChars);
+      const output = flattenOutput(payload.output);
       const completed: ToolItem = existing.type === "commandExecution"
         ? { ...existing, status: "completed", aggregatedOutput: output, exitCode: inferExitCode(output) }
         : { ...existing, status: "completed", contentItems: output ? [{ type: "inputText", text: output }] : [], success: true };
       tracker.calls.delete(callId);
-      pushRecent(tracker, completed);
+      pushRecent(tracker, completed, this.options.maxOutputBytes);
       if (emitNow) this.emit({ method: "item/completed", params: { threadId: tracker.id, turnId: "external", item: completed } });
     }
   }
@@ -423,8 +470,8 @@ export class ExternalCodexMonitor {
 // writable file descriptors through /proc, which gives us a definitive liveness
 // check without guessing based on how long a model or tool has been quiet.
 export function findWritableRolloutPaths(
-  procRoot = "/proc",
-  sessionsRoot = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sessions")
+  procRoot: string,
+  sessionsRoot: string
 ): Set<string> | null {
   let processEntries: fs.Dirent[];
   try {
@@ -495,11 +542,19 @@ export function readLatestLifecycle(rolloutPath: string, size = fs.statSync(roll
   return null;
 }
 
-function pushRecent(tracker: Tracker, item: ToolItem): void {
+function pushRecent(tracker: Tracker, item: ToolItem, maximumBytes: number): void {
   const index = tracker.recent.findIndex((candidate) => candidate.id === item.id);
   if (index >= 0) tracker.recent.splice(index, 1);
-  tracker.recent.push(item);
+  const retained = Buffer.byteLength(JSON.stringify(item)) <= maximumBytes
+    ? item
+    : { id: item.id, type: item.type, status: item.status, recoveryTruncated: true };
+  tracker.recent.push(retained);
+  while (tracker.recent.length > 1 && recentByteSize(tracker.recent) > maximumBytes) tracker.recent.shift();
   if (tracker.recent.length > 192) tracker.recent.splice(0, tracker.recent.length - 192);
+}
+
+function recentByteSize(items: readonly ToolItem[]): number {
+  return Buffer.byteLength(JSON.stringify(items));
 }
 
 function extractCommand(input: string): string {
@@ -534,9 +589,10 @@ function inferExitCode(output: string): number | null {
   return match ? Number(match[1]) : null;
 }
 
-function truncateTail(value: string, maximum: number): string {
-  if (value.length <= maximum) return value;
-  return `…[earlier output truncated]\n${value.slice(-(maximum - 28))}`;
+function truncateTailBytes(value: string, maximum: number): string {
+  const buffer = Buffer.from(value);
+  if (buffer.byteLength <= maximum) return value;
+  return buffer.subarray(buffer.byteLength - maximum).toString("utf8").replace(/^\uFFFD+/, "");
 }
 
 function canonicalPath(value: string): string {

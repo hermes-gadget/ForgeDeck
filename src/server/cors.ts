@@ -1,30 +1,33 @@
 import type { RequestHandler } from "express";
 
-/** Allows same-host browser requests plus an explicit set of credentialed origins. */
-export function createCorsMiddleware(allowedOrigins: ReadonlySet<string>): RequestHandler {
+export type OriginPolicy = {
+  publicOrigin: string;
+  allowedOrigins?: ReadonlySet<string>;
+};
+
+/** Enforces an exact canonical browser origin, with explicit cross-origin exceptions. */
+export function createCorsMiddleware(policy: OriginPolicy): RequestHandler {
+  const allowedOrigins = new Set([policy.publicOrigin, ...(policy.allowedOrigins || [])]);
   return (req, res, next): void => {
-    const origin = req.headers.origin;
-    if (!origin) {
+    const originHeader = req.headers.origin;
+    if (!originHeader) {
       next();
       return;
     }
-    let parsed: URL;
-    try {
-      parsed = new URL(origin);
-    } catch {
+    const origin = requestOrigin(originHeader);
+    if (!origin) {
       res.status(403).json({ error: "Invalid request origin", code: "INVALID_ORIGIN" });
       return;
     }
-    const sameHost = Boolean(req.headers.host) && parsed.host === req.headers.host && ["http:", "https:"].includes(parsed.protocol);
-    if (!sameHost && !allowedOrigins.has(parsed.origin)) {
+    if (!allowedOrigins.has(origin)) {
       res.status(403).json({ error: "Cross-origin request rejected", code: "ORIGIN_REJECTED" });
       return;
     }
     res.vary("Origin");
     res.set({
-      "Access-Control-Allow-Origin": parsed.origin,
+      "Access-Control-Allow-Origin": origin,
       "Access-Control-Allow-Credentials": "true",
-      "Access-Control-Allow-Methods": "GET,HEAD,POST,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Authorization,Content-Type,X-Request-Id",
       "Access-Control-Max-Age": "600"
     });
@@ -34,4 +37,12 @@ export function createCorsMiddleware(allowedOrigins: ReadonlySet<string>): Reque
     }
     next();
   };
+}
+
+function requestOrigin(value: string): string | null {
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { return null; }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.origin === "null" || parsed.username || parsed.password) return null;
+  if (parsed.pathname !== "/" || parsed.search || parsed.hash || value !== parsed.origin) return null;
+  return parsed.origin;
 }

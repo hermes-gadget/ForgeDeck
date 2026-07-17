@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { NextFunction, Request, Response } from "express";
 import { createRateLimiter } from "./rate-limit.js";
+import type { NextFunction, Request, Response } from "express";
 
 test("rate limiter allows requests up to the limit and returns JSON after it", () => {
   const middleware = createRateLimiter({ windowMs: 60_000, max: 2, key: () => "client" });

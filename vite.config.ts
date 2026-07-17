@@ -9,6 +9,9 @@ export default defineConfig({
   ],
   build: {
     outDir: "dist",
+    // The production CSP permits self-hosted fonts but intentionally rejects
+    // data: fonts. Keep even small font subsets as emitted assets.
+    assetsInlineLimit: 0,
     sourcemap: process.env.FORGEDECK_SOURCEMAP === "true"
   },
   server: {

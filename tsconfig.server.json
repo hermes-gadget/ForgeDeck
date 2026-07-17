@@ -3,16 +3,22 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": "src/server",
-    "outDir": "build/server",
+    "rootDir": "src",
+    "outDir": "build",
     "strict": true,
+    "strictNullChecks": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "declaration": false,
-    "sourceMap": true
+    "sourceMap": false,
+    "inlineSourceMap": false,
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/server/**/*.ts"]
+  "include": ["src/server/**/*.ts", "src/shared/**/*.ts"],
+  "exclude": ["src/server/**/*.test.ts"]
 }

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import readline, { type Interface as ReadlineInterface } from "node:readline";
 import WebSocket, { type RawData } from "ws";
 import { logger, redactSensitive } from "./logger.js";
+import type { OperationScheduler } from "./operation-pool.js";
 
 export type RpcId = string | number;
 
@@ -68,6 +69,8 @@ export interface BridgeStatus {
   lastConnectedAt: number | null;
   lastHeartbeatAt: number | null;
   lastError: string | null;
+  retrying: boolean;
+  nextRetryAt: number | null;
   metrics: BridgeMetrics;
 }
 
@@ -83,7 +86,14 @@ export interface BridgeReadyEvent {
   recoveredSessions: number;
 }
 
+export interface CodexRuntimeOptions {
+  bin: string;
+  appServerUrl?: string;
+  environment: Readonly<NodeJS.ProcessEnv>;
+}
+
 export interface CodexBridgeOptions {
+  runtime?: CodexRuntimeOptions;
   requestRetries?: number;
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
@@ -102,6 +112,12 @@ export interface CodexBridgeOptions {
   maxOutboundBufferBytes?: number;
   shutdownGraceMs?: number;
   isRetryableMethod?: (method: string) => boolean;
+  backgroundScheduler?: OperationScheduler;
+}
+
+export interface CodexRequestOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface CodexBridgeEventMap {
@@ -149,11 +165,12 @@ type PendingCall = {
   timer: NodeJS.Timeout;
   generation: number;
   dispatched: boolean;
+  removeAbortListener?: () => void;
 };
 
 type TrackedServerRequest = ServerRequest & { expiresAt: number };
 type RunningSession = BridgeSession & { state: "running"; probeFailures: number; disconnectedAt: number | null };
-type OutboundMessage = { payload: string; id?: RpcId; bytes: number };
+type OutboundMessage = { payload: string; pendingCallId?: RpcId; generation: number; bytes: number };
 type BufferedNotification = { notification: CodexNotification; bytes: number };
 
 type ChildTransport = {
@@ -171,6 +188,7 @@ type SocketTransport = {
   socket: WebSocket;
   closed: boolean;
   awaitingPongSince: number | null;
+  heartbeatTimeout: NodeJS.Timeout | null;
   connectReject: ((error: Error) => void) | null;
 };
 
@@ -190,7 +208,7 @@ const OUTPUT_DELTA_METHODS = new Set([
   "command/exec/outputDelta"
 ]);
 
-const DEFAULT_OPTIONS: Required<Omit<CodexBridgeOptions, "isRetryableMethod">> = {
+const DEFAULT_OPTIONS: Required<Omit<CodexBridgeOptions, "isRetryableMethod" | "backgroundScheduler" | "runtime">> = {
   requestRetries: 2,
   retryBaseDelayMs: 200,
   retryMaxDelayMs: 2_000,
@@ -227,7 +245,9 @@ const SAFE_RETRY_METHODS = [
  * idempotent operations after they may have reached Codex.
  */
 export class CodexBridge extends EventEmitter {
-  private readonly options: Required<Omit<CodexBridgeOptions, "isRetryableMethod">> & Pick<CodexBridgeOptions, "isRetryableMethod">;
+  private readonly options: Required<Omit<CodexBridgeOptions, "isRetryableMethod" | "backgroundScheduler" | "runtime">> & Pick<CodexBridgeOptions, "isRetryableMethod">;
+  private readonly backgroundScheduler: OperationScheduler | undefined;
+  private readonly runtime: CodexRuntimeOptions;
   private readonly startedAt = Date.now();
   private transport: Transport | null = null;
   private connectionState: BridgeConnectionState = "offline";
@@ -248,6 +268,7 @@ export class CodexBridge extends EventEmitter {
   private outboundFlushTimer: NodeJS.Timeout | null = null;
   private startPromise: Promise<void> | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private nextReconnectAt: number | null = null;
   private reconnectAttempt = 0;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private heartbeatInFlight = false;
@@ -267,13 +288,29 @@ export class CodexBridge extends EventEmitter {
 
   constructor(options: CodexBridgeOptions = {}) {
     super();
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    const { backgroundScheduler, runtime, ...bridgeOptions } = options;
+    this.options = { ...DEFAULT_OPTIONS, ...bridgeOptions };
+    this.backgroundScheduler = backgroundScheduler;
+    this.runtime = Object.freeze({
+      bin: runtime?.bin || "codex",
+      appServerUrl: runtime?.appServerUrl,
+      environment: Object.freeze({ ...(runtime?.environment || {}) })
+    });
   }
 
   async start(): Promise<void> {
     if (this.stopping) throw new CodexBridgeError("Codex bridge has been stopped", "STOPPED", false, false);
     if (this.startPromise) return this.startPromise;
     if (this.connectionState === "ready" && this.transport) return;
+
+    if (this.reconnectTimer && this.nextReconnectAt && this.nextReconnectAt > Date.now()) {
+      throw new CodexUnavailableError(
+        `Codex app-server restart is cooling down for ${this.nextReconnectAt - Date.now()}ms`,
+        "RECONNECT_BACKOFF",
+        true,
+        false
+      );
+    }
 
     this.clearReconnectTimer();
     this.connectionState = "connecting";
@@ -287,9 +324,17 @@ export class CodexBridge extends EventEmitter {
     }
   }
 
-  async request<T = unknown>(method: string, params?: unknown, timeoutMs = 30_000): Promise<T> {
+  async request<T = unknown>(
+    method: string,
+    params?: unknown,
+    timeoutOrOptions: number | CodexRequestOptions = 30_000
+  ): Promise<T> {
     if (!method.trim()) throw new TypeError("Codex RPC method is required");
+    const { timeoutMs, signal } = typeof timeoutOrOptions === "number"
+      ? { timeoutMs: timeoutOrOptions, signal: undefined }
+      : { timeoutMs: timeoutOrOptions.timeoutMs ?? 30_000, signal: timeoutOrOptions.signal };
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("Codex request timeout must be positive");
+    if (signal?.aborted) throw abortedRequestError(method);
 
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
@@ -301,13 +346,21 @@ export class CodexBridge extends EventEmitter {
       while (true) {
         try {
           try {
-            await this.start();
+            await waitForDeadline(
+              this.ensureReady(deadline, signal, method),
+              deadline,
+              signal,
+              `Codex request timed out before dispatch: ${method}`
+            );
           } catch (cause) {
             const connectionError = this.normalizeRequestError(cause);
-            throw new CodexUnavailableError(connectionError.message, connectionError.code, connectionError.transient, false);
+            throw connectionError;
           }
-          const remainingMs = Math.max(1, deadline - Date.now());
-          const result = await this.callRaw(method, params, remainingMs);
+          const remainingMs = deadline - Date.now();
+          if (remainingMs <= 0) {
+            throw new CodexBridgeError(`Codex request timed out before dispatch: ${method}`, "TIMEOUT", true, false);
+          }
+          const result = await this.callRaw(method, params, remainingMs, signal);
           this.successfulRequests += 1;
           return result as T;
         } catch (cause) {
@@ -326,7 +379,7 @@ export class CodexBridge extends EventEmitter {
             if (error.code === "TIMEOUT") this.timedOutRequests += 1;
             throw error;
           }
-          await delay(delayMs);
+          await delay(delayMs, signal, method);
         }
       }
     } finally {
@@ -339,6 +392,21 @@ export class CodexBridge extends EventEmitter {
   listServerRequests(): ServerRequest[] {
     this.expireServerRequests();
     return [...this.serverRequests.values()].map(({ expiresAt: _expiresAt, ...request }) => request);
+  }
+
+  private async ensureReady(deadline: number, signal: AbortSignal | undefined, method: string): Promise<void> {
+    const retryAt = this.reconnectTimer ? this.nextReconnectAt : null;
+    if (retryAt && retryAt > Date.now()) {
+      const waitMs = retryAt - Date.now();
+      if (Date.now() + waitMs >= deadline) {
+        throw new CodexBridgeError(`Codex request timed out before dispatch: ${method}`, "TIMEOUT", true, false);
+      }
+      await delay(waitMs, signal, method);
+    }
+    if (Date.now() >= deadline) {
+      throw new CodexBridgeError(`Codex request timed out before dispatch: ${method}`, "TIMEOUT", true, false);
+    }
+    await this.start();
   }
 
   listSessions(): BridgeSession[] {
@@ -374,6 +442,8 @@ export class CodexBridge extends EventEmitter {
       lastConnectedAt: this.lastConnectedAt,
       lastHeartbeatAt: this.lastHeartbeatAt,
       lastError: this.lastError,
+      retrying: this.reconnectTimer !== null,
+      nextRetryAt: this.nextReconnectAt,
       metrics: this.getMetrics()
     };
   }
@@ -426,8 +496,8 @@ export class CodexBridge extends EventEmitter {
   }
 
   private async launch(): Promise<void> {
-    const codexBin = process.env.CODEX_BIN || "codex";
-    const serverUrl = process.env.CODEX_APP_SERVER_URL?.trim();
+    const codexBin = this.runtime.bin;
+    const serverUrl = this.runtime.appServerUrl;
     let transport: Transport | null = null;
 
     try {
@@ -442,6 +512,7 @@ export class CodexBridge extends EventEmitter {
 
       this.connectionState = "ready";
       this.reconnectAttempt = 0;
+      this.nextReconnectAt = null;
       this.lastHeartbeatAt = Date.now();
       this.lastConnectedAt = this.lastHeartbeatAt;
       this.lastError = null;
@@ -455,7 +526,7 @@ export class CodexBridge extends EventEmitter {
       const error = this.normalizeConnectionError(cause, false);
       this.lastError = error.message;
       if (transport && this.transport === transport) this.handleTransportFailure(transport, error);
-      else if (!this.stopping) this.scheduleReconnect();
+      else if (!this.stopping && error.transient) this.scheduleReconnect();
       this.reportError(error);
       throw error;
     }
@@ -464,7 +535,7 @@ export class CodexBridge extends EventEmitter {
   private async spawnChild(codexBin: string): Promise<ChildTransport> {
     const generation = ++this.generation;
     const child = spawn(codexBin, ["app-server", "--stdio"], {
-      env: process.env,
+      env: { ...this.runtime.environment },
       stdio: ["pipe", "pipe", "pipe"]
     });
     const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -526,6 +597,7 @@ export class CodexBridge extends EventEmitter {
       socket,
       closed: false,
       awaitingPongSince: null,
+      heartbeatTimeout: null,
       connectReject: null
     };
     this.transport = transport;
@@ -555,6 +627,8 @@ export class CodexBridge extends EventEmitter {
     socket.on("pong", () => {
       if (this.transport !== transport) return;
       transport.awaitingPongSince = null;
+      if (transport.heartbeatTimeout) clearTimeout(transport.heartbeatTimeout);
+      transport.heartbeatTimeout = null;
       this.markHeartbeat();
     });
     socket.on("error", (error) => this.handleTransportFailure(transport, this.normalizeConnectionError(error, true)));
@@ -569,7 +643,7 @@ export class CodexBridge extends EventEmitter {
     return transport;
   }
 
-  private callRaw(method: string, params?: unknown, timeoutMs = 30_000): Promise<unknown> {
+  private callRaw(method: string, params?: unknown, timeoutMs = 30_000, signal?: AbortSignal): Promise<unknown> {
     const transport = this.transport;
     if (!transport || transport.closed) {
       return Promise.reject(new CodexBridgeError("Codex app-server is not available", "OFFLINE", true, false));
@@ -577,10 +651,13 @@ export class CodexBridge extends EventEmitter {
 
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
+      let abortHandler: (() => void) | undefined;
       const timer = setTimeout(() => {
         const call = this.pending.get(id);
         if (!call) return;
         this.pending.delete(id);
+        this.removeQueuedCall(id, call.generation);
+        call.removeAbortListener?.();
         reject(new CodexBridgeError(`Codex request timed out: ${method}`, "TIMEOUT", true, call.dispatched));
       }, timeoutMs);
       timer.unref();
@@ -591,27 +668,46 @@ export class CodexBridge extends EventEmitter {
         reject,
         timer,
         generation: transport.generation,
-        dispatched: false
+        dispatched: false,
+        removeAbortListener: signal ? () => signal.removeEventListener("abort", abortHandler!) : undefined
       };
       this.pending.set(id, call);
+      if (signal) {
+        abortHandler = () => {
+          const pending = this.pending.get(id);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          this.pending.delete(id);
+          this.removeQueuedCall(id, pending.generation);
+          pending.removeAbortListener?.();
+          reject(new CodexBridgeError(`Codex request aborted: ${method}`, "ABORTED", false, pending.dispatched));
+        };
+        signal.addEventListener("abort", abortHandler, { once: true });
+        if (signal.aborted) {
+          abortHandler();
+          return;
+        }
+      }
       const message: RpcMessage = { id, method };
       if (params !== undefined) message.params = params;
       try {
-        this.write(message);
+        this.write(message, id);
       } catch (cause) {
         clearTimeout(timer);
         this.pending.delete(id);
+        this.removeQueuedCall(id, transport.generation);
+        call.removeAbortListener?.();
         reject(this.normalizeConnectionError(cause, call.dispatched));
       }
     });
   }
 
-  private write(message: RpcMessage): void {
+  private write(message: RpcMessage, pendingCallId?: RpcId): void {
     const transport = this.transport;
     if (!transport || transport.closed) throw new CodexBridgeError("Codex app-server is not available", "OFFLINE", true, false);
     const payload = `${JSON.stringify(message)}${transport.kind === "child" ? "\n" : ""}`;
     const bytes = Buffer.byteLength(payload);
-    const outbound: OutboundMessage = { payload, id: message.id, bytes };
+    const outbound: OutboundMessage = { payload, pendingCallId, generation: transport.generation, bytes };
 
     if (this.outboundBlocked || this.outboundQueue.length) {
       this.enqueueOutbound(outbound);
@@ -630,7 +726,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   private sendOutbound(transport: Transport, message: OutboundMessage): void {
-    const pending = message.id === undefined ? undefined : this.pending.get(message.id);
+    const pending = message.pendingCallId === undefined ? undefined : this.pending.get(message.pendingCallId);
     if (pending) pending.dispatched = true;
 
     if (transport.kind === "socket") {
@@ -670,10 +766,14 @@ export class CodexBridge extends EventEmitter {
     while (!this.outboundBlocked && this.outboundQueue.length) {
       const next = this.outboundQueue.shift()!;
       this.outboundQueueBytes -= next.bytes;
+      if (next.pendingCallId !== undefined) {
+        const pending = this.pending.get(next.pendingCallId);
+        if (!pending || pending.generation !== next.generation) continue;
+      }
       try {
         this.sendOutbound(transport, next);
       } catch (cause) {
-        const pending = next.id === undefined ? undefined : this.pending.get(next.id);
+        const pending = next.pendingCallId === undefined ? undefined : this.pending.get(next.pendingCallId);
         if (pending) pending.dispatched = false;
         this.handleTransportFailure(transport, this.normalizeConnectionError(cause, false));
         return;
@@ -692,7 +792,6 @@ export class CodexBridge extends EventEmitter {
 
   private handlePayload(transport: Transport, payload: string): void {
     if (this.transport !== transport || transport.closed) return;
-    this.markHeartbeat();
     for (const line of payload.split(/\r?\n/)) {
       if (line.trim()) this.handleLine(line);
     }
@@ -706,12 +805,19 @@ export class CodexBridge extends EventEmitter {
       logger.warn("Ignoring malformed Codex protocol message");
       return;
     }
+    if (!message || typeof message !== "object"
+      || (typeof message.method !== "string" && !(message.id !== undefined && ("result" in message || "error" in message)))) {
+      logger.warn("Ignoring invalid Codex protocol message");
+      return;
+    }
+    this.markHeartbeat();
 
     if (message.id !== undefined && ("result" in message || "error" in message) && !message.method) {
       const call = this.pending.get(message.id);
       if (!call) return;
       clearTimeout(call.timer);
       this.pending.delete(message.id);
+      call.removeAbortListener?.();
       if (message.error) {
         call.reject(new CodexRpcError(
           message.error.message || "Codex request failed",
@@ -976,16 +1082,19 @@ export class CodexBridge extends EventEmitter {
     }
 
     if (transport.kind === "socket") {
-      if (transport.awaitingPongSince && Date.now() - transport.awaitingPongSince >= this.options.heartbeatTimeoutMs) {
-        this.handleTransportFailure(
-          transport,
-          new CodexBridgeError("Codex app-server heartbeat timed out", "HEARTBEAT_TIMEOUT", true, true)
-        );
-        return;
-      }
+      if (transport.awaitingPongSince) return;
       try {
         transport.awaitingPongSince = Date.now();
         transport.socket.ping();
+        transport.heartbeatTimeout = setTimeout(() => {
+          transport.heartbeatTimeout = null;
+          if (this.transport !== transport || transport.closed || transport.awaitingPongSince === null) return;
+          this.handleTransportFailure(
+            transport,
+            new CodexBridgeError("Codex app-server heartbeat timed out", "HEARTBEAT_TIMEOUT", true, true)
+          );
+        }, this.options.heartbeatTimeoutMs);
+        transport.heartbeatTimeout.unref();
       } catch (cause) {
         this.handleTransportFailure(transport, this.normalizeConnectionError(cause, true));
       }
@@ -1020,7 +1129,22 @@ export class CodexBridge extends EventEmitter {
     if (!session) return;
     this.sessionProbes.add(threadId);
     try {
-      const result = await this.callRaw("thread/read", { threadId, includeTurns: true }, this.options.heartbeatTimeoutMs) as ThreadReadResult;
+      const read = (timeoutMs: number, signal?: AbortSignal) => this.callRaw(
+        "thread/read",
+        { threadId, includeTurns: true },
+        timeoutMs,
+        signal
+      ) as Promise<ThreadReadResult>;
+      const result = this.backgroundScheduler
+        ? await this.backgroundScheduler.run(
+          (context) => read(Math.max(1, Math.min(this.options.heartbeatTimeoutMs, context.remainingMs())), context.signal),
+          {
+            priority: "background",
+            fairnessKey: "codex-session-probes",
+            deadline: Date.now() + this.options.heartbeatTimeoutMs
+          }
+        )
+        : await read(this.options.heartbeatTimeoutMs);
       const current = this.activeSessions.get(threadId);
       if (!current) return;
       const latestTurn = result.thread?.turns?.at(-1);
@@ -1109,6 +1233,8 @@ export class CodexBridge extends EventEmitter {
     connectReject?.(new CodexUnavailableError("Codex connection was closed before it became ready", "CONNECTION_CLOSED", true, false));
 
     if (transport.kind === "socket") {
+      if (transport.heartbeatTimeout) clearTimeout(transport.heartbeatTimeout);
+      transport.heartbeatTimeout = null;
       transport.socket.removeAllListeners();
       try {
         if (graceful && transport.socket.readyState === WebSocket.OPEN) transport.socket.close(1000, "ForgeDeck bridge stopped");
@@ -1166,11 +1292,22 @@ export class CodexBridge extends EventEmitter {
     this.outboundBlocked = false;
   }
 
+  private removeQueuedCall(id: RpcId, generation: number): void {
+    for (let index = this.outboundQueue.length - 1; index >= 0; index -= 1) {
+      const message = this.outboundQueue[index];
+      if (message.pendingCallId !== id || message.generation !== generation) continue;
+      this.outboundQueue.splice(index, 1);
+      this.outboundQueueBytes = Math.max(0, this.outboundQueueBytes - message.bytes);
+    }
+  }
+
   private rejectPendingForGeneration(generation: number, error: CodexBridgeError): void {
     for (const [id, call] of this.pending) {
       if (call.generation !== generation) continue;
       clearTimeout(call.timer);
       this.pending.delete(id);
+      this.removeQueuedCall(id, call.generation);
+      call.removeAbortListener?.();
       call.reject(new CodexBridgeError(error.message, error.code, error.transient, call.dispatched, error.data));
     }
   }
@@ -1178,6 +1315,7 @@ export class CodexBridge extends EventEmitter {
   private rejectPending(error: CodexBridgeError): void {
     for (const call of this.pending.values()) {
       clearTimeout(call.timer);
+      call.removeAbortListener?.();
       call.reject(error);
     }
     this.pending.clear();
@@ -1203,8 +1341,10 @@ export class CodexBridge extends EventEmitter {
     if (this.stopping || this.reconnectTimer) return;
     const delayMs = this.backoff(this.reconnectAttempt, this.options.reconnectBaseDelayMs, this.options.reconnectMaxDelayMs);
     this.reconnectAttempt += 1;
+    this.nextReconnectAt = Date.now() + delayMs;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      this.nextReconnectAt = null;
       if (this.stopping || this.connectionState === "ready") return;
       this.reconnectAttempts += 1;
       void this.start().catch(() => {
@@ -1217,6 +1357,7 @@ export class CodexBridge extends EventEmitter {
   private clearReconnectTimer(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.nextReconnectAt = null;
   }
 
   private shouldRetry(method: string, error: CodexBridgeError, attempt: number, deadline: number): boolean {
@@ -1294,9 +1435,60 @@ function errorWithCode(error: Error): Error & { code?: string | number } {
   return error as Error & { code?: string | number };
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
+function abortedRequestError(method: string): CodexBridgeError {
+  return new CodexBridgeError(`Codex request aborted: ${method}`, "ABORTED", false, false);
+}
+
+function waitForDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+  signal: AbortSignal | undefined,
+  timeoutMessage: string
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => reject(abortedRequestError("before dispatch")));
+    const remainingMs = deadline - Date.now();
+    const timer = setTimeout(() => finish(() => reject(
+      new CodexBridgeError(timeoutMessage, "TIMEOUT", true, false)
+    )), Math.max(0, remainingMs));
     timer.unref();
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+    }
+    operation.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error))
+    );
+  });
+}
+
+function delay(ms: number, signal?: AbortSignal, method = "request"): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(abortedRequestError(method));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref();
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
   });
 }

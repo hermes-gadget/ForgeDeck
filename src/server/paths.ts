@@ -1,36 +1,49 @@
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 const BLOCKED_SEGMENTS = new Set([
   ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
-  ".password-store", ".local/share/keyrings"
+  ".password-store", ".local/share/keyrings", ".config/gcloud", ".config/gh"
 ]);
+const BLOCKED_FILES = new Set([".netrc", ".npmrc", ".pypirc"]);
+const DEFAULT_SEARCH_OPTIONS: WorkspaceSearchLimits = {
+  maxEntries: 4_000,
+  maxDepth: 6,
+  resultLimit: 30,
+  allowHidden: false
+};
 
 export type DirectoryEntry = { name: string; path: string };
 export type FileSuggestion = { name: string; path: string; relativePath: string; type: "file" | "directory" };
+export type WorkspaceSearchLimits = {
+  maxEntries: number;
+  maxDepth: number;
+  resultLimit: number;
+  allowHidden: boolean;
+};
+export type FileSearchOptions = Partial<Pick<WorkspaceSearchLimits, "maxEntries" | "maxDepth">> & {
+  limit?: number;
+  signal?: AbortSignal;
+};
 
 export class WorkspacePaths {
-  readonly roots: string[];
+  readonly roots: readonly string[];
 
-  private constructor(roots: string[]) {
-    this.roots = roots;
+  private constructor(roots: readonly string[], private readonly searchOptions: Readonly<WorkspaceSearchLimits>) {
+    this.roots = Object.freeze([...roots]);
   }
 
-  static async create(): Promise<WorkspacePaths> {
-    const configured = process.env.FORGEDECK_ROOTS
-      ?.split(path.delimiter)
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const candidates = configured?.length ? configured : [os.homedir()];
+  static async create(
+    candidates: readonly string[],
+    options: WorkspaceSearchLimits = DEFAULT_SEARCH_OPTIONS
+  ): Promise<WorkspacePaths> {
     const roots = await Promise.all(candidates.map(async (candidate) => {
       const resolved = await fs.realpath(path.resolve(candidate));
       const stat = await fs.stat(resolved);
       if (!stat.isDirectory()) throw new Error(`Workspace root is not a directory: ${candidate}`);
       return resolved;
     }));
-    return new WorkspacePaths([...new Set(roots)]);
+    return new WorkspacePaths([...new Set(roots)], Object.freeze(normalizeSearchLimits(options)));
   }
 
   async validate(candidate: string): Promise<string> {
@@ -65,7 +78,7 @@ export class WorkspacePaths {
     const resolved = await this.validate(candidate);
     const entries = await fs.readdir(resolved, { withFileTypes: true });
     const visible = entries
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && !BLOCKED_SEGMENTS.has(entry.name))
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && !this.isSensitive(path.join(resolved, entry.name)))
       .map((entry) => ({ name: entry.name, path: path.join(resolved, entry.name) }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 
@@ -74,52 +87,133 @@ export class WorkspacePaths {
     return { path: resolved, parent, entries: visible };
   }
 
-  async searchFiles(cwd: string, query: string, limit = 30): Promise<FileSuggestion[]> {
+  async searchFiles(cwd: string, query: string, limitOrOptions: number | FileSearchOptions = {}): Promise<FileSuggestion[]> {
+    const requested = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
+    const limit = boundedInteger(requested.limit, this.searchOptions.resultLimit, 0, this.searchOptions.resultLimit);
+    if (limit === 0) return [];
+    const maxEntries = boundedInteger(requested.maxEntries, this.searchOptions.maxEntries, 1, this.searchOptions.maxEntries);
+    const maxDepth = boundedInteger(requested.maxDepth, this.searchOptions.maxDepth, 0, this.searchOptions.maxDepth);
+    throwIfAborted(requested.signal);
     const root = await this.validate(cwd);
-    const needle = query.trim().replace(/^\.\//, "").toLowerCase();
+    throwIfAborted(requested.signal);
+    const needle = query.trim().replace(/^\.\//, "").normalize("NFKC").toLocaleLowerCase("en-US");
     const results: FileSuggestion[] = [];
     const queue: Array<{ directory: string; depth: number }> = [{ directory: root, depth: 0 }];
     const visited = new Set<string>();
     let scanned = 0;
-    while (queue.length && results.length < limit && scanned < 4_000) {
-      const current = queue.shift()!;
+    for (let head = 0; head < queue.length && scanned < maxEntries; head += 1) {
+      throwIfAborted(requested.signal);
+      const current = queue[head];
+      if (!current) break;
       let directory: string;
       try {
         const pathStat = await fs.lstat(current.directory);
         if (pathStat.isSymbolicLink() || !pathStat.isDirectory()) continue;
         directory = await fs.realpath(current.directory);
-      } catch { continue; }
+      } catch {
+        throwIfAborted(requested.signal);
+        continue;
+      }
       if (visited.has(directory) || !isWithin(root, directory) || this.isSensitive(directory)) continue;
       visited.add(directory);
-      let entries: Dirent<string>[];
-      try { entries = await fs.readdir(directory, { withFileTypes: true, encoding: "utf8" }); } catch { continue; }
-      for (const entry of entries) {
-        scanned += 1;
-        if (entry.name === "node_modules" || entry.name === ".git" || BLOCKED_SEGMENTS.has(entry.name) || (entry.name.startsWith(".") && !needle.startsWith("."))) continue;
-        const absolute = path.join(directory, entry.name);
-        const relativePath = path.relative(root, absolute);
-        if (entry.isDirectory() && current.depth < 6) queue.push({ directory: absolute, depth: current.depth + 1 });
-        if (!entry.isFile() && !entry.isDirectory()) continue;
-        if (!needle || relativePath.toLowerCase().includes(needle) || entry.name.toLowerCase().includes(needle)) {
-          results.push({ name: entry.name, path: absolute, relativePath, type: entry.isDirectory() ? "directory" : "file" });
-          if (results.length >= limit) break;
+      try {
+        const entries = await fs.opendir(directory);
+        for await (const entry of entries) {
+          throwIfAborted(requested.signal);
+          if (scanned >= maxEntries) break;
+          scanned += 1;
+          const absolute = path.join(directory, entry.name);
+          if (isIgnoredEntry(entry.name, this.searchOptions.allowHidden) || this.isSensitive(absolute)) continue;
+          if (!entry.isFile() && !entry.isDirectory()) continue;
+          const relativePath = path.relative(root, absolute);
+          if (entry.isDirectory() && current.depth < maxDepth) queue.push({ directory: absolute, depth: current.depth + 1 });
+          const normalizedName = entry.name.normalize("NFKC").toLocaleLowerCase("en-US");
+          const normalizedRelative = relativePath.normalize("NFKC").toLocaleLowerCase("en-US");
+          if (!needle || normalizedRelative.includes(needle) || normalizedName.includes(needle)) {
+            insertTopResult(results, {
+              name: entry.name,
+              path: absolute,
+              relativePath,
+              type: entry.isDirectory() ? "directory" : "file"
+            }, needle, limit);
+          }
         }
+      } catch {
+        throwIfAborted(requested.signal);
       }
     }
-    return results.sort((a, b) => scoreFile(a, needle) - scoreFile(b, needle) || a.relativePath.localeCompare(b.relativePath));
+    return results;
   }
 
   private isSensitive(candidate: string): boolean {
     for (const root of this.roots) {
       if (!isWithin(root, candidate)) continue;
       const relative = path.relative(root, candidate);
-      const segments = relative.split(path.sep);
+      const segments = relative.split(path.sep).map(normalizeSensitiveSegment);
       return segments.some((segment, index) =>
-        BLOCKED_SEGMENTS.has(segment) || BLOCKED_SEGMENTS.has(segments.slice(index, index + 3).join("/"))
+        BLOCKED_SEGMENTS.has(segment)
+        || BLOCKED_FILES.has(segment)
+        || BLOCKED_SEGMENTS.has(segments.slice(index, index + 2).join("/"))
+        || BLOCKED_SEGMENTS.has(segments.slice(index, index + 3).join("/"))
       );
     }
     return true;
   }
+}
+
+function normalizeSensitiveSegment(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function normalizeSearchLimits(options: WorkspaceSearchLimits): WorkspaceSearchLimits {
+  return {
+    maxEntries: boundedInteger(options.maxEntries, DEFAULT_SEARCH_OPTIONS.maxEntries, 1, 100_000),
+    maxDepth: boundedInteger(options.maxDepth, DEFAULT_SEARCH_OPTIONS.maxDepth, 0, 32),
+    resultLimit: boundedInteger(options.resultLimit, DEFAULT_SEARCH_OPTIONS.resultLimit, 1, 200),
+    allowHidden: options.allowHidden === true
+  };
+}
+
+function boundedInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function isIgnoredEntry(
+  name: string,
+  allowHidden: boolean
+): boolean {
+  const normalized = normalizeSensitiveSegment(name);
+  return normalized === "node_modules"
+    || normalized === ".git"
+    || (!allowHidden && name.startsWith("."));
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new DOMException("Workspace search aborted", "AbortError");
+}
+
+function insertTopResult(results: FileSuggestion[], candidate: FileSuggestion, needle: string, limit: number): void {
+  let low = 0;
+  let high = results.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const current = results[middle];
+    if (!current || compareSuggestions(candidate, current, needle) < 0) high = middle;
+    else low = middle + 1;
+  }
+  if (low >= limit) return;
+  results.splice(low, 0, candidate);
+  if (results.length > limit) results.pop();
+}
+
+function compareSuggestions(a: FileSuggestion, b: FileSuggestion, needle: string): number {
+  return scoreFile(a, needle) - scoreFile(b, needle)
+    || a.relativePath.localeCompare(b.relativePath, undefined, { sensitivity: "base" })
+    || a.relativePath.localeCompare(b.relativePath);
 }
 
 export class PathError extends Error {
@@ -134,8 +228,8 @@ function isWithin(root: string, candidate: string): boolean {
 }
 
 function scoreFile(entry: FileSuggestion, needle: string): number {
-  const name = entry.name.toLowerCase();
-  const relative = entry.relativePath.toLowerCase();
+  const name = entry.name.normalize("NFKC").toLocaleLowerCase("en-US");
+  const relative = entry.relativePath.normalize("NFKC").toLocaleLowerCase("en-US");
   if (name === needle) return 0;
   if (name.startsWith(needle)) return 1;
   if (relative.startsWith(needle)) return 2;

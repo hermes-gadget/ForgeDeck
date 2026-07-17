@@ -1,2118 +1,1022 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
-  Archive, ArrowLeft, Bot, BrainCircuit, Check, ChevronRight, CircleStop,
-  Clock3, Code2, Command, Folder, FolderOpen, Gauge, GitBranch, KeyRound,
-  FileText, LayoutGrid, LoaderCircle, LogOut, Menu, MessageSquareText,
-  PanelLeftClose, Pin, PinOff, Plus, RefreshCw, Search, Send, Server,
-  Settings2, ShieldCheck, Sparkles, TerminalSquare, ListPlus, Target, Pause, Play,
-  Moon, Sun, Tags, Trash2, X
+  Archive, ArrowLeft, BookOpen, Command as CommandIcon, EllipsisVertical, FileDown, FileJson, FileText, Folder, GitBranch, History, KeyRound, LoaderCircle,
+  Menu, Monitor, Moon, Pin, PinOff, Plus, RefreshCw, Settings2, ShieldCheck, Sparkles, Sun, Tags, X
 } from "lucide-react";
-import type { Bootstrap, ClaudeModelOption, CodexModel, LiveThreadState, PendingRequest, QueueEntry, Thread, ThreadItem, Usage } from "./types";
+import { api, apiErrorFromPayload, clearConditionalApiCache } from "./api/client";
+import { ApprovalTray } from "./components/ApprovalTray";
+import { ArchiveHeader, ArchiveView } from "./components/archive/ArchiveView";
+import { Chat } from "./components/chat/Chat";
+import { CommandPalette } from "./components/command-palette/CommandPalette";
+import { BoardHeader, ControlCenter, FleetSummary, SparkBoard } from "./components/control-center/ControlCenter";
+import { ErrorCenter, useErrorCenter } from "./components/error-center/ErrorCenter";
+import { EvalHeader, EvalLab } from "./components/evals/EvalLab";
+import { ComparisonHeader, ComparisonLab } from "./components/comparisons/ComparisonLab";
+import { InsightsPanel } from "./components/insights/InsightsPanel";
+import { KnowledgePacksDialog } from "./components/knowledge-packs/KnowledgePacksDialog";
+import { MissionsHeader, MissionsView } from "./components/missions/MissionsView";
+import { NewSessionModal, type SessionClass } from "./components/new-session/NewSessionModal";
+import { PoliciesDialog } from "./components/policies/PoliciesDialog";
+import {
+  NotificationCenter, NotificationToasts, SessionNotificationPreferences, useNotificationCenter,
+  type DesktopNotificationPermission
+} from "./components/notifications/NotificationCenter";
+import { Brand, Sidebar, type BatchAction, type SidebarView } from "./components/sidebar/Sidebar";
+import {
+  SessionActionDialog, type SessionActionRequest, type SessionActionResult, type SessionActionTarget, type SessionOperation
+} from "./components/session-actions/SessionActionDialog";
+import { SessionReplay } from "./components/session-replay/SessionReplay";
+import { useEventStream, type BackendHealth, type LiveNotificationEvent, type TransportState } from "./hooks/use-event-stream";
+import { DEFAULT_THREAD_FILTERS, useThreadInventory, type SortDirection, type SortMode, type ThreadFilters } from "./hooks/use-thread-inventory";
+import { hasLaunchConfiguration, markOnboardingSeen, notificationPreferences, readStoredString, readStoredStringArray, readThreadSettings, writeStoredJson, writeStoredString } from "./state/preferences";
+import { mergeBackendStatus, reconcileBackendStatusResponse, type VersionedBackendStatusPatch } from "./state/backend-status";
+import { normalizeThreadSettings, resolveThreadSettings, settingsFromThread, threadStore, useThreadDetail } from "./state/thread-store";
+import type {
+  AccountStatus, AdmissionEvent, Bootstrap, LiveRecoverySnapshot, LiveThreadState, NotificationPreferences, PendingRequest, QueueEntry,
+  SessionSettings, StartupConfiguration, Thread
+} from "./types";
 
-type SortMode = "updated" | "created" | "name" | "directory" | "status";
-type ViewMode = "session" | "control" | "spark";
-type SessionClass = "standard" | "spark";
-type SessionBackend = "codex" | "claude";
-type BoardVariant = "control" | "spark";
-type ClaudePermissionMode = "default" | "plan" | "bypassPermissions";
-type ThreadSettings = Record<string, { model: string; effort: string }>;
-type LiveStreams = Record<string, Record<string, string>>;
-type LiveItems = Record<string, Record<string, ThreadItem>>;
-type ThemeMode = "dark" | "light";
-type ThreadTokenUsage = { totalTokens: number; inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; reasoningOutputTokens?: number };
-type AssistSuggestion = { id: string; label: string; description: string; insert: string; kind: "command" | "file" | "directory" };
+type ThemeMode = "system" | "dark" | "light";
+type ThreadSettings = Record<string, SessionSettings>;
 
-const LazyReactMarkdown = lazy(() => import("react-markdown"));
-
-/** Defers the markdown parser until conversation content actually needs it. */
-function ReactMarkdown({ children }: { children: string }) {
-  return <Suspense fallback={<span>{children}</span>}><LazyReactMarkdown>{children}</LazyReactMarkdown></Suspense>;
-}
-
-const SLASH_COMMANDS: AssistSuggestion[] = [
-  { id: "compact", label: "/compact", description: "Compact the session context", insert: "/compact", kind: "command" },
-  { id: "goal", label: "/goal", description: "Set or manage a persistent task goal", insert: "/goal ", kind: "command" },
-  { id: "stop", label: "/stop", description: "Stop the active turn", insert: "/stop", kind: "command" },
-  { id: "rename", label: "/rename", description: "Rename this session", insert: "/rename ", kind: "command" },
-  { id: "archive", label: "/archive", description: "Archive this session", insert: "/archive", kind: "command" },
-  { id: "mention", label: "/mention", description: "Autocomplete a workspace file", insert: "@", kind: "command" }
-];
-
-const EFFORT_LABELS: Record<string, string> = {
-  none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
-  xhigh: "Extra high", max: "Maximum", ultra: "Ultra"
-};
-const COMPLETED_CONTROL_TTL_MS = 15 * 60_000;
 const POLL_INTERVALS = [0, 2_000, 4_000, 10_000, 30_000] as const;
-const LIVE_UPDATE_INTERVAL_MS = 50;
-const CLIENT_LIVE_OUTPUT_MAX_CHARS = 200_000;
-const EMPTY_TEXT_STREAM: Record<string, string> = {};
-const EMPTY_LIVE_ITEMS: Record<string, ThreadItem> = {};
-const EMPTY_QUEUE: QueueEntry[] = [];
-const EMPTY_CLAUDE_MODELS: ClaudeModelOption[] = [];
-const SPARK_MODEL = "gpt-5.3-codex-spark";
-const CLAUDE_EFFORTS = ["low", "medium", "high", "max"] as const;
-const CLAUDE_LIVE_POLL_MS = 2_000;
+const EMPTY_ACCOUNT_STATUS: AccountStatus = {
+  account: { account: null, requiresOpenaiAuth: false },
+  usage: null,
+  activeThreadIds: [],
+  agentThreadIds: [],
+  sparkAgentThreadIds: [],
+  sparkActiveThreadIds: [],
+  claudeAvailable: false
+};
 
 export default function App() {
+  const mobileLayout = useMediaQuery("(max-width: 767px)");
+  const systemDarkTheme = useMediaQuery("(prefers-color-scheme: dark)");
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
-  const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
-  const [threads, setThreads] = useState<Thread[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<Thread | null>(null);
+  const [startup, setStartup] = useState<StartupConfiguration | null>(null);
+  const [accountStatus, setAccountStatus] = useState<AccountStatus | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(readLinkedSessionId);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>(readSortMode);
-  const [pollInterval, setPollInterval] = useState(() => readPollInterval());
-  const [theme, setTheme] = useState<ThemeMode>(() => readTheme());
+  const [sortDirection, setSortDirection] = useState<SortDirection>(readSortDirection);
+  const [filters, setFilters] = useState<ThreadFilters>(DEFAULT_THREAD_FILTERS);
+  const [pollInterval, setPollInterval] = useState(readPollInterval);
+  const [theme, setTheme] = useState<ThemeMode>(readTheme);
   const [pinned, setPinned] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-pins")));
   const [settings, setSettings] = useState<ThreadSettings>(readThreadSettings);
-  const [view, setView] = useState<ViewMode>(() => {
-    const stored = readStoredString("forgedeck-view");
-    return stored === "control" || stored === "spark" ? stored : "session";
-  });
+  const [view, setView] = useState<SidebarView>(readView);
   const [controlIds, setControlIds] = useState<string[]>(() => readStoredStringArray("forgedeck-control-ids"));
-  const [dismissedControlIds, setDismissedControlIds] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-control-dismissed")));
   const [sparkIds, setSparkIds] = useState<string[]>(() => readStoredStringArray("forgedeck-spark-ids"));
+  const [dismissedControlIds, setDismissedControlIds] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-control-dismissed")));
   const [dismissedSparkIds, setDismissedSparkIds] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-spark-dismissed")));
   const [newOpen, setNewOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [newSessionClass, setNewSessionClass] = useState<SessionClass>("standard");
+  const [newQuickStart, setNewQuickStart] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [pending, setPending] = useState<PendingRequest[]>([]);
-  const [liveText, setLiveText] = useState<LiveStreams>({});
-  const [liveToolOutput, setLiveToolOutput] = useState<LiveStreams>({});
-  const [liveItems, setLiveItems] = useState<LiveItems>({});
-  const [liveStatuses, setLiveStatuses] = useState<Record<string, Thread["status"]>>({});
-  const [activeThreadIds, setActiveThreadIds] = useState<Set<string>>(new Set());
-  const [queues, setQueues] = useState<Record<string, QueueEntry[]>>({});
-  const [completedSignals, setCompletedSignals] = useState<Set<string>>(() => new Set(readStoredStringArray("forgedeck-completed")));
-  const [completionTimes, setCompletionTimes] = useState<Record<string, number>>({});
-  const [tokenUsage, setTokenUsage] = useState<Record<string, ThreadTokenUsage>>(readStoredTokenUsage);
-  const [activityVersion, setActivityVersion] = useState(0);
-  const [runtime, setRuntime] = useState<"ready" | "offline" | "error">("ready");
   const [toast, setToast] = useState<string | null>(null);
+  const [sessionActionRequest, setSessionActionRequest] = useState<SessionActionRequest | null>(null);
+  const [insightsOpen, setInsightsOpen] = useState(false);
+  const [knowledgePacksOpen, setKnowledgePacksOpen] = useState(false);
+  const [policiesOpen, setPoliciesOpen] = useState(false);
+  const [replayThreadId, setReplayThreadId] = useState<string | null>(null);
+  const [visibleBoardIds, setVisibleBoardIds] = useState<string[]>([]);
+  const {
+    entries: errors,
+    open: errorsOpen,
+    setOpen: setErrorsOpen,
+    report: reportError,
+    reportAutomatic: reportAutomaticError,
+    dismiss: dismissError,
+    clear: clearErrors,
+    retry: retryError
+  } = useErrorCenter();
+  const notificationFocusRef = useRef<string | null>(null);
+  const focusNotificationSession = useCallback((threadId: string) => {
+    notificationFocusRef.current = threadId;
+    setSelectedId(threadId);
+    setView("session");
+    setSidebarOpen(false);
+    setSearch("");
+    setFilters({ ...DEFAULT_THREAD_FILTERS });
+    threadStore.markCompletionSeen(threadId);
+  }, []);
+  const notifications = useNotificationCenter(focusNotificationSession);
   const selectedRef = useRef(selectedId);
-  const searchRef = useRef(search);
-  const activeThreadIdsRef = useRef(activeThreadIds);
-  const dismissedControlIdsRef = useRef(dismissedControlIds);
-  const dismissedSparkIdsRef = useRef(dismissedSparkIds);
-  const activitySequence = useRef(0);
-  const threadActivitySequence = useRef<Record<string, number>>({});
-  const statusConfirmTimers = useRef<Record<string, number>>({});
-  const refreshTimer = useRef<number | null>(null);
-  const listTimer = useRef<number | null>(null);
-  const listRequestSequence = useRef(0);
-  const removedThreadIdsRef = useRef<Set<string>>(new Set());
-  const detailRequestSequence = useRef<Record<string, number>>({});
-  const controlSelectionInitialized = useRef(readStoredString("forgedeck-control-initialized") === "true" || readStoredString("forgedeck-control-ids") !== null);
-  const sparkSelectionInitialized = useRef(readStoredString("forgedeck-spark-ids") !== null);
+  const settingsRef = useRef(settings);
+  const currentThreadRef = useRef<Thread | null>(null);
+  const mobileMenuRef = useRef<HTMLButtonElement>(null);
+  const bootstrapController = useRef<AbortController | null>(null);
+  const statusController = useRef<AbortController | null>(null);
+  const statusRequest = useRef<Promise<void> | null>(null);
+  const backendStatusPatch = useRef<VersionedBackendStatusPatch>({ generation: 0, value: {} });
+  const settingsMetadataSignatures = useRef(new Map<string, string>());
+  const controlInitialized = useRef(readStoredString("forgedeck-control-ids") !== null);
+  const recoveryThreadIdsRef = useRef<string[]>([]);
+  const onboardingCheckedRef = useRef(false);
+  const bootstrap = useMemo<Bootstrap | null>(
+    () => startup ? { ...startup, ...(accountStatus || EMPTY_ACCOUNT_STATUS) } : null,
+    [accountStatus, startup]
+  );
 
-  useEffect(() => { selectedRef.current = selectedId; }, [selectedId]);
-  searchRef.current = search;
-  useEffect(() => { dismissedControlIdsRef.current = dismissedControlIds; }, [dismissedControlIds]);
-  useEffect(() => { dismissedSparkIdsRef.current = dismissedSparkIds; }, [dismissedSparkIds]);
-  useLayoutEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.style.colorScheme = theme;
-  }, [theme]);
+  const {
+    threads, filteredThreads, totalCount: inventoryTotal, facets, hasMore, loadingMore, fullyLoaded,
+    reload, loadMore, loadDetail, cancelDetail, remove
+  } = useThreadInventory({
+    enabled: authenticated === true,
+    search,
+    sortMode,
+    sortDirection,
+    filters,
+    pinned
+  });
+  const selectedSummary = useMemo(() => threads.find((thread) => thread.id === selectedId) || null, [selectedId, threads]);
+  const selectedDetail = useThreadDetail(selectedId || "");
+  const currentThread = selectedDetail || selectedSummary;
+  selectedRef.current = selectedId;
+  settingsRef.current = settings;
+  currentThreadRef.current = currentThread;
+
+  const handleError = reportError;
+  const handleBackgroundError = reportAutomaticError;
+  const handleSessionEnded = useCallback(() => {
+    bootstrapController.current?.abort();
+    statusController.current?.abort();
+    clearConditionalApiCache();
+    setAuthenticated(false);
+    setStartup(null);
+    setAccountStatus(null);
+  }, []);
+  const handleAdmission = useCallback((event: AdmissionEvent) => {
+    const alert = event.decision?.alerts.find((candidate) => candidate.severity === "hard")
+      || event.decision?.alerts[0];
+    if (alert) setToast(alert.message);
+  }, []);
+  const handleLiveNotification = useCallback((event: LiveNotificationEvent) => {
+    const preferences = notificationPreferences(settingsRef.current[event.threadId]);
+    if (event.kind === "completed" && !preferences.onCompletion) return;
+    if (event.kind === "failed" && !preferences.onFailure) return;
+    if (event.kind === "approval" && !preferences.onApprovalNeeded) return;
+    const thread = threadStore.getSummary(event.threadId);
+    const sessionName = thread ? threadTitle(thread) : event.threadId;
+    const details = notificationCopy(event);
+    notifications.push({
+      kind: event.kind,
+      threadId: event.threadId,
+      sessionName,
+      title: details.title,
+      message: details.message
+    }, event.kind !== "queued");
+  }, [notifications]);
 
   const loadBootstrap = useCallback(async () => {
-    const requestSequence = activitySequence.current;
-    const data = await api<Bootstrap>("/api/bootstrap");
-    setBootstrap((current) => sameBootstrapSummary(current, data) ? current : data);
-    setPending((current) => samePendingRequests(current, data.pendingRequests) ? current : data.pendingRequests);
-    setQueues((current) => sameQueues(current, data.queues || {}) ? current : data.queues || {});
-    const activeIds = new Set(data.activeThreadIds || []);
-    for (const [threadId, sequence] of Object.entries(threadActivitySequence.current)) {
-      if (sequence > requestSequence && activeThreadIdsRef.current.has(threadId)) activeIds.add(threadId);
-    }
-    activeThreadIdsRef.current = activeIds;
-    setActiveThreadIds((current) => sameSet(current, activeIds) ? current : activeIds);
-    if (data.agentThreadIds?.length) {
-      const sparkAgentIds = new Set(data.sparkAgentThreadIds || []);
-      setControlIds((current) => {
-        const missing = data.agentThreadIds!.filter((threadId) => !sparkAgentIds.has(threadId) && !dismissedControlIdsRef.current.has(threadId) && !current.includes(threadId));
-        return missing.length ? [...current, ...missing] : current;
-      });
-    }
-    if (data.sparkAgentThreadIds?.length) {
-      setSparkIds((current) => {
-        const missing = data.sparkAgentThreadIds!.filter((threadId) => !dismissedSparkIdsRef.current.has(threadId) && !current.includes(threadId));
-        return missing.length ? [...current, ...missing] : current;
-      });
-    }
-    setLiveStatuses((current) => {
-      const next = { ...current };
-      for (const [threadId, status] of Object.entries(next)) {
-        if (status.type === "active" && !activeIds.has(threadId)) delete next[threadId];
-      }
-      for (const [threadId, state] of Object.entries(data.liveState || {})) {
-        next[threadId] = state.active
-          ? { type: "active", activeFlags: [] }
-          : { type: "idle" };
-      }
-      for (const threadId of activeIds) next[threadId] = { type: "active", activeFlags: [] };
-      return sameRecord(current, next, sameThreadStatus) ? current : next;
-    });
-    if (data.liveState) {
-      setLiveItems((current) => mergeLiveState(current, data.liveState!, "items"));
-      setLiveText((current) => mergeLiveState(current, data.liveState!, "agentText"));
-      setLiveToolOutput((current) => mergeLiveState(current, data.liveState!, "toolOutput"));
-      const seen = readStoredNumberRecord("forgedeck-completion-seen");
-      setCompletedSignals((current) => {
-        const next = new Set(current);
-        for (const [threadId, state] of Object.entries(data.liveState!)) {
-          if (state.active || activeIds.has(threadId)) next.delete(threadId);
-          else if (state.completedAt && state.completedAt > (seen[threadId] || 0)) next.add(threadId);
-        }
-        return sameSet(current, next) ? current : next;
-      });
-      setCompletionTimes((current) => {
-        const next = { ...current };
-        for (const [threadId, state] of Object.entries(data.liveState!)) {
-          if (state.active || activeIds.has(threadId)) delete next[threadId];
-          else if (state.completedAt) next[threadId] = state.completedAt;
-        }
-        return sameNumberRecord(current, next) ? current : next;
-      });
-    }
-    return data;
-  }, []);
-
-  const loadThreads = useCallback(async () => {
-    const requestId = ++listRequestSequence.current;
-    const requestedSearch = searchRef.current.trim();
-    const collect = async (sessionClass: SessionClass) => {
-      const inventory: Thread[] = [];
-      let cursor: string | null = null;
-      do {
-        const query = new URLSearchParams({ limit: "200", sortKey: "updated_at", sortDirection: "desc" });
-        if (cursor) query.set("cursor", cursor);
-        query.set("class", sessionClass);
-        const response = await api<{ data: Thread[]; nextCursor: string | null }>(`/api/threads?${query}`);
-        inventory.push(...response.data);
-        cursor = response.nextCursor;
-      } while (cursor);
-      return inventory;
-    };
-    // Fetch both creation-time partitions explicitly so neither board depends
-    // on an unfiltered endpoint's default behavior.
-    const [standardInventory, sparkInventory] = await Promise.all([collect("standard"), collect("spark")]);
-    const byId = new Map<string, Thread>();
-    for (const thread of [...standardInventory, ...sparkInventory]) byId.set(thread.id, thread);
-    const collected = [...byId.values()];
-    if (requestId !== listRequestSequence.current || requestedSearch !== searchRef.current.trim()) return;
-    const eligible = collected.filter((thread) => !removedThreadIdsRef.current.has(thread.id));
-    const visible = requestedSearch
-      ? eligible.filter((thread) => sessionSearchText(thread).includes(requestedSearch.toLocaleLowerCase()))
-      : eligible;
-    setThreads((current) => reconcileThreads(current, visible));
-    setTokenUsage((current) => mergeThreadTokenUsage(current, visible));
-    setSelectedId((current) => current && visible.some((thread) => thread.id === current) ? current : visible[0]?.id || null);
-  }, []);
-
-  const loadThread = useCallback(async (id: string, quiet = false) => {
-    const requestId = (detailRequestSequence.current[id] || 0) + 1;
-    detailRequestSequence.current[id] = requestId;
-    if (!quiet) setLoadingDetail(true);
+    bootstrapController.current?.abort();
+    const controller = new AbortController();
+    bootstrapController.current = controller;
     try {
-      const response = await api<{ thread: Thread }>(`/api/threads/${encodeURIComponent(id)}`);
-      const usage = extractThreadTokenUsage(response.thread);
-      if (usage) setTokenUsage((current) => sameTokenUsage(current[id], usage) ? current : { ...current, [id]: usage });
-      if (detailRequestSequence.current[id] === requestId && selectedRef.current === id) {
-        setDetail((current) => current && sameThreadSnapshot(current, response.thread) ? current : response.thread);
-      }
+      const data = await api<StartupConfiguration>("/api/bootstrap", { conditional: true, signal: controller.signal });
+      if (controller.signal.aborted) return;
+      setStartup(data);
+      for (const error of data.errors || []) reportError(apiErrorFromPayload(error, { scope: "runtime" }));
     } finally {
-      if (detailRequestSequence.current[id] === requestId && selectedRef.current === id) setLoadingDetail(false);
+      if (bootstrapController.current === controller) bootstrapController.current = null;
     }
+  }, [reportError]);
+
+  const loadAccountStatus = useCallback((): Promise<void> => {
+    if (statusRequest.current) return statusRequest.current;
+    const patchGeneration = backendStatusPatch.current.generation;
+    const controller = new AbortController();
+    statusController.current = controller;
+    const request = api<AccountStatus>("/api/account/status", { conditional: true, signal: controller.signal })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        setAccountStatus(reconcileBackendStatusResponse(data, patchGeneration, backendStatusPatch.current));
+        for (const error of data.errors || []) reportError(apiErrorFromPayload(error, { scope: "runtime" }));
+      })
+      .finally(() => {
+        if (statusController.current === controller) statusController.current = null;
+        if (statusRequest.current === request) statusRequest.current = null;
+      });
+    statusRequest.current = request;
+    return request;
+  }, [reportError]);
+
+  const handleBackendStatus = useCallback((patch: Parameters<typeof mergeBackendStatus>[1]) => {
+    backendStatusPatch.current = {
+      generation: backendStatusPatch.current.generation + 1,
+      value: patch
+    };
+    setAccountStatus((current) => current ? mergeBackendStatus(current, patch) : current);
   }, []);
 
+  const readApprovals = useCallback(async (): Promise<PendingRequest[]> => {
+    const response = await api<{ data: PendingRequest[] }>("/api/approvals");
+    return response.data;
+  }, []);
+
+  const refreshThread = useCallback(async (threadId: string, quiet = false) => {
+    if (!quiet && selectedRef.current === threadId) setLoadingDetail(true);
+    try { return await loadDetail(threadId); }
+    finally { if (selectedRef.current === threadId) setLoadingDetail(false); }
+  }, [loadDetail]);
+
+  const removeThreadState = useCallback((threadId: string) => {
+    cancelDetail(threadId);
+    remove(threadId);
+    setControlIds((ids) => ids.filter((id) => id !== threadId));
+    setSparkIds((ids) => ids.filter((id) => id !== threadId));
+    setPinned((ids) => { const next = new Set(ids); next.delete(threadId); return next; });
+    setSettings((current) => { if (!current[threadId]) return current; const next = { ...current }; delete next[threadId]; return next; });
+    setSelectedId((current) => current === threadId ? null : current);
+  }, [cancelDetail, remove]);
+  const getSelectedThreadId = useCallback(() => selectedRef.current, []);
+  const readRecovery = useCallback((): Promise<LiveRecoverySnapshot> => {
+    return readThreadRecoverySnapshot(recoveryThreadIdsRef.current.slice(0, 256));
+  }, []);
+  const shouldReconcileThread = useCallback((threadId: string) => recoveryThreadIdsRef.current.includes(threadId), []);
+  const relevantLiveIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (view === "session" && selectedId) ids.add(selectedId);
+    if (view === "control" || view === "spark") for (const threadId of visibleBoardIds) ids.add(threadId);
+    return [...ids].sort();
+  }, [selectedId, view, visibleBoardIds]);
+  recoveryThreadIdsRef.current = relevantLiveIds;
+  const relevantLiveSignature = relevantLiveIds.join(",");
+
+  const {
+    backendHealth, transport, lastSyncedAt, nextReconnectAt, reconnect,
+    pending, replacePending, resolvePending
+  } = useEventStream({
+    enabled: authenticated === true,
+    subscribedThreadIds: relevantLiveIds,
+    fallbackPollInterval: pollInterval,
+    refreshStatus: loadAccountStatus,
+    readApprovals,
+    refreshInventory: reload,
+    refreshThread,
+    readRecovery,
+    selectedThreadId: getSelectedThreadId,
+    shouldReconcileThread,
+    onThreadRemoved: removeThreadState,
+    onSessionEnded: handleSessionEnded,
+    onAdmission: handleAdmission,
+    onBackendStatus: handleBackendStatus,
+    onNotification: handleLiveNotification,
+    onError: handleBackgroundError
+  });
+  const waitingThreadIds = useMemo(() => new Set(pending.flatMap((request) => {
+    const threadId = request.params && typeof request.params.threadId === "string" ? request.params.threadId : null;
+    return threadId ? [threadId] : [];
+  })), [pending]);
+
   useEffect(() => {
-    void api<{ authenticated: boolean }>("/api/auth", { allowUnauthenticated: true })
+    const controller = new AbortController();
+    void api<{ authenticated: boolean }>("/api/auth", { allowUnauthenticated: true, signal: controller.signal })
       .then(({ authenticated: value }) => setAuthenticated(value))
-      .catch(() => setAuthenticated(false));
+      .catch((error) => { if (error.name !== "AbortError") setAuthenticated(false); });
+    return () => controller.abort();
   }, []);
-
   useEffect(() => {
-    if (!authenticated) return;
-    void loadBootstrap().catch((error) => showError(error, setToast));
-  }, [authenticated, loadBootstrap]);
-
-  useEffect(() => {
-    if (!authenticated) return;
-    const timer = window.setTimeout(() => void loadThreads().catch((error) => showError(error, setToast)), search.trim() ? 250 : 0);
-    return () => clearTimeout(timer);
-  }, [search, authenticated, loadThreads]);
-
-  useEffect(() => {
-    if (!selectedId) { setDetail(null); return; }
-    setSidebarOpen(false);
-    void loadThread(selectedId).catch((error) => showError(error, setToast));
-  }, [selectedId, loadThread]);
-
-  // Poll only while the event stream is unavailable. Running the fallback beside
-  // healthy SSE needlessly replaces the same DOM data every few seconds.
-  useEffect(() => {
-    if (!authenticated || runtime === "ready" || pollInterval === 0) return;
-    const timer = window.setInterval(() => void loadThreads().catch(() => undefined), pollInterval);
-    return () => clearInterval(timer);
-  }, [authenticated, loadThreads, pollInterval, runtime]);
-
-  useEffect(() => {
-    if (!authenticated) return;
-    const threadIds = threads.filter((thread) => isClaudeThread(thread) && (thread.status.type === "active" || hasInProgressTurn(thread))).map((thread) => thread.id);
-    if (!threadIds.length) return;
-    const refresh = async () => {
-      const response = await api<{ results: Array<{ threadId: string; ok: boolean; value?: Thread }> }>("/api/threads/batch", {
-        method: "POST",
-        body: JSON.stringify({ operation: "read", threadIds })
-      });
-      const snapshots = new Map(response.results.filter((result) => result.ok && result.value).map((result) => [result.threadId, result.value!]));
-      const completedIds = [...snapshots.values()].filter((thread) => thread.status.type !== "active" && !hasInProgressTurn(thread)).map((thread) => thread.id);
-      setThreads((current) => {
-        let changed = false;
-        const next = current.map((thread) => {
-          const snapshot = snapshots.get(thread.id);
-          if (!snapshot || sameThreadSnapshot(thread, snapshot)) return thread;
-          changed = true;
-          return snapshot;
-        });
-        return changed ? next : current;
-      });
-      if (completedIds.length) {
-        const completedAt = Date.now();
-        setCompletedSignals((current) => {
-          const next = new Set(current);
-          for (const threadId of completedIds) next.add(threadId);
-          return sameSet(current, next) ? current : next;
-        });
-        setCompletionTimes((current) => {
-          const next = { ...current };
-          for (const threadId of completedIds) next[threadId] = completedAt;
-          return next;
-        });
-        const nextActiveIds = new Set(activeThreadIdsRef.current);
-        for (const threadId of completedIds) nextActiveIds.delete(threadId);
-        activeThreadIdsRef.current = nextActiveIds;
-        setActiveThreadIds(nextActiveIds);
-      }
-    };
-    const timer = window.setInterval(() => void refresh().catch(() => undefined), CLAUDE_LIVE_POLL_MS);
-    return () => clearInterval(timer);
-  }, [authenticated, threads]);
-
-  useEffect(() => {
-    if (!authenticated || view !== "session" || !selectedId) return;
-    const selectedIsClaude = threads.some((thread) => thread.id === selectedId && isClaudeThread(thread));
-    if (!selectedIsClaude && (runtime === "ready" || pollInterval === 0)) return;
-    const timer = window.setInterval(() => void loadThread(selectedId, true).catch(() => undefined), selectedIsClaude ? CLAUDE_LIVE_POLL_MS : pollInterval);
-    return () => clearInterval(timer);
-  }, [authenticated, view, selectedId, loadThread, pollInterval, runtime, threads]);
-
-  useEffect(() => {
-    if (!authenticated) return;
-    const events = new EventSource("/events");
-    let hasConnected = false;
-    let needsReconnectRefresh = false;
-    let serverRuntimeState: "ready" | "offline" | "error" = "ready";
-    let reconnectTimer: number | null = null;
-    let activityTimer: number | null = null;
-    let liveFlushTimer: number | null = null;
-    const liveCleanupTimers = new Set<number>();
-    let pendingTextDeltas: LiveStreams = {};
-    let pendingToolDeltas: LiveStreams = {};
-    let pendingTokenUsage: Record<string, ThreadTokenUsage> = {};
-
-    const scheduleListRefresh = (delay = 250) => {
-      if (listTimer.current) clearTimeout(listTimer.current);
-      listTimer.current = window.setTimeout(() => {
-        listTimer.current = null;
-        void loadThreads().catch(() => undefined);
-      }, delay);
-    };
-    const scheduleConnectionRefresh = () => {
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        void Promise.all([loadBootstrap(), loadThreads()]).catch(() => undefined);
-        if (selectedRef.current) void loadThread(selectedRef.current, true).catch(() => undefined);
-      }, 100);
-    };
-    const scheduleActivityRefresh = () => {
-      if (activityTimer) clearTimeout(activityTimer);
-      activityTimer = window.setTimeout(() => {
-        activityTimer = null;
-        setActivityVersion((value) => value + 1);
-      }, 250);
-    };
-    const flushLiveDeltas = () => {
-      liveFlushTimer = null;
-      const textDeltas = pendingTextDeltas;
-      const toolDeltas = pendingToolDeltas;
-      const usageUpdates = pendingTokenUsage;
-      pendingTextDeltas = {};
-      pendingToolDeltas = {};
-      pendingTokenUsage = {};
-      if (Object.keys(textDeltas).length) setLiveText((current) => appendLiveDeltas(current, textDeltas));
-      if (Object.keys(toolDeltas).length) setLiveToolOutput((current) => appendLiveDeltas(current, toolDeltas));
-      if (Object.keys(usageUpdates).length) setTokenUsage((current) => mergeTokenUsage(current, usageUpdates));
-    };
-    const scheduleLiveFlush = () => {
-      if (!liveFlushTimer) liveFlushTimer = window.setTimeout(flushLiveDeltas, LIVE_UPDATE_INTERVAL_MS);
-    };
-    const queueLiveDelta = (target: "text" | "tool", threadId: string, itemId: string, delta: string) => {
-      if (!delta) return;
-      const pending = target === "text" ? pendingTextDeltas : pendingToolDeltas;
-      pending[threadId] = { ...(pending[threadId] || {}), [itemId]: appendBoundedText(pending[threadId]?.[itemId] || "", delta) };
-      scheduleLiveFlush();
-    };
-    const markActive = (threadId: string) => {
-      activitySequence.current += 1;
-      threadActivitySequence.current[threadId] = activitySequence.current;
-      if (!activeThreadIdsRef.current.has(threadId)) {
-        const next = new Set(activeThreadIdsRef.current).add(threadId);
-        activeThreadIdsRef.current = next;
-        setActiveThreadIds(next);
-      }
-      setLiveStatuses((current) => current[threadId]?.type === "active"
-        ? current
-        : { ...current, [threadId]: { type: "active", activeFlags: [] } });
-      const timer = statusConfirmTimers.current[threadId];
-      if (timer) {
-        clearTimeout(timer);
-        delete statusConfirmTimers.current[threadId];
-      }
-    };
-    const reconcileTerminalStatus = (threadId: string) => {
-      activitySequence.current += 1;
-      threadActivitySequence.current[threadId] = activitySequence.current;
-      const existing = statusConfirmTimers.current[threadId];
-      if (existing) clearTimeout(existing);
-      statusConfirmTimers.current[threadId] = window.setTimeout(() => {
-        delete statusConfirmTimers.current[threadId];
-        void loadBootstrap().catch(() => undefined);
-        scheduleListRefresh(0);
-      }, 300);
-    };
-    events.addEventListener("connected", () => {
-      const isReconnect = hasConnected || needsReconnectRefresh;
-      hasConnected = true;
-      needsReconnectRefresh = false;
-      setRuntime((current) => current === "ready" ? current : "ready");
-      if (isReconnect) scheduleConnectionRefresh();
-    });
-    events.addEventListener("runtime", (event) => {
-      const payload = parseEventData<{ state?: unknown }>(event);
-      if (!payload || !["ready", "offline", "error"].includes(String(payload.state))) return;
-      const state = payload.state as "ready" | "offline" | "error";
-      const recovered = serverRuntimeState !== "ready" && state === "ready";
-      serverRuntimeState = state;
-      setRuntime((current) => current === state ? current : state);
-      if (state === "ready" && (needsReconnectRefresh || recovered)) {
-        needsReconnectRefresh = false;
-        scheduleConnectionRefresh();
-      }
-    });
-    events.addEventListener("approval", (event) => {
-      const request = parseEventData<PendingRequest>(event);
-      if (!request || request.id === undefined) return;
-      setPending((current) => current.some((item) => String(item.id) === String(request.id)) ? current : [...current, request]);
-    });
-    events.addEventListener("approval-resolved", (event) => {
-      const payload = parseEventData<{ id?: unknown }>(event);
-      if (!payload || payload.id === undefined) return;
-      const { id } = payload;
-      setPending((current) => current.filter((item) => String(item.id) !== String(id)));
-    });
-    events.addEventListener("queue", (event) => {
-      const payload = parseEventData<{ threadId?: unknown; queue?: unknown; error?: unknown }>(event);
-      if (!payload || typeof payload.threadId !== "string" || !Array.isArray(payload.queue)) return;
-      const threadId = payload.threadId;
-      const queue = payload.queue as QueueEntry[];
-      setQueues((current) => sameQueue(current[threadId] || EMPTY_QUEUE, queue)
-        ? current
-        : { ...current, [threadId]: queue });
-      if (typeof payload.error === "string" && payload.error) setToast(`Queued turn could not start: ${payload.error}`);
-    });
-    events.addEventListener("threads", (event) => {
-      const payload = parseEventData<{ action?: unknown; threadId?: unknown; reason?: unknown }>(event);
-      if (!payload || typeof payload.threadId !== "string" || !["created", "updated", "removed"].includes(String(payload.action))) return;
-      const threadId = payload.threadId;
-      if (payload.action === "created") {
-        removedThreadIdsRef.current.delete(threadId);
-      }
-      if (payload.action === "updated" && payload.reason === "archive_failed") {
-        removedThreadIdsRef.current.delete(threadId);
-      }
-      if (payload.action === "removed") {
-        removedThreadIdsRef.current.add(threadId);
-        listRequestSequence.current += 1;
-        delete pendingTextDeltas[threadId];
-        delete pendingToolDeltas[threadId];
-        delete pendingTokenUsage[threadId];
-        setThreads((current) => current.filter((thread) => thread.id !== threadId));
-        setSelectedId((current) => current === threadId ? null : current);
-        setDetail((current) => current?.id === threadId ? null : current);
-        setControlIds((current) => current.filter((id) => id !== threadId));
-        setSparkIds((current) => current.filter((id) => id !== threadId));
-        setLiveStatuses((current) => omitKey(current, threadId));
-        setLiveText((current) => omitKey(current, threadId));
-        setLiveToolOutput((current) => omitKey(current, threadId));
-        setLiveItems((current) => omitKey(current, threadId));
-        setQueues((current) => omitKey(current, threadId));
-        setCompletedSignals((current) => withoutSetValue(current, threadId));
-        setCompletionTimes((current) => omitKey(current, threadId));
-        const next = withoutSetValue(activeThreadIdsRef.current, threadId);
-        activeThreadIdsRef.current = next;
-        setActiveThreadIds(next);
-      }
-      scheduleListRefresh(payload.action === "removed" ? 0 : 250);
-    });
-    events.addEventListener("codex", (event) => {
-      const notification = parseEventData<{ method?: unknown; params?: unknown }>(event);
-      if (!notification || typeof notification.method !== "string" || !isRecord(notification.params)) return;
-      const threadId = typeof notification.params?.threadId === "string" ? notification.params.threadId : null;
-      if (notification.method === "item/agentMessage/delta" && threadId) {
-        const itemId = String(notification.params.itemId);
-        const delta = String(notification.params.delta || "");
-        queueLiveDelta("text", threadId, itemId, delta);
-      }
-      if ((notification.method === "item/commandExecution/outputDelta" || notification.method === "command/exec/outputDelta") && threadId) {
-        const itemId = String(notification.params.itemId || notification.params.processId || "command");
-        const delta = String(notification.params.delta || "");
-        queueLiveDelta("tool", threadId, itemId, delta);
-      }
-      if ((notification.method === "item/started" || notification.method === "item/completed") && threadId && notification.params.item && typeof notification.params.item === "object") {
-        const item = notification.params.item as ThreadItem;
-        if (item.id) {
-          setLiveItems((current) => setNestedValue(current, threadId, item.id!, item, sameThreadItem));
-        }
-      }
-      if (notification.method === "thread/status/changed" && threadId && notification.params.status && typeof notification.params.status === "object") {
-        const status = notification.params.status as Thread["status"];
-        if (status.type === "active") {
-          markActive(threadId);
-        } else {
-          setLiveStatuses((current) => sameThreadStatus(current[threadId], status) ? current : { ...current, [threadId]: status });
-          reconcileTerminalStatus(threadId);
-        }
-        setDetail((current) => current?.id === threadId && !sameThreadStatus(current.status, status) ? { ...current, status } : current);
-      }
-      if (notification.method === "turn/started" && threadId) {
-        markActive(threadId);
-        setCompletedSignals((current) => withoutSetValue(current, threadId));
-        setCompletionTimes((current) => omitKey(current, threadId));
-      }
-      if (notification.method === "turn/completed" && threadId) {
-        // A raw completion can belong to one of several activity sources, or be
-        // followed immediately by a queued turn. Keep showing active until the
-        // aggregate bootstrap state confirms that all work has stopped.
-        reconcileTerminalStatus(threadId);
-      }
-      if (notification.method === "thread/tokenUsage/updated" && threadId) {
-        const usage = normalizeTokenUsage((notification.params.tokenUsage as { total?: unknown } | undefined)?.total);
-        if (usage) {
-          pendingTokenUsage[threadId] = usage;
-          scheduleLiveFlush();
-        }
-      }
-      if (notification.method === "account/rateLimits/updated") {
-        void loadBootstrap().catch(() => undefined);
-      }
-      if (threadId === selectedRef.current && !notification.method.endsWith("/delta")) {
-        if (refreshTimer.current) clearTimeout(refreshTimer.current);
-        refreshTimer.current = window.setTimeout(() => {
-          if (selectedRef.current) void loadThread(selectedRef.current, true).catch(() => undefined);
-          if (notification.method === "turn/completed") {
-            const cleanupTimer = window.setTimeout(() => {
-              liveCleanupTimers.delete(cleanupTimer);
-              setLiveText((current) => omitKey(current, threadId!));
-              setLiveToolOutput((current) => omitKey(current, threadId!));
-              setLiveItems((current) => omitKey(current, threadId!));
-            }, 1_200);
-            liveCleanupTimers.add(cleanupTimer);
-          }
-        }, 300);
-      }
-      if (threadId && /^(item\/|turn\/|thread\/(status|goal))/.test(notification.method) && !notification.method.endsWith("/delta")) {
-        scheduleActivityRefresh();
-      }
-      if (/^(thread|turn)\//.test(notification.method)) {
-        scheduleListRefresh(400);
-      }
-    });
-    events.onerror = () => {
-      needsReconnectRefresh = true;
-      setRuntime((current) => current === "offline" ? current : "offline");
-    };
+    if (authenticated !== true) return;
+    void Promise.all([
+      loadBootstrap(),
+      loadAccountStatus(),
+      readApprovals().then(replacePending)
+    ]).catch(handleBackgroundError);
     return () => {
-      events.close();
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (activityTimer) clearTimeout(activityTimer);
-      if (liveFlushTimer) clearTimeout(liveFlushTimer);
-      if (refreshTimer.current) clearTimeout(refreshTimer.current);
-      if (listTimer.current) clearTimeout(listTimer.current);
-      refreshTimer.current = null;
-      listTimer.current = null;
-      for (const timer of liveCleanupTimers) clearTimeout(timer);
-      for (const timer of Object.values(statusConfirmTimers.current)) clearTimeout(timer);
-      statusConfirmTimers.current = {};
+      bootstrapController.current?.abort();
+      statusController.current?.abort();
     };
-  }, [authenticated, loadBootstrap, loadThread, loadThreads]);
-
+  }, [authenticated, handleBackgroundError, loadAccountStatus, loadBootstrap, readApprovals, replacePending]);
   useEffect(() => {
-    writeStoredJson("forgedeck-pins", [...pinned]);
-  }, [pinned]);
-  useEffect(() => writeStoredString("forgedeck-view", view), [view]);
-  useEffect(() => writeStoredJson("forgedeck-control-ids", controlIds), [controlIds]);
-  useEffect(() => writeStoredJson("forgedeck-control-dismissed", [...dismissedControlIds]), [dismissedControlIds]);
-  useEffect(() => writeStoredJson("forgedeck-spark-ids", sparkIds), [sparkIds]);
-  useEffect(() => writeStoredJson("forgedeck-spark-dismissed", [...dismissedSparkIds]), [dismissedSparkIds]);
-  useEffect(() => writeStoredJson("forgedeck-completed", [...completedSignals]), [completedSignals]);
+    if (authenticated !== true || !startup || onboardingCheckedRef.current) return;
+    onboardingCheckedRef.current = true;
+    if (hasLaunchConfiguration()) return;
+    const controller = new AbortController();
+    void Promise.all([
+      api<{ total: number }>("/api/threads?limit=1&archiveState=all", { signal: controller.signal }),
+      api<{ data: unknown[] }>("/api/blueprints?limit=1", { signal: controller.signal })
+    ]).then(([inventory, blueprints]) => {
+      if (!controller.signal.aborted && inventory.total === 0 && blueprints.data.length === 0) setOnboardingOpen(true);
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, [authenticated, startup]);
   useEffect(() => {
-    const timer = window.setTimeout(() => writeStoredJson("forgedeck-token-usage", tokenUsage), 500);
-    return () => clearTimeout(timer);
-  }, [tokenUsage]);
-  useEffect(() => writeStoredString("forgedeck-poll-interval", String(pollInterval)), [pollInterval]);
-  useEffect(() => writeStoredString("forgedeck-theme", theme), [theme]);
-  useEffect(() => {
-    const prune = () => {
-      const cutoff = Date.now() - COMPLETED_CONTROL_TTL_MS;
-      setControlIds((current) => {
-        const next = current.filter((threadId) => activeThreadIds.has(threadId) || !completionTimes[threadId] || completionTimes[threadId] > cutoff);
-        return next.length === current.length ? current : next;
-      });
-      setSparkIds((current) => {
-        const next = current.filter((threadId) => activeThreadIds.has(threadId) || !completionTimes[threadId] || completionTimes[threadId] > cutoff);
-        return next.length === current.length ? current : next;
-      });
-    };
-    prune();
-    const timer = window.setInterval(prune, 30_000);
-    return () => clearInterval(timer);
-  }, [activeThreadIds, completionTimes]);
-  useEffect(() => {
-    if (threads.length && !controlSelectionInitialized.current) {
-      controlSelectionInitialized.current = true;
-      writeStoredString("forgedeck-control-initialized", "true");
-      const initial = threads.filter((thread) => !isSparkThread(thread)).sort((a, b) => statusRank(b) - statusRank(a) || b.updatedAt - a.updatedAt).slice(0, 3).map((thread) => thread.id);
-      setControlIds(initial);
+    if (!threads.length) return;
+    const notificationTarget = notificationFocusRef.current;
+    if (notificationTarget) {
+      if (threads.some((thread) => thread.id === notificationTarget)) notificationFocusRef.current = null;
+      setSelectedId(notificationTarget);
+      return;
     }
+    setSelectedId((current) => current && threads.some((thread) => thread.id === current) ? current : threads[0].id);
   }, [threads]);
   useEffect(() => {
-    const activeIds = threads.filter((thread) => !isSparkThread(thread) && activeThreadIds.has(thread.id) && !dismissedControlIds.has(thread.id)).map((thread) => thread.id);
-    const sparkThreadIdSet = new Set(threads.filter(isSparkThread).map((thread) => thread.id));
-    setControlIds((current) => {
-      const retained = current.filter((id) => !sparkThreadIdSet.has(id));
-      const missing = activeIds.filter((id) => !retained.includes(id));
-      return retained.length === current.length && !missing.length ? current : [...retained, ...missing];
+    if (!selectedId || view !== "session") return;
+    void refreshThread(selectedId).catch(handleBackgroundError);
+    return () => cancelDetail(selectedId);
+  }, [cancelDetail, handleBackgroundError, refreshThread, selectedId, view]);
+
+  useEffect(() => {
+    if (authenticated !== true || !relevantLiveIds.length) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void readThreadRecoverySnapshot(relevantLiveIds.slice(0, 256), controller.signal).then((snapshot) => {
+        if (controller.signal.aborted) return;
+        threadStore.applyRecoverySnapshot(snapshot);
+      }).catch(handleBackgroundError);
+    }, 50);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  // The sorted signature coalesces equivalent ID sets across status object revisions.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticated, relevantLiveSignature]);
+
+  useEffect(() => {
+    if (!bootstrap) return;
+    const models = bootstrap.models.data;
+    const defaultModel = models.find((model) => model.isDefault) || models[0];
+    const claudeModels = bootstrap.claudeModelOptions || [];
+    setSettings((current) => {
+      let next = current;
+      for (const thread of threads) {
+        const metadata = settingsFromThread(thread);
+        const signature = `${metadata.model || ""}:${metadata.effort || ""}`;
+        const previousSignature = settingsMetadataSignatures.current.get(thread.id);
+        if (previousSignature === signature && current[thread.id]) continue;
+        const normalized = resolveThreadSettings(thread, models, claudeModels, current[thread.id], defaultModel);
+        settingsMetadataSignatures.current.set(thread.id, signature);
+        if (current[thread.id]?.model === normalized.model && current[thread.id]?.effort === normalized.effort) continue;
+        if (next === current) next = { ...current };
+        next[thread.id] = normalized;
+      }
+      return next;
     });
-  }, [threads, activeThreadIds, dismissedControlIds]);
+  }, [bootstrap, threads]);
   useEffect(() => {
-    if (!threads.length || sparkSelectionInitialized.current) return;
-    sparkSelectionInitialized.current = true;
-    const initialIds = threads.filter((thread) => isSparkThread(thread) && !dismissedSparkIds.has(thread.id)).map((thread) => thread.id);
-    if (initialIds.length) setSparkIds(initialIds);
-  }, [threads, dismissedSparkIds]);
+    if (!bootstrap || !currentThread) return;
+    const persisted = settingsFromThread(currentThread);
+    const signature = `${persisted.model || ""}:${persisted.effort || ""}`;
+    if (settingsMetadataSignatures.current.get(currentThread.id) === signature && settings[currentThread.id]) return;
+    const defaultChoice = bootstrap.models.data.find((model) => model.isDefault) || bootstrap.models.data[0];
+    setSettings((current) => {
+      const normalized = resolveThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], current[currentThread.id], defaultChoice);
+      settingsMetadataSignatures.current.set(currentThread.id, signature);
+      return current[currentThread.id]?.model === normalized.model && current[currentThread.id]?.effort === normalized.effort
+        ? current : { ...current, [currentThread.id]: normalized };
+    });
+  }, [bootstrap, currentThread, settings]);
+
   useEffect(() => {
-    const activeIds = threads.filter((thread) => isSparkThread(thread) && activeThreadIds.has(thread.id) && !dismissedSparkIds.has(thread.id)).map((thread) => thread.id);
-    if (!activeIds.length) return;
-    setSparkIds((current) => {
-      const missing = activeIds.filter((id) => !current.includes(id));
+    if (!bootstrap) return;
+    // Account status can retain MCP ownership for sessions that are archived or
+    // otherwise absent from the active inventory. Only board sessions the
+    // inventory can render; when a newly spawned session arrives, the threads
+    // dependency reruns this effect and adds it immediately.
+    const inventoryIds = new Set(threads.map((thread) => thread.id));
+    const sparkAgents = new Set(bootstrap.sparkAgentThreadIds || []);
+    setControlIds((current) => {
+      const missing = (bootstrap.agentThreadIds || []).filter((id) => inventoryIds.has(id) && !sparkAgents.has(id) && !dismissedControlIds.has(id) && !current.includes(id));
       return missing.length ? [...current, ...missing] : current;
     });
-  }, [threads, activeThreadIds, dismissedSparkIds]);
+    setSparkIds((current) => {
+      const missing = (bootstrap.sparkAgentThreadIds || []).filter((id) => inventoryIds.has(id) && !dismissedSparkIds.has(id) && !current.includes(id));
+      return missing.length ? [...current, ...missing] : current;
+    });
+  }, [bootstrap, dismissedControlIds, dismissedSparkIds, threads]);
+  useEffect(() => {
+    if (!threads.length || controlInitialized.current) return;
+    controlInitialized.current = true;
+    setControlIds(threads.filter((thread) => thread.sessionClass !== "spark").slice(0, 3).map((thread) => thread.id));
+  }, [threads]);
+  useEffect(() => {
+    const activeStandard = threads.filter((thread) => thread.sessionClass !== "spark" && thread.status.type === "active" && !dismissedControlIds.has(thread.id)).map((thread) => thread.id);
+    const activeSpark = threads.filter((thread) => thread.sessionClass === "spark" && thread.status.type === "active" && !dismissedSparkIds.has(thread.id)).map((thread) => thread.id);
+    if (activeStandard.length) setControlIds((current) => [...current, ...activeStandard.filter((id) => !current.includes(id))]);
+    if (activeSpark.length) setSparkIds((current) => [...current, ...activeSpark.filter((id) => !current.includes(id))]);
+  }, [dismissedControlIds, dismissedSparkIds, threads]);
+  useEffect(() => {
+    const serverPinned = threads.filter((thread) => thread.pinned).map((thread) => thread.id);
+    if (!serverPinned.length) return;
+    setPinned((current) => {
+      const next = new Set(current);
+      for (const threadId of serverPinned) next.add(threadId);
+      return next.size === current.size ? current : next;
+    });
+  }, [threads]);
+
+  // Prune stale control/spark IDs that no longer exist in the thread inventory
+  useEffect(() => {
+    if (!threads.length || !fullyLoaded) return;
+    const existingIds = new Set(threads.map((t) => t.id));
+    setControlIds((current) => current.filter((id) => existingIds.has(id)));
+    setSparkIds((current) => current.filter((id) => existingIds.has(id)));
+  }, [fullyLoaded, threads]);
+
+  useLayoutEffect(() => {
+    const resolvedTheme = theme === "system" ? systemDarkTheme ? "dark" : "light" : theme;
+    document.documentElement.dataset.theme = resolvedTheme;
+    document.documentElement.dataset.themeMode = theme;
+    document.documentElement.style.colorScheme = resolvedTheme;
+  }, [systemDarkTheme, theme]);
+  useEffect(() => writeStoredJson("forgedeck-pins", [...pinned]), [pinned]);
+  useEffect(() => writeStoredJson("forgedeck-settings", settings), [settings]);
+  useEffect(() => writeStoredString("forgedeck-sort", sortMode), [sortMode]);
+  useEffect(() => writeStoredString("forgedeck-sort-direction", sortDirection), [sortDirection]);
+  useEffect(() => writeStoredString("forgedeck-view", view), [view]);
+  useEffect(() => writeStoredString("forgedeck-poll-interval", String(pollInterval)), [pollInterval]);
+  useEffect(() => writeStoredString("forgedeck-theme", theme), [theme]);
+  useEffect(() => writeStoredJson("forgedeck-control-ids", controlIds), [controlIds]);
+  useEffect(() => writeStoredJson("forgedeck-spark-ids", sparkIds), [sparkIds]);
+  useEffect(() => writeStoredJson("forgedeck-control-dismissed", [...dismissedControlIds]), [dismissedControlIds]);
+  useEffect(() => writeStoredJson("forgedeck-spark-dismissed", [...dismissedSparkIds]), [dismissedSparkIds]);
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 4_500);
+    return () => clearTimeout(timer);
+  }, [toast]);
+  const handleCloseSidebar = useCallback(() => {
+    setSidebarOpen(false);
+    window.requestAnimationFrame(() => mobileMenuRef.current?.focus());
+  }, []);
+  const handleOpenSidebar = useCallback(() => setSidebarOpen(true), []);
+  const handleOpenInsights = useCallback(() => { setInsightsOpen(true); setSidebarOpen(false); }, []);
+  const handleCloseInsights = useCallback(() => setInsightsOpen(false), []);
+  const handleCloseReplay = useCallback(() => setReplayThreadId(null), []);
+  const handleNew = useCallback(() => { setNewSessionClass("standard"); setNewQuickStart(false); setNewOpen(true); }, []);
+  const handleNewSpark = useCallback(() => { setNewSessionClass("spark"); setNewQuickStart(false); setNewOpen(true); }, []);
+  const handleCloseNew = useCallback(() => setNewOpen(false), []);
+  const handleDismissOnboarding = useCallback(() => { markOnboardingSeen(); setOnboardingOpen(false); }, []);
+  const handleOnboardingQuickStart = useCallback(() => {
+    markOnboardingSeen();
+    setOnboardingOpen(false);
+    setNewSessionClass("standard");
+    setNewQuickStart(true);
+    setNewOpen(true);
+  }, []);
+  const handleLoginSuccess = useCallback(() => setAuthenticated(true), []);
+  const handleSearch = useCallback((value: string) => setSearch(value), []);
+  const handleSort = useCallback((value: SortMode) => { setSortMode(value); setSortDirection(value === "name" || value === "directory" ? "asc" : "desc"); }, []);
+  const handleSortDirection = useCallback(() => setSortDirection((current) => current === "asc" ? "desc" : "asc"), []);
+  const handleFilters = useCallback((value: ThreadFilters) => setFilters(value), []);
+  const handlePollInterval = useCallback((value: number) => setPollInterval(value), []);
+  const handleDismissToast = useCallback(() => setToast(null), []);
+  const handleRetryError = useCallback((id: string) => {
+    void retryError(id).then((succeeded) => { if (succeeded) setToast("Retry succeeded."); });
+  }, [retryError]);
+  const handleView = useCallback((next: SidebarView) => { setView(next); setSidebarOpen(false); }, []);
+  const handleSelect = useCallback((threadId: string) => {
+    notificationFocusRef.current = null;
+    setSelectedId(threadId);
+    setView("session");
+    setSidebarOpen(false);
+    threadStore.markCompletionSeen(threadId);
+  }, []);
+  const handleInsightSession = useCallback((threadId: string) => {
+    if (threadStore.getSummary(threadId)) handleSelect(threadId);
+    else setReplayThreadId(threadId);
+  }, [handleSelect]);
+  const handleTogglePin = useCallback((threadId: string) => {
+    const nextPinned = !pinned.has(threadId);
+    setPinned((current) => { const next = new Set(current); nextPinned ? next.add(threadId) : next.delete(threadId); return next; });
+    void api(`/api/sessions/${encodeURIComponent(threadId)}/pin`, {
+      method: "POST",
+      body: JSON.stringify({ pinned: nextPinned })
+    }).catch((error) => {
+      setPinned((current) => { const next = new Set(current); nextPinned ? next.delete(threadId) : next.add(threadId); return next; });
+      handleError(error);
+    });
+  }, [handleError, pinned]);
+  const handleAddControl = useCallback((threadId: string) => { setDismissedControlIds((current) => { const next = new Set(current); next.delete(threadId); return next; }); setControlIds((current) => current.includes(threadId) ? current : [...current, threadId]); }, []);
+  const handleRemoveControl = useCallback((threadId: string) => { setDismissedControlIds((current) => new Set(current).add(threadId)); setControlIds((current) => current.filter((id) => id !== threadId)); }, []);
+  const handleAddSpark = useCallback((threadId: string) => { setDismissedSparkIds((current) => { const next = new Set(current); next.delete(threadId); return next; }); setSparkIds((current) => current.includes(threadId) ? current : [...current, threadId]); }, []);
+  const handleRemoveSpark = useCallback((threadId: string) => { setDismissedSparkIds((current) => new Set(current).add(threadId)); setSparkIds((current) => current.filter((id) => id !== threadId)); }, []);
+  const requestSessionAction = useCallback((operation: SessionOperation, threadIds: string[]) => {
+    const uniqueIds = [...new Set(threadIds)].filter(Boolean);
+    if (uniqueIds.length) setSessionActionRequest((current) => current || { operation, threadIds: uniqueIds });
+  }, []);
+  const handleCloseSessionAction = useCallback(() => setSessionActionRequest(null), []);
+  const handleToggleBoard = useCallback((threadId: string) => {
+    const thread = threadStore.getSummary(threadId);
+    const inBoard = thread?.sessionClass === "spark" ? sparkIds.includes(threadId) : controlIds.includes(threadId);
+    if (inBoard) requestSessionAction("remove", [threadId]);
+    else if (thread?.sessionClass === "spark") handleAddSpark(threadId);
+    else handleAddControl(threadId);
+  }, [controlIds, handleAddControl, handleAddSpark, requestSessionAction, sparkIds]);
+  const handleSettings = useCallback((threadId: string, next: SessionSettings) => setSettings((current) => ({ ...current, [threadId]: next })), []);
+  const handleSelectedSettings = useCallback((next: SessionSettings) => { if (selectedRef.current) handleSettings(selectedRef.current, next); }, [handleSettings]);
+  const handleSelectedNotificationSettings = useCallback((next: NotificationPreferences) => {
+    const threadId = selectedRef.current;
+    if (!threadId) return;
+    const current = settingsRef.current[threadId];
+    if (!current) return;
+    handleSettings(threadId, { ...current, notifications: next });
+    if ((next.onCompletion || next.onFailure || next.onApprovalNeeded) && notifications.permission === "default") {
+      void notifications.requestPermission();
+    }
+  }, [handleSettings, notifications]);
+  const handleOpenBoardThread = useCallback((threadId: string) => handleSelect(threadId), [handleSelect]);
+  const handleRefreshBoardThread = useCallback((threadId: string) => refreshThread(threadId, true), [refreshThread]);
+  const handleVisibleBoardThreads = useCallback((threadIds: string[]) => {
+    setVisibleBoardIds((current) => sameStringArray(current, threadIds) ? current : threadIds);
+  }, []);
+  const handleRefreshSelectedThread = useCallback(() => selectedRef.current ? refreshThread(selectedRef.current) : Promise.resolve(null), [refreshThread]);
+  const handleClearControl = useCallback(() => setControlIds((ids) => ids.filter((id) => !threadStore.getLive(id).completed)), []);
+  const handleClearSpark = useCallback(() => setSparkIds((ids) => ids.filter((id) => !threadStore.getLive(id).completed)), []);
+  const idleThreadIds = useMemo(() => threads.filter((thread) => thread.status.type !== "active").map((thread) => thread.id), [threads]);
+
+  const handleBatchAction = useCallback(async (_action: BatchAction, threadIds: string[]): Promise<string[]> => {
+    const nextPinned = !threadIds.every((id) => pinned.has(id));
+    const settled = await Promise.allSettled(threadIds.map((threadId) => api(`/api/sessions/${encodeURIComponent(threadId)}/pin`, {
+      method: "POST",
+      body: JSON.stringify({ pinned: nextPinned })
+    })));
+    const failed = threadIds.filter((_, index) => settled[index]?.status === "rejected");
+    const succeeded = threadIds.filter((_, index) => settled[index]?.status === "fulfilled");
+    setPinned((current) => {
+      const next = new Set(current);
+      for (const id of succeeded) nextPinned ? next.add(id) : next.delete(id);
+      return next;
+    });
+    return failed;
+  }, [pinned]);
+  const handleReportedBatchAction = useCallback(async (action: BatchAction, threadIds: string[]): Promise<string[]> => {
+    try {
+      return await handleBatchAction(action, threadIds);
+    } catch (error) {
+      handleError(error);
+      throw error;
+    }
+  }, [handleBatchAction, handleError]);
+
+  const handleClearIdle = useCallback(() => requestSessionAction("archive", idleThreadIds), [idleThreadIds, requestSessionAction]);
+
+  const handleCreated = useCallback(async (thread: Thread, requested: SessionSettings, sessionClass: SessionClass) => {
+    const models = bootstrap?.models.data || [];
+    const defaultModel = models.find((model) => model.isDefault) || models[0];
+    const persisted = settingsFromThread(thread);
+    const canonical = resolveThreadSettings(thread, models, bootstrap?.claudeModelOptions || [], requested, defaultModel);
+    settingsMetadataSignatures.current.set(thread.id, `${persisted.model || ""}:${persisted.effort || ""}`);
+    handleSettings(thread.id, canonical);
+    threadStore.upsertSummary(thread);
+    sessionClass === "spark" ? handleAddSpark(thread.id) : handleAddControl(thread.id);
+    markOnboardingSeen();
+    setOnboardingOpen(false);
+    setNewOpen(false);
+    await reload();
+    setSelectedId(thread.id);
+    setView("session");
+  }, [bootstrap, handleAddControl, handleAddSpark, handleSettings, reload]);
+
+  const handleLogout = useCallback(() => { void api("/api/logout", { method: "POST" }).then(handleSessionEnded).catch(handleError); }, [handleError, handleSessionEnded]);
+  const handlePinCurrent = useCallback(() => { if (currentThreadRef.current) handleTogglePin(currentThreadRef.current.id); }, [handleTogglePin]);
+  const handleRename = useCallback(() => { const thread = currentThreadRef.current; if (!thread) return; const name = window.prompt("Session name", threadTitle(thread)); if (!name?.trim()) return; void api(`/api/threads/${thread.id}`, { method: "PATCH", body: JSON.stringify({ name: name.trim() }) }).then(() => Promise.all([refreshThread(thread.id), reload()])).catch(handleError); }, [handleError, refreshThread, reload]);
+  const handleOrganize = useCallback(() => { const thread = currentThreadRef.current; if (!thread) return; const category = window.prompt("Session category (blank clears it)", thread.category || ""); if (category === null) return; const tags = window.prompt("Tags, separated by commas", (thread.tags || []).join(", ")); if (tags === null) return; void api(`/api/threads/${thread.id}`, { method: "PATCH", body: JSON.stringify({ category, tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean) }) }).then(() => Promise.all([refreshThread(thread.id), reload()])).catch(handleError); }, [handleError, refreshThread, reload]);
+  const handleArchiveCurrent = useCallback(() => { const thread = currentThreadRef.current; if (thread) requestSessionAction("archive", [thread.id]); }, [requestSessionAction]);
+  const handleArchivePinned = useCallback((threadId: string, nextPinned: boolean) => {
+    setPinned((current) => { const next = new Set(current); nextPinned ? next.add(threadId) : next.delete(threadId); return next; });
+  }, []);
+  const handleArchiveRestored = useCallback(async (threadId: string) => {
+    await reload();
+    setToast("Session restored to the active inventory.");
+    setSelectedId(threadId);
+  }, [reload]);
+  const handleStopCurrent = useCallback(() => { const thread = currentThreadRef.current; if (thread) requestSessionAction("stop", [thread.id]); }, [requestSessionAction]);
+  const handleToggleTheme = useCallback(() => setTheme((current) => {
+    const dark = current === "dark" || (current === "system" && systemDarkTheme);
+    return dark ? "light" : "dark";
+  }), [systemDarkTheme]);
+  const handleOpenPalette = useCallback(() => {
+    setSidebarOpen(false);
+    setErrorsOpen(false);
+    notifications.closeCenter();
+    setPaletteOpen(true);
+  }, [notifications, setErrorsOpen]);
+  const handleClosePalette = useCallback(() => setPaletteOpen(false), []);
+  const handleNavigateRelative = useCallback((direction: -1 | 1) => {
+    setView((current) => {
+      const views: SidebarView[] = ["session", "control", "spark"];
+      const index = views.indexOf(current);
+      if (index === -1) return views[direction === 1 ? 0 : views.length - 1];
+      return views[(index + direction + views.length) % views.length];
+    });
+    setSidebarOpen(false);
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (event.key.toLowerCase() === "n" && !event.ctrlKey && !event.metaKey && !event.altKey && !target?.matches("input, textarea, select, [contenteditable=true]")) {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || document.querySelector("[aria-modal='true']")) return;
+      const key = event.key.toLocaleLowerCase();
+      if (key === "k") {
         event.preventDefault();
-        setNewSessionClass("standard");
-        setNewOpen(true);
+        handleOpenPalette();
+      } else if (key === "n") {
+        event.preventDefault();
+        handleNew();
+      } else if (key === "w") {
+        event.preventDefault();
+        const thread = currentThreadRef.current;
+        if (!thread) setToast("Select a session to close.");
+        else if (thread.archiveState === "archived") setToast("This session is already archived.");
+        else handleArchiveCurrent();
+      } else if (event.key === "[") {
+        event.preventDefault();
+        handleNavigateRelative(-1);
+      } else if (event.key === "]") {
+        event.preventDefault();
+        handleNavigateRelative(1);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-  useEffect(() => writeStoredJson("forgedeck-settings", settings), [settings]);
-  useEffect(() => writeStoredString("forgedeck-sort", sortMode), [sortMode]);
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 4500);
-    return () => clearTimeout(timer);
-  }, [toast]);
+  }, [handleArchiveCurrent, handleNavigateRelative, handleNew, handleOpenPalette]);
 
-  const effectiveThreads = useMemo(() => threads.map((thread) => {
-    const status = isClaudeThread(thread)
-      ? hasInProgressTurn(thread) ? { type: "active", activeFlags: [] } as Thread["status"] : thread.status
-      : activeThreadIds.has(thread.id) || liveStatuses[thread.id]?.type === "active" || hasInProgressTurn(thread)
-      ? { type: "active", activeFlags: [] } as Thread["status"]
-      : liveStatuses[thread.id] || thread.status;
-    return sameThreadStatus(thread.status, status) ? thread : { ...thread, status };
-  }), [threads, liveStatuses, activeThreadIds]);
-
-  const sortedThreads = useMemo(() => {
-    const copy = [...effectiveThreads];
-    copy.sort((a, b) => {
-      const lifecycleOrder = statusRank(b, completedSignals.has(b.id)) - statusRank(a, completedSignals.has(a.id));
-      if (lifecycleOrder) return lifecycleOrder;
-      const pinOrder = Number(pinned.has(b.id)) - Number(pinned.has(a.id));
-      if (pinOrder) return pinOrder;
-      if (sortMode === "name") return threadTitle(a).localeCompare(threadTitle(b));
-      if (sortMode === "directory") return a.cwd.localeCompare(b.cwd);
-      if (sortMode === "status") return b.updatedAt - a.updatedAt;
-      if (sortMode === "created") return b.createdAt - a.createdAt;
-      return b.updatedAt - a.updatedAt;
-    });
-    return copy;
-  }, [effectiveThreads, sortMode, pinned, completedSignals]);
-
-  const defaultModel = bootstrap?.models.data.find((model) => model.isDefault) || bootstrap?.models.data[0];
-  const selectedThread = useMemo(() => effectiveThreads.find((thread) => thread.id === selectedId), [effectiveThreads, selectedId]);
-  const activeSettings = useMemo(() => selectedId && settings[selectedId]
-    ? settings[selectedId]
-    : selectedThread ? defaultSettingsForThread(selectedThread, bootstrap?.models.data || [], bootstrap?.claudeModelOptions || [], defaultModel) : null,
-  [bootstrap?.claudeModelOptions, bootstrap?.models.data, defaultModel, selectedId, selectedThread, settings]);
-  const controlThreads = useMemo(() => {
-    const byId = new Map(effectiveThreads.map((thread) => [thread.id, thread]));
-    return controlIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread) && !isSparkThread(thread!));
-  }, [effectiveThreads, controlIds]);
-  const allStandardThreads = useMemo(() => effectiveThreads.filter((thread) => !isSparkThread(thread)), [effectiveThreads]);
-  const sparkThreads = useMemo(() => {
-    const byId = new Map(effectiveThreads.filter(isSparkThread).map((thread) => [thread.id, thread]));
-    return sparkIds.map((id) => byId.get(id)).filter((thread): thread is Thread => Boolean(thread));
-  }, [effectiveThreads, sparkIds]);
-  const allSparkThreads = useMemo(() => effectiveThreads.filter(isSparkThread), [effectiveThreads]);
   const controlIdSet = useMemo(() => new Set(controlIds), [controlIds]);
   const sparkIdSet = useMemo(() => new Set(sparkIds), [sparkIds]);
-  const effectiveDetail = useMemo(() => {
-    if (detail && isClaudeThread(detail)) return detail;
-    if (!detail || !(activeThreadIds.has(detail.id) || liveStatuses[detail.id]?.type === "active" || hasInProgressTurn(detail)) || detail.status.type === "active") return detail;
-    return { ...detail, status: { type: "active", activeFlags: [] } as Thread["status"] };
-  }, [activeThreadIds, detail, liveStatuses]);
+  const controlThreads = useMemo(() => controlIds.map((id) => threads.find((thread) => thread.id === id)).filter((thread): thread is Thread => Boolean(thread) && thread!.sessionClass !== "spark"), [controlIds, threads]);
+  const sparkThreads = useMemo(() => sparkIds.map((id) => threads.find((thread) => thread.id === id)).filter((thread): thread is Thread => Boolean(thread)), [sparkIds, threads]);
+  const filteredStandardThreads = useMemo(() => filteredThreads.filter((thread) => thread.sessionClass !== "spark"), [filteredThreads]);
+  const filteredSparkThreads = useMemo(() => filteredThreads.filter((thread) => thread.sessionClass === "spark"), [filteredThreads]);
+  const defaultModel = bootstrap?.models.data.find((model) => model.isDefault) || bootstrap?.models.data[0];
+  const activeSettings = useMemo(() => {
+    if (!currentThread || !bootstrap) return null;
+    const persisted = settingsFromThread(currentThread);
+    const signature = `${persisted.model || ""}:${persisted.effort || ""}`;
+    return settingsMetadataSignatures.current.get(currentThread.id) === signature
+      ? normalizeThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], settings[currentThread.id], defaultModel)
+      : resolveThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], settings[currentThread.id], defaultModel);
+  }, [bootstrap, currentThread, defaultModel, settings]);
+  const sessionNames = useMemo(() => Object.fromEntries(threads.map((thread) => [thread.id, threadTitle(thread)])), [threads]);
+  const displayedBackendHealth = backendHealth === "unknown"
+    ? backendHealthFromStatus(accountStatus?.runtime || startup?.health.runtime)
+    : backendHealth;
+  const modifierLabel = shortcutModifierLabel();
+  const resolvedTheme = theme === "system" ? systemDarkTheme ? "dark" : "light" : theme;
+  const currentRunning = Boolean(currentThread && (
+    threadStore.getActiveIds().has(currentThread.id)
+    || threadStore.getLive(currentThread.id).status?.type === "active"
+    || currentThread.status.type === "active"
+  ));
+  const paletteSessions = useMemo(() => threads.map((thread) => ({
+    id: thread.id,
+    title: threadTitle(thread),
+    cwd: thread.cwd,
+    category: thread.category,
+    tags: thread.tags
+  })), [threads]);
+  const sessionActionTargets = useMemo<SessionActionTarget[]>(() => (sessionActionRequest?.threadIds || []).map((threadId) => {
+    const thread = threads.find((candidate) => candidate.id === threadId) || threadStore.getSummary(threadId);
+    const live = threadStore.getLive(threadId);
+    return {
+      id: threadId,
+      title: thread ? threadTitle(thread) : threadId,
+      running: threadStore.getActiveIds().has(threadId) || live.status?.type === "active" || thread?.status.type === "active",
+      queued: live.queue.length || thread?.queueDepth || 0,
+      onBoard: controlIds.includes(threadId) || sparkIds.includes(threadId),
+      archived: thread?.archiveState === "archived"
+    };
+  }), [controlIds, sessionActionRequest, sparkIds, threads]);
+
+  const runSessionAction = useCallback(async (operation: SessionOperation, targets: SessionActionTarget[]): Promise<SessionActionResult[]> => {
+    if (operation === "delete") return targets.map((target) => ({ threadId: target.id, status: "skipped", message: "Permanent delete is unavailable" }));
+    if (operation === "remove") {
+      return targets.map((target) => {
+        if (!target.onBoard) return { threadId: target.id, status: "skipped", message: "Not on a board" };
+        const thread = threads.find((candidate) => candidate.id === target.id) || threadStore.getSummary(target.id);
+        thread?.sessionClass === "spark" ? handleRemoveSpark(target.id) : handleRemoveControl(target.id);
+        return { threadId: target.id, status: "succeeded", message: "Removed from board" };
+      });
+    }
+    if (operation === "stop") {
+      const settled = await Promise.allSettled(targets.map(async (target): Promise<SessionActionResult> => {
+        if (!target.running) return { threadId: target.id, status: "skipped", message: "No running turn" };
+        await api(`/api/threads/${target.id}/interrupt`, { method: "POST", body: "{}" });
+        void refreshThread(target.id, true).catch(handleError);
+        return { threadId: target.id, status: "succeeded", message: "Turn interrupted" };
+      }));
+      return settled.map((result, index) => result.status === "fulfilled" ? result.value : actionFailure(targets[index].id, result.reason, handleError));
+    }
+
+    const archiveIds = targets.filter((target) => !target.archived).map((target) => target.id);
+    const archived = new Map<string, SessionActionResult>();
+    if (archiveIds.length) {
+      try {
+        const response = await api<{ results: Array<{ threadId: string; ok: boolean; error?: unknown }> }>("/api/threads/batch", { method: "POST", body: JSON.stringify({ operation: "archive", threadIds: archiveIds }) });
+        for (const result of response.results) {
+          if (result.ok) {
+            archived.set(result.threadId, { threadId: result.threadId, status: "succeeded", message: "Archive accepted" });
+            removeThreadState(result.threadId);
+          } else {
+            archived.set(result.threadId, actionFailure(result.threadId, result.error, handleError));
+          }
+        }
+      } catch (error) {
+        for (const threadId of archiveIds) archived.set(threadId, actionFailure(threadId, error, handleError));
+      }
+      await reload().catch(handleError);
+    }
+    return targets.map((target) => target.archived
+      ? { threadId: target.id, status: "skipped", message: "Already archived" }
+      : archived.get(target.id) || { threadId: target.id, status: "failed", message: "Archive returned no result" });
+  }, [handleError, handleRemoveControl, handleRemoveSpark, refreshThread, reload, removeThreadState, threads]);
+
+  const undoBoardRemoval = useCallback((threadIds: string[]) => {
+    for (const threadId of threadIds) {
+      const thread = threads.find((candidate) => candidate.id === threadId) || threadStore.getSummary(threadId);
+      thread?.sessionClass === "spark" ? handleAddSpark(threadId) : handleAddControl(threadId);
+    }
+  }, [handleAddControl, handleAddSpark, threads]);
 
   if (authenticated === null) return <Splash />;
-  if (!authenticated) return <Login onSuccess={() => setAuthenticated(true)} />;
+  if (!authenticated) return <Login onSuccess={handleLoginSuccess} />;
   if (!bootstrap) return <Splash label="Connecting to your Codex account…" />;
 
-  const togglePin = (id: string) => setPinned((current) => {
-    const next = new Set(current);
-    next.has(id) ? next.delete(id) : next.add(id);
-    return next;
-  });
+  return <div className="app-shell">
+    <Sidebar open={sidebarOpen} bootstrap={bootstrap} threads={filteredThreads} totalCount={inventoryTotal} selectedId={selectedId} view={view} controlIds={controlIdSet} sparkIds={sparkIdSet} pinned={pinned} search={search} sortMode={sortMode} sortDirection={sortDirection} filters={filters} facets={facets} hasMore={hasMore} loadingMore={loadingMore} idleCount={idleThreadIds.length} unseenNotificationCount={notifications.unseenCount} errors={errors} waitingThreadIds={waitingThreadIds}
+      onClose={handleCloseSidebar} onNew={handleNew} onView={handleView} onSearch={handleSearch} onSort={handleSort} onSortDirection={handleSortDirection} onFilters={handleFilters} onLoadMore={loadMore} onSelect={handleSelect} onTogglePin={handleTogglePin} onToggleBoard={handleToggleBoard} onBatchAction={handleReportedBatchAction} onSessionAction={requestSessionAction} onClearIdle={handleClearIdle} onNotifications={notifications.openCenter} onInsights={handleOpenInsights} onKnowledgePacks={() => setKnowledgePacksOpen(true)} onPolicies={() => setPoliciesOpen(true)} onLogout={handleLogout} />
+    {sidebarOpen && <button type="button" className="sidebar-scrim" onClick={handleCloseSidebar} aria-label="Close sidebar" />}
+    <main className="main-panel">
+      <header className="topbar"><button ref={mobileMenuRef} className="icon-button mobile-menu" onClick={handleOpenSidebar} aria-label="Open sidebar"><Menu size={20} /></button>
+        {view === "control" ? <BoardHeader variant="control" count={controlThreads.length} activeCount={controlThreads.filter((thread) => thread.status.type === "active").length} /> : view === "spark" ? <BoardHeader variant="spark" count={sparkThreads.length} activeCount={sparkThreads.filter((thread) => thread.status.type === "active").length} /> : view === "missions" ? <MissionsHeader /> : view === "compare" ? <ComparisonHeader /> : view === "evals" ? <EvalHeader /> : view === "archive" ? <ArchiveHeader /> : currentThread ? <ThreadHeader thread={currentThread} settings={activeSettings} notificationPermission={notifications.permission} pinned={pinned.has(currentThread.id)} archiveShortcut={`${modifierLabel}W`} onNotifications={handleSelectedNotificationSettings} onReplay={() => setReplayThreadId(currentThread.id)} onPin={handlePinCurrent} onRename={handleRename} onOrganize={handleOrganize} onArchive={handleArchiveCurrent} /> : <div className="topbar-placeholder">Session workspace</div>}
+        <AppPreferences pollInterval={pollInterval} onPollInterval={handlePollInterval} theme={theme} modifierLabel={modifierLabel} onCommands={handleOpenPalette} onTheme={setTheme} />
+        <ConnectionStatus transport={transport} backendHealth={displayedBackendHealth} lastSyncedAt={lastSyncedAt} nextReconnectAt={nextReconnectAt} pollInterval={pollInterval} onReconnect={reconnect} />
+      </header>
+      {mobileLayout && <div className="mobile-monitor-summary">
+        <FleetSummary threads={threads} bootstrap={bootstrap} approvalCount={pending.length} errors={errors} compact onError={handleError} />
+      </div>}
+      <section className="workspace-panel" id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${view}`}>
+      {view === "control" ? <ControlCenter threads={controlThreads} allThreads={filteredStandardThreads} fleetThreads={threads} bootstrap={bootstrap} approvalCount={pending.length} showFleetSummary={!mobileLayout} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || []} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddControl} onClearCompleted={handleClearControl} onVisibleThreadsChange={handleVisibleBoardThreads} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
+        : view === "spark" ? <SparkBoard threads={sparkThreads} allThreads={filteredSparkThreads} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} claudeModels={[]} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddSpark} onClearCompleted={handleClearSpark} onVisibleThreadsChange={handleVisibleBoardThreads} onLaunch={handleNewSpark} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
+        : view === "missions" ? <MissionsView onError={handleError} />
+        : view === "compare" ? <ComparisonLab bootstrap={bootstrap} onOpenSession={handleSelect} onError={handleError} />
+        : view === "evals" ? <EvalLab bootstrap={bootstrap} onOpenSession={handleSelect} onError={handleError} />
+        : view === "archive" ? <ArchiveView onError={handleError} onPinned={handleArchivePinned} onRestored={handleArchiveRestored} />
+        : currentThread && activeSettings ? <Chat key={currentThread.id} thread={currentThread} loading={loadingDetail} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || []} settings={activeSettings} onSettings={handleSelectedSettings} onRefresh={handleRefreshSelectedThread} onSessionAction={(operation) => requestSessionAction(operation, [currentThread.id])} onError={handleError} />
+        : <Welcome onNew={handleNew} />}
+      </section>
+    </main>
+    {onboardingOpen && !newOpen && <OnboardingOverlay onClose={handleDismissOnboarding} onQuickStart={handleOnboardingQuickStart} />}
+    {newOpen && <NewSessionModal bootstrap={bootstrap} sessionClass={newSessionClass} quickStart={newQuickStart} recentThreads={threads} onClose={handleCloseNew} onCreated={handleCreated} onError={handleError} />}
+    {insightsOpen && <InsightsPanel onClose={handleCloseInsights} onSelectSession={handleInsightSession} onError={handleError} />}
+    {knowledgePacksOpen && <KnowledgePacksDialog roots={bootstrap.roots} onClose={() => setKnowledgePacksOpen(false)} onError={handleError} />}
+    {policiesOpen && <PoliciesDialog bootstrap={bootstrap} onClose={() => setPoliciesOpen(false)} onError={handleError} />}
+    {replayThreadId && <SessionReplay threadId={replayThreadId} onClose={handleCloseReplay} onError={handleError} />}
+    {sessionActionRequest && <SessionActionDialog request={sessionActionRequest} targets={sessionActionTargets} onRun={runSessionAction} onUndoRemove={undoBoardRemoval} onClose={handleCloseSessionAction} />}
+    {paletteOpen && <CommandPalette sessions={paletteSessions} selectedTitle={currentThread ? threadTitle(currentThread) : null}
+      canStop={currentRunning} canArchive={Boolean(currentThread && currentThread.archiveState !== "archived")} theme={resolvedTheme} modifierLabel={modifierLabel}
+      onClose={handleClosePalette} onNew={handleNew} onSelectSession={handleSelect} onStop={handleStopCurrent} onArchive={handleArchiveCurrent}
+      onNavigate={handleView} onNavigateRelative={handleNavigateRelative} onToggleTheme={handleToggleTheme} />}
+    {pending.length > 0 && <ApprovalTray requests={pending} onResolved={resolvePending} onError={handleError} />}
+    <NotificationCenter entries={notifications.entries} open={notifications.open} onClose={notifications.closeCenter} onFocus={notifications.focusNotification} onDismiss={notifications.dismiss} onClear={notifications.clear} />
+    <NotificationToasts entries={notifications.toasts} onFocus={notifications.focusNotification} onDismiss={notifications.dismissToast} />
+    <ErrorCenter entries={errors} open={errorsOpen} sessionNames={sessionNames} onOpen={() => setErrorsOpen(true)} onClose={() => setErrorsOpen(false)} onDismiss={dismissError} onClear={clearErrors} onRetry={handleRetryError} />
+    {toast && <div className="toast" role="status"><ShieldCheck size={17} />{toast}<button onClick={handleDismissToast} aria-label="Dismiss notification"><X size={15} /></button></div>}
+  </div>;
+}
 
-  const addControl = (id: string) => {
-    const nextDismissed = withoutSetValue(dismissedControlIdsRef.current, id);
-    dismissedControlIdsRef.current = nextDismissed;
-    setDismissedControlIds(nextDismissed);
-    setControlIds((current) => current.includes(id) ? current : [...current, id]);
-    setCompletionTimes((times) => omitKey(times, id));
+type ThreadRecoveryResponse = {
+  revision: number;
+  threadId: string;
+  state: LiveThreadState | null;
+  queue: QueueEntry[];
+  active: boolean;
+};
+
+async function readThreadRecoverySnapshot(threadIds: readonly string[], signal?: AbortSignal): Promise<LiveRecoverySnapshot> {
+  if (!threadIds.length) {
+    const { revision } = await api<{ revision: number }>("/api/events/revision", { signal });
+    return { revision, threadRevisions: {}, data: {}, queues: {}, activeThreadIds: [] };
+  }
+  const responses = await mapWithConcurrency(threadIds, 8, (threadId) => api<ThreadRecoveryResponse>(
+    `/api/threads/${encodeURIComponent(threadId)}/recovery`,
+    { signal }
+  ));
+  const threadRevisions: Record<string, number> = {};
+  const data: Record<string, LiveThreadState> = {};
+  const queues: Record<string, QueueEntry[]> = {};
+  const activeThreadIds: string[] = [];
+  for (const response of responses) {
+    threadRevisions[response.threadId] = response.revision;
+    if (response.state) data[response.threadId] = response.state;
+    queues[response.threadId] = response.queue;
+    if (response.active) activeThreadIds.push(response.threadId);
+  }
+  return {
+    revision: Math.min(...responses.map((response) => response.revision)),
+    threadRevisions,
+    data,
+    queues,
+    activeThreadIds
   };
+}
 
-  const removeControl = (id: string) => {
-    // Record the dismissal before updating the deck so bootstrap/active-session
-    // discovery cannot race the close and put the panel back.
-    dismissedControlIdsRef.current = new Set(dismissedControlIdsRef.current).add(id);
-    setDismissedControlIds(new Set(dismissedControlIdsRef.current));
-    setControlIds((current) => current.filter((item) => item !== id));
-  };
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  operation: (value: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      results[index] = await operation(values[index]);
+    }
+  }));
+  return results;
+}
 
-  const toggleControl = (id: string) => {
-    if (controlIds.includes(id)) removeControl(id);
-    else addControl(id);
-  };
+function OnboardingOverlay({ onClose, onQuickStart }: { onClose: () => void; onQuickStart: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialogRef.current?.querySelector<HTMLElement>("button")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); onClose(); return; }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>("button:not(:disabled)")];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => { window.removeEventListener("keydown", onKeyDown); previousFocus?.focus(); };
+  }, [onClose]);
 
-  const addSpark = (id: string) => {
-    const nextDismissed = withoutSetValue(dismissedSparkIdsRef.current, id);
-    dismissedSparkIdsRef.current = nextDismissed;
-    setDismissedSparkIds(nextDismissed);
-    setSparkIds((current) => current.includes(id) ? current : [...current, id]);
-    setCompletionTimes((times) => omitKey(times, id));
-  };
-
-  const removeSpark = (id: string) => {
-    dismissedSparkIdsRef.current = new Set(dismissedSparkIdsRef.current).add(id);
-    setDismissedSparkIds(new Set(dismissedSparkIdsRef.current));
-    setSparkIds((current) => current.filter((item) => item !== id));
-  };
-
-  const toggleSpark = (id: string) => {
-    if (sparkIds.includes(id)) removeSpark(id);
-    else addSpark(id);
-  };
-
-  const markCompletionSeen = (id: string) => {
-    setCompletedSignals((current) => withoutSetValue(current, id));
-    const seen = readStoredNumberRecord("forgedeck-completion-seen");
-    seen[id] = Date.now();
-    writeStoredJson("forgedeck-completion-seen", seen);
-  };
-
-  const clearCompleted = (sessionClass: SessionClass) => {
-    const ids = effectiveThreads
-      .filter((thread) => (sessionClass === "spark") === isSparkThread(thread) && completedSignals.has(thread.id) && thread.status.type !== "active")
-      .map((thread) => thread.id);
-    if (!ids.length) return;
-    const completedIds = new Set(ids);
-    const setBoardIds = sessionClass === "spark" ? setSparkIds : setControlIds;
-    setBoardIds((current) => current.filter((id) => !completedIds.has(id)));
-    const dismissedRef = sessionClass === "spark" ? dismissedSparkIdsRef : dismissedControlIdsRef;
-    const setDismissed = sessionClass === "spark" ? setDismissedSparkIds : setDismissedControlIds;
-    const nextDismissed = new Set(dismissedRef.current);
-    for (const id of ids) nextDismissed.add(id);
-    dismissedRef.current = nextDismissed;
-    setDismissed(nextDismissed);
-    setCompletedSignals((current) => {
-      const next = new Set(current);
-      for (const id of ids) next.delete(id);
-      return next;
-    });
-    const seen = readStoredNumberRecord("forgedeck-completion-seen");
-    for (const id of ids) seen[id] = Math.max(Date.now(), completionTimes[id] || 0);
-    writeStoredJson("forgedeck-completion-seen", seen);
-  };
-
-  const updateSettings = (next: { model: string; effort: string }) => {
-    if (!selectedId) return;
-    setSettings((current) => ({ ...current, [selectedId]: next }));
-  };
-
-  const onCreated = async (thread: Thread, model: string, effort: string, sessionClass: SessionClass) => {
-    setSettings((current) => ({ ...current, [thread.id]: { model, effort } }));
-    if (sessionClass === "spark") addSpark(thread.id);
-    else addControl(thread.id);
-    setNewOpen(false);
-    await loadThreads();
-    setSelectedId(thread.id);
-  };
-
-  const logout = async () => {
-    await api("/api/logout", { method: "POST" });
-    setAuthenticated(false);
-    setBootstrap(null);
-  };
-
-  const runUiAction = (action: () => Promise<void>) => {
-    void action().catch((error) => showError(error, setToast));
-  };
-
-  return (
-    <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
-        <div className="brand-row">
-          <Brand />
-          <button className="icon-button mobile-only" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar"><PanelLeftClose size={19} /></button>
-        </div>
-
-        <button className="new-session" onClick={() => { setNewSessionClass("standard"); setNewOpen(true); }}><Plus size={18} /> New session <kbd>N</kbd></button>
-
-        <div className="view-switch" style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
-          <button className={view === "session" ? "active" : ""} onClick={() => { setView("session"); setSidebarOpen(false); }}><MessageSquareText size={14} />{view === "session" ? "Session" : ""}</button>
-          <button className={view === "control" ? "active" : ""} onClick={() => { setView("control"); setSidebarOpen(false); }}><LayoutGrid size={14} />{view === "control" ? "Control center" : ""}<span>{controlThreads.length}</span></button>
-          <button className={view === "spark" ? "active" : ""} style={view === "spark" ? { color: "#f5c451", background: "rgba(245, 196, 81, .1)", boxShadow: "inset 0 0 0 1px rgba(245, 196, 81, .2)" } : undefined} onClick={() => { setView("spark"); setSidebarOpen(false); }}><Sparkles size={14} />{view === "spark" ? "SparkBoard" : ""}<span>{sparkThreads.length}</span></button>
-        </div>
-
-        <UsageCard usage={bootstrap.usage} plan={bootstrap.account.account?.planType} backendStatus={bootstrap.backendStatus} />
-
-        <div className="session-tools">
-          <label className="search-box"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a session…" /></label>
-          <select value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort sessions">
-            <option value="updated">Recent activity</option>
-            <option value="created">Newest created</option>
-            <option value="status">Running first</option>
-            <option value="name">Name</option>
-            <option value="directory">Directory</option>
-          </select>
-        </div>
-
-        <div className="session-heading"><span>Sessions</span><span>{threads.length}</span></div>
-        <nav className="session-list">
-          {sortedThreads.map((thread) => (
-            <SessionCard key={thread.id} thread={thread} selected={view === "session" && thread.id === selectedId} pinned={pinned.has(thread.id)} inBoard={isSparkThread(thread) ? sparkIdSet.has(thread.id) : controlIdSet.has(thread.id)} completed={completedSignals.has(thread.id)}
-              tokens={tokensForThread(thread, tokenUsage[thread.id])} onSelect={() => { setSelectedId(thread.id); setView("session"); markCompletionSeen(thread.id); }} onPin={() => togglePin(thread.id)} onBoard={() => isSparkThread(thread) ? toggleSpark(thread.id) : toggleControl(thread.id)} />
-          ))}
-          {!sortedThreads.length && <div className="empty-list"><MessageSquareText size={20} /><span>No sessions found</span></div>}
-        </nav>
-
-        <div className="account-row">
-          <div className="avatar">{initials(bootstrap.account.account?.email || "Codex")}</div>
-          <div><strong>{bootstrap.account.account?.email || "Local Codex"}</strong><span>{formatPlan(bootstrap.account.account?.planType)} plan</span></div>
-          <button className="icon-button" onClick={() => runUiAction(logout)} title="Log out of ForgeDeck"><LogOut size={17} /></button>
-        </div>
-      </aside>
-      {sidebarOpen && <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />}
-
-      <main className="main-panel">
-        <header className="topbar">
-          <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar"><Menu size={20} /></button>
-          {view === "control" ? <BoardHeader variant="control" count={controlThreads.length} activeCount={controlThreads.filter((thread) => thread.status.type === "active").length} /> : view === "spark" ? <BoardHeader variant="spark" count={sparkThreads.length} activeCount={sparkThreads.filter((thread) => thread.status.type === "active").length} /> : effectiveDetail ? <ThreadHeader thread={effectiveDetail} pinned={pinned.has(effectiveDetail.id)} onPin={() => togglePin(effectiveDetail.id)}
-            onRename={() => runUiAction(async () => {
-              const name = prompt("Session name", threadTitle(effectiveDetail));
-              if (!name?.trim()) return;
-              await api(`/api/threads/${effectiveDetail.id}`, { method: "PATCH", body: JSON.stringify({ name }) });
-              await Promise.all([loadThread(effectiveDetail.id), loadThreads()]);
-            })}
-            onOrganize={() => runUiAction(async () => {
-              const category = window.prompt("Session category (blank clears it)", effectiveDetail.category || "");
-              if (category === null) return;
-              const tags = window.prompt("Tags, separated by commas (blank clears them)", (effectiveDetail.tags || []).join(", "));
-              if (tags === null) return;
-              await api(`/api/threads/${effectiveDetail.id}`, {
-                method: "PATCH",
-                body: JSON.stringify({ category, tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean) })
-              });
-              await Promise.all([loadThread(effectiveDetail.id), loadThreads()]);
-            })}
-            onArchive={() => runUiAction(async () => {
-              if (!confirm("Archive this session? Its Codex history will be kept.")) return;
-              const archivedId = effectiveDetail.id;
-              const nextId = sortedThreads.find((thread) => thread.id !== archivedId)?.id || null;
-              removedThreadIdsRef.current.add(archivedId);
-              listRequestSequence.current += 1;
-              setThreads((current) => current.filter((thread) => thread.id !== archivedId));
-              setControlIds((current) => current.filter((id) => id !== archivedId));
-              setSparkIds((current) => current.filter((id) => id !== archivedId));
-              setSelectedId(nextId);
-              setDetail(null);
-              try {
-                await api(`/api/threads/${archivedId}`, { method: "DELETE" });
-                await loadThreads();
-              } catch (error) {
-                removedThreadIdsRef.current.delete(archivedId);
-                await loadThreads().catch(() => undefined);
-                showError(error, setToast);
-              }
-            })} /> : <div className="topbar-placeholder">Session workspace</div>}
-          <AppPreferences pollInterval={pollInterval} onPollInterval={setPollInterval} theme={theme} onTheme={() => setTheme((current) => current === "dark" ? "light" : "dark")} />
-          <div className={`runtime-pill ${runtime}`}><span />{runtime === "ready" ? "Runtime online" : "Reconnecting"}</div>
-        </header>
-
-        {view === "control" ? (
-          <ControlCenter threads={controlThreads} allThreads={allStandardThreads} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || EMPTY_CLAUDE_MODELS} settings={settings} defaultModel={defaultModel}
-            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} queues={queues} activityVersion={activityVersion}
-            tokenUsage={tokenUsage} pollInterval={controlThreads.some(isClaudeThread) ? CLAUDE_LIVE_POLL_MS : runtime === "ready" ? 0 : pollInterval}
-            onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
-            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={removeControl}
-            onAdd={addControl} onClearCompleted={() => clearCompleted("standard")}
-            onError={(error) => showError(error, setToast)} />
-        ) : view === "spark" ? (
-          <SparkBoard threads={sparkThreads} allThreads={allSparkThreads} models={bootstrap.models.data} claudeModels={EMPTY_CLAUDE_MODELS} settings={settings} defaultModel={defaultModel}
-            liveText={liveText} liveToolOutput={liveToolOutput} liveItems={liveItems} queues={queues} activityVersion={activityVersion}
-            tokenUsage={tokenUsage} pollInterval={runtime === "ready" ? 0 : pollInterval}
-            onSettings={(threadId, next) => setSettings((current) => ({ ...current, [threadId]: next }))}
-            completedSignals={completedSignals} onOpen={(id) => { setSelectedId(id); setView("session"); markCompletionSeen(id); }} onRemove={removeSpark}
-            onAdd={addSpark} onClearCompleted={() => clearCompleted("spark")} onLaunch={() => { setNewSessionClass("spark"); setNewOpen(true); }}
-            onError={(error) => showError(error, setToast)} />
-        ) : effectiveDetail ? (
-          <Chat key={effectiveDetail.id} thread={effectiveDetail} loading={loadingDetail} liveText={liveText[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveToolOutput={liveToolOutput[effectiveDetail.id] || EMPTY_TEXT_STREAM} liveItems={liveItems[effectiveDetail.id] || EMPTY_LIVE_ITEMS} queue={queues[effectiveDetail.id] || EMPTY_QUEUE} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || EMPTY_CLAUDE_MODELS}
-            settings={activeSettings!} onSettings={updateSettings} onRefresh={() => loadThread(effectiveDetail.id)} onError={(error) => showError(error, setToast)} />
-        ) : (
-          <Welcome onNew={() => { setNewSessionClass("standard"); setNewOpen(true); }} />
-        )}
-      </main>
-
-      {newOpen && <NewSessionModal bootstrap={bootstrap} sessionClass={newSessionClass} onClose={() => setNewOpen(false)} onCreated={onCreated} onError={(error) => showError(error, setToast)} />}
-      {pending.length > 0 && <ApprovalTray requests={pending} onResolved={(id) => setPending((items) => items.filter((item) => String(item.id) !== String(id)))} onError={(error) => showError(error, setToast)} />}
-      {toast && <div className="toast"><ShieldCheck size={17} />{toast}<button onClick={() => setToast(null)}><X size={15} /></button></div>}
+  return <div className="modal-backdrop onboarding-backdrop">
+    <div ref={dialogRef} className="onboarding-dialog" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-description">
+      <button type="button" className="icon-button onboarding-close" onClick={onClose} aria-label="Dismiss welcome guide"><X size={18} /></button>
+      <div className="onboarding-mark"><div className="brand-mark large"><span /><span /><span /></div></div>
+      <span className="eyebrow">First run</span>
+      <h1 id="onboarding-title">Get a session running</h1>
+      <p id="onboarding-description">Three steps: pick a workspace, choose a model, then launch. Sessions keep working on this machine even if you close the browser.</p>
+      <div className="onboarding-steps">
+        <article><span>1</span><div><strong>Workspace</strong><small>The project directory the agent can work in.</small></div></article>
+        <article><span>2</span><div><strong>Model</strong><small>Start with the recommended defaults; ForgeDeck remembers them.</small></div></article>
+        <article><span>3</span><div><strong>Task</strong><small>Launch now, or open an empty session and type later.</small></div></article>
+      </div>
+      <div className="onboarding-template"><BookOpen size={18} /><div><strong>Quick-start: workspace tour</strong><span>Read-only tour of the project with suggested next tasks.</span></div></div>
+      <div className="onboarding-actions"><button type="button" className="secondary-button" onClick={onClose}>Skip</button><button type="button" className="primary-button" onClick={onQuickStart}><Sparkles size={16} />Use quick-start</button></div>
     </div>
-  );
+  </div>;
 }
 
-function Brand() {
-  return <div className="brand"><div className="brand-mark"><span /><span /><span /></div><div><strong>ForgeDeck</strong><small>CODEX COMMAND</small></div></div>;
-}
-
-function Splash({ label = "Warming up ForgeDeck…" }: { label?: string }) {
-  return <div className="splash"><Brand /><LoaderCircle className="spin" size={22} /><span>{label}</span></div>;
-}
+function Splash({ label = "Warming up ForgeDeck…" }: { label?: string }) { return <div className="splash"><Brand /><LoaderCircle className="spin" size={22} /><span>{label}</span></div>; }
 
 function Login({ onSuccess }: { onSuccess: () => void }) {
-  const [token, setToken] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const submit = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); setError("");
-    try {
-      await api("/api/login", { method: "POST", body: JSON.stringify({ token }), allowUnauthenticated: true });
-      onSuccess();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally { setBusy(false); }
-  };
-  return <div className="login-page">
-    <div className="login-glow" />
-    <form className="login-card" onSubmit={submit}>
-      <Brand />
-      <div className="login-icon"><KeyRound size={25} /></div>
-      <h1>Enter the command deck</h1>
-      <p>Use the access key shown when ForgeDeck started, or from <code>.data/access-token</code> on the host.</p>
-      <label>Access key<input autoFocus type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="Paste your private access key" /></label>
-      {error && <div className="form-error">{error}</div>}
-      <button className="primary-button" disabled={busy || !token}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowLeft className="enter-arrow" size={17} />}Enter ForgeDeck</button>
-      <div className="private-note"><ShieldCheck size={15} />Your Codex credentials never pass through the browser.</div>
-    </form>
-  </div>;
+  const [token, setToken] = useState(""); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(""); try { await api("/api/login", { method: "POST", body: JSON.stringify({ token }), allowUnauthenticated: true }); onSuccess(); } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); } finally { setBusy(false); } };
+  return <div className="login-page"><div className="login-glow" /><form className="login-card" onSubmit={submit}><Brand /><div className="login-icon"><KeyRound size={25} /></div><h1>Unlock ForgeDeck</h1><p>Paste the access key from startup output, or from <code>.data/access-token</code> on this host.</p><label>Access key<input autoFocus type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="Access key" /></label>{error && <div className="form-error" role="alert">{error}</div>}<button className="primary-button" disabled={busy || !token}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowLeft className="enter-arrow" size={17} />}Continue</button><div className="private-note"><ShieldCheck size={15} />Provider credentials stay on the host — never in the browser.</div></form></div>;
 }
 
-type ProviderUsageRowProps = { icon: ReactNode; name: string; color: string; available: boolean; percent?: number | null; subscription?: boolean };
-
-function ProviderUsageRow({ icon, name, color, available, percent = null, subscription = false }: ProviderUsageRowProps) {
-  const statusColor = available ? color : "#737b87";
-  return <div style={{ display: "grid", gridTemplateColumns: "16px 43px minmax(0, 1fr)", alignItems: "center", gap: 7, minHeight: 18 }}>
-    <span style={{ display: "grid", placeItems: "center", color: statusColor }}>{icon}</span>
-    <strong style={{ color: available ? "var(--text)" : statusColor, fontSize: 11 }}>{name}</strong>
-    {!available ? <span style={{ color: statusColor, fontSize: 10, textAlign: "right" }}>Unavailable</span> : subscription ?
-      <span title="Subscription-based" style={{ color, fontSize: 10, fontWeight: 700, textAlign: "right" }}>Active</span> :
-      <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span style={{ width: 30, color, fontSize: 10, fontWeight: 700, textAlign: "right" }}>{percent === null ? "—" : `${Math.round(percent)}%`}</span>
-        <span style={{ flex: 1, height: 5, overflow: "hidden", borderRadius: 999, background: "rgba(127, 136, 148, .24)" }}>
-          <span style={{ display: "block", width: `${percent ?? 0}%`, height: "100%", borderRadius: "inherit", background: color }} />
-        </span>
-      </span>}
-  </div>;
+function AppPreferences({ pollInterval, theme, modifierLabel, onPollInterval, onCommands, onTheme }: {
+  pollInterval: number;
+  theme: ThemeMode;
+  modifierLabel: string;
+  onPollInterval: (value: number) => void;
+  onCommands: () => void;
+  onTheme: (value: ThemeMode) => void;
+}) {
+  const ThemeIcon = theme === "system" ? Monitor : theme === "light" ? Sun : Moon;
+  return <div className="app-preferences"><button type="button" className="command-palette-trigger" onClick={onCommands} aria-label="Open command palette" aria-keyshortcuts="Meta+K Control+K" title={`Open command palette (${modifierLabel}K)`}><CommandIcon size={14} /><kbd>{modifierLabel}K</kbd></button><label className="poll-setting"><RefreshCw size={14} /><select value={pollInterval} onChange={(event) => onPollInterval(Number(event.target.value))} aria-label="Polling fallback interval"><option value={0}>Auto fallback</option><option value={2000}>Fallback 2s</option><option value={4000}>Fallback 4s</option><option value={10000}>Fallback 10s</option><option value={30000}>Fallback 30s</option></select></label><label className="theme-setting"><ThemeIcon size={15} /><select value={theme} onChange={(event) => onTheme(event.target.value as ThemeMode)} aria-label="Color theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>;
 }
 
-function UsageCard({ usage, plan, backendStatus }: { usage: Usage | null; plan?: string; backendStatus?: Bootstrap["backendStatus"] }) {
-  const legacyCodex = usage?.rateLimitsByLimitId?.codex || usage?.rateLimits;
-  const clampPercent = (value?: number) => value === undefined ? null : Math.min(100, Math.max(0, value));
-  const codexPercent = clampPercent(backendStatus?.codex.rateLimit?.primary?.usedPercent ?? legacyCodex?.primary?.usedPercent);
-  const sparkPercent = clampPercent(backendStatus?.spark.rateLimit?.primary?.usedPercent);
-  const claudePercent = clampPercent(backendStatus?.claude.rateLimit?.primary?.usedPercent);
-  const codexAvailable = backendStatus?.codex.available ?? Boolean(legacyCodex?.primary);
-  return <section className="usage-card">
-    <div className="usage-top"><span><Gauge size={15} /> Usage</span><strong>{formatPlan(plan)}</strong></div>
-    <div style={{ display: "grid", gap: 9 }}>
-      <ProviderUsageRow icon={<Bot size={14} />} name="Codex" color="#6e9dff" available={codexAvailable} percent={codexPercent} />
-      <ProviderUsageRow icon={<Sparkles size={14} />} name="Spark" color="#f5c451" available={backendStatus?.spark.available ?? false} percent={sparkPercent} />
-      <ProviderUsageRow icon={<BrainCircuit size={14} />} name="Claude" color="#cf75ff" available={backendStatus?.claude.available ?? false} percent={claudePercent} />
-    </div>
-  </section>;
-}
-
-type SessionCardProps = { thread: Thread; selected: boolean; pinned: boolean; inBoard: boolean; completed: boolean; tokens: number | null; onSelect: () => void; onPin: () => void; onBoard: () => void };
-
-const SessionCard = memo(function SessionCard({ thread, selected, pinned, inBoard, completed, tokens, onSelect, onPin, onBoard }: SessionCardProps) {
-  const state = sessionVisualState(thread, completed);
-  const running = state === "running";
-  const spark = isSparkThread(thread);
-  const claude = isClaudeThread(thread);
-  return <button className={`session-card state-${state} ${selected ? "selected" : ""}`} style={spark ? { boxShadow: "inset 2px 0 rgba(245, 196, 81, .55)" } : claude ? { boxShadow: "inset 2px 0 rgba(201, 105, 255, .5)" } : undefined} onClick={onSelect}>
-    <span className={`status-dot ${state === "running" ? "active" : state}`} />
-    <span className="session-copy">
-      <span className="session-title-row"><ThreadProviderIcon thread={thread} size={11} /><strong>{threadTitle(thread)}</strong>{(spark || claude) && <em style={providerBadgeStyle(thread)}>{spark ? "Spark" : "Claude"}</em>}<em className={`session-state ${state}`}>{sessionStateLabel(state)}</em></span>
-      <small><Folder size={12} />{basename(thread.cwd)}<i>·</i>{timeAgo(thread.updatedAt)}</small>
-      {(thread.category || thread.tags?.length) && <span className="session-labels">{thread.category && <b>{thread.category}</b>}{thread.tags?.slice(0, 2).map((tag) => <i key={tag}>{tag}</i>)}</span>}
-      <span className="session-metrics"><span><Clock3 size={11} />{formatDuration(threadDurationSeconds(thread))}</span><span><Gauge size={11} />{tokens === null ? "— tokens" : `${formatTokenCount(tokens)} tokens`}</span></span>
-    </span>
-    <span className="session-actions" onClick={(event) => event.stopPropagation()}>
-      {running && <LoaderCircle className="spin running-icon" size={14} />}
-      <span role="button" tabIndex={0} onClick={onBoard} title={inBoard ? `Remove from ${spark ? "SparkBoard" : "Control Center"}` : `Add to ${spark ? "SparkBoard" : "Control Center"}`}>{spark ? <Sparkles size={14} style={inBoard ? { color: "#f5c451" } : undefined} /> : <LayoutGrid size={14} className={inBoard ? "control-active" : ""} />}</span>
-      <span role="button" tabIndex={0} onClick={onPin} title={pinned ? "Unpin" : "Pin"}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</span>
-    </span>
-  </button>;
-}, (previous, next) => previous.thread === next.thread
-  && previous.selected === next.selected
-  && previous.pinned === next.pinned
-  && previous.inBoard === next.inBoard
-  && previous.completed === next.completed
-  && previous.tokens === next.tokens);
-
-function AppPreferences({ pollInterval, onPollInterval, theme, onTheme }: { pollInterval: number; onPollInterval: (value: number) => void; theme: ThemeMode; onTheme: () => void }) {
-  return <div className="app-preferences">
-    <label className="poll-setting" title="Polling fallback interval (live events remain enabled)">
-      <RefreshCw size={14} />
-      <select value={pollInterval} onChange={(event) => onPollInterval(Number(event.target.value))} aria-label="Auto-refresh interval">
-        <option value={0}>Live only</option>
-        <option value={2000}>Refresh 2s</option>
-        <option value={4000}>Refresh 4s</option>
-        <option value={10000}>Refresh 10s</option>
-        <option value={30000}>Refresh 30s</option>
-      </select>
-    </label>
-    <button className="icon-button theme-toggle" onClick={onTheme} title={`Use ${theme === "dark" ? "light" : "dark"} theme`} aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}>
-      {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
-    </button>
-  </div>;
-}
-
-function ThreadHeader({ thread, pinned, onPin, onRename, onOrganize, onArchive }: { thread: Thread; pinned: boolean; onPin: () => void; onRename: () => void; onOrganize: () => void; onArchive: () => void }) {
-  return <div className="thread-header">
-    <div className="thread-title"><div className="thread-icon" style={providerIconContainerStyle(thread)}><ThreadProviderIcon thread={thread} size={18} /></div><div><strong>{threadTitle(thread)}</strong><span><FolderOpen size={13} />{thread.cwd}{thread.gitInfo?.branch && <><i>·</i><GitBranch size={12} />{thread.gitInfo.branch}</>}{thread.category && <><i>·</i><b>{thread.category}</b></>}{thread.tags?.map((tag) => <em key={tag}>#{tag}</em>)}</span></div></div>
-    <div className="header-actions"><button className="icon-button" onClick={onPin} title={pinned ? "Unpin" : "Pin"}>{pinned ? <PinOff size={17} /> : <Pin size={17} />}</button><button className="icon-button" onClick={onOrganize} title="Edit category and tags"><Tags size={17} /></button><button className="icon-button" onClick={onRename} title="Rename"><Settings2 size={17} /></button><button className="icon-button" onClick={onArchive} title="Archive"><Archive size={17} /></button></div>
-  </div>;
-}
-
-function BoardHeader({ variant, count, activeCount }: { variant: BoardVariant; count: number; activeCount: number }) {
-  const spark = variant === "spark";
-  return <div className="control-header">
-    <div className="control-header-icon" style={spark ? { color: "#f5c451", background: "rgba(245, 196, 81, .09)", borderColor: "rgba(245, 196, 81, .22)" } : undefined}>{spark ? <Sparkles size={18} /> : <LayoutGrid size={18} />}</div>
-    <div><strong>{spark ? "SparkBoard" : "Control Center"}</strong><span>{count} session{count === 1 ? "" : "s"} on deck <i>·</i> <b style={spark ? { color: "#f5c451" } : undefined}>{activeCount} active now</b></span></div>
-  </div>;
-}
-
-type ControlCenterProps = {
-  threads: Thread[]; allThreads: Thread[]; models: CodexModel[]; claudeModels: ClaudeModelOption[]; settings: ThreadSettings; defaultModel?: CodexModel;
-  liveText: LiveStreams; liveToolOutput: LiveStreams; liveItems: LiveItems; queues: Record<string, QueueEntry[]>; completedSignals: Set<string>; tokenUsage: Record<string, ThreadTokenUsage>; activityVersion: number; pollInterval: number;
-  onSettings: (threadId: string, value: { model: string; effort: string }) => void;
-  onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onAdd: (threadId: string) => void; onClearCompleted: () => void; onError: (error: unknown) => void;
-  onLaunch?: () => void;
-};
-
-type SessionBoardProps = ControlCenterProps & { variant: BoardVariant };
-
-const SessionBoard = memo(function SessionBoard({ variant, threads, allThreads, models, claudeModels, settings, defaultModel, liveText, liveToolOutput, liveItems, queues, completedSignals, tokenUsage, activityVersion, pollInterval, onSettings, onOpen, onRemove, onAdd, onClearCompleted, onLaunch, onError }: SessionBoardProps) {
-  const spark = variant === "spark";
-  const columns = useControlColumns();
-  const pageSize = columns * 2;
-  const [page, setPage] = useState(0);
-  const [details, setDetails] = useState<Record<string, Thread>>({});
-  const [reload, setReload] = useState(0);
-  const errorRef = useRef(onError);
-  const refreshSequence = useRef(0);
-  const pageCount = Math.max(1, Math.ceil(threads.length / pageSize));
-  const pageThreads = useMemo(() => threads.slice(page * pageSize, page * pageSize + pageSize), [page, pageSize, threads]);
-  const idsKey = pageThreads.map((thread) => thread.id).join(",");
-  const pageThreadIds = useMemo(() => pageThreads.map((thread) => thread.id), [pageThreads]);
-  const available = useMemo(() => {
-    const shownIds = new Set(threads.map((thread) => thread.id));
-    return allThreads.filter((thread) => !shownIds.has(thread.id));
-  }, [allThreads, threads]);
-  const completedCount = useMemo(() => allThreads.filter((thread) => completedSignals.has(thread.id) && thread.status.type !== "active").length, [allThreads, completedSignals]);
-
-  useEffect(() => { errorRef.current = onError; }, [onError]);
-  useEffect(() => { if (page >= pageCount) setPage(pageCount - 1); }, [page, pageCount]);
-
-  const refresh = useCallback(async () => {
-    if (!pageThreadIds.length) return;
-    const requestId = ++refreshSequence.current;
-    const response = await api<{ results: Array<{ threadId: string; ok: boolean; value?: Thread }> }>("/api/threads/batch", {
-      method: "POST",
-      body: JSON.stringify({ operation: "read", threadIds: pageThreadIds })
-    });
-    if (requestId !== refreshSequence.current) return;
-    setDetails((current) => {
-      let next = current;
-      for (const snapshot of response.results) {
-        if (!snapshot.ok || !snapshot.value || sameThreadSnapshot(current[snapshot.value.id], snapshot.value)) continue;
-        if (next === current) next = { ...current };
-        next[snapshot.value.id] = snapshot.value;
-      }
-      return next;
-    });
-  // idsKey intentionally represents the current page's stable set of threads.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idsKey]);
-
-  useEffect(() => { void refresh().catch((error) => errorRef.current(error)); }, [refresh, activityVersion, reload]);
+function ConnectionStatus({ transport, backendHealth, lastSyncedAt, nextReconnectAt, pollInterval, onReconnect }: {
+  transport: TransportState;
+  backendHealth: BackendHealth;
+  lastSyncedAt: number | null;
+  nextReconnectAt: number | null;
+  pollInterval: number;
+  onReconnect: () => void;
+}) {
+  const [now, setNow] = useState(Date.now);
   useEffect(() => {
-    if (pollInterval === 0) return;
-    const timer = window.setInterval(() => void refresh().catch(() => undefined), pollInterval);
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => clearInterval(timer);
-  }, [refresh, pollInterval]);
-
-  const visibleColumns = Math.max(1, Math.min(columns, pageThreads.length));
-  const visibleRows = Math.max(1, Math.ceil(pageThreads.length / visibleColumns));
-  const displayThreads = useMemo(() => pageThreads.map((summary) => {
-    const snapshot = details[summary.id];
-    if (!snapshot) return summary;
-    if (isClaudeThread(snapshot)) return snapshot;
-    return sameThreadStatus(snapshot.status, summary.status) ? snapshot : { ...snapshot, status: summary.status };
-  }), [details, pageThreads]);
-  const requestRefresh = useCallback(() => setReload((value) => value + 1), []);
-
-  return <section className="control-center" data-board={variant}>
-    <div className="control-toolbar">
-      <div><span className="live-beacon"><i />LIVE</span><p>Agent messages stream live. Completed panels close after 15 minutes.</p></div>
-      <div className="control-toolbar-actions">
-        <button className="clear-completed" onClick={onClearCompleted} disabled={completedCount === 0} title="Remove completed panels and acknowledge their notifications"><Trash2 size={13} /><span>Clear completed</span>{completedCount > 0 && <b>{completedCount}</b>}</button>
-        {spark && onLaunch && <button className="clear-completed" style={{ color: "#f5c451", borderColor: "rgba(245, 196, 81, .28)", background: "rgba(245, 196, 81, .07)" }} onClick={onLaunch}><Sparkles size={13} /><span>Launch Spark session</span></button>}
-        {!spark && available.length > 0 && <label className="add-panel"><Plus size={14} /><select value="" onChange={(event) => { if (event.target.value) onAdd(event.target.value); }}><option value="">Add session</option>{available.map((thread) => <option key={thread.id} value={thread.id}>{threadTitle(thread)}</option>)}</select></label>}
-        <button className="icon-button" onClick={requestRefresh} title="Refresh panels"><RefreshCw size={16} /></button>
-      </div>
-    </div>
-
-    {pageThreads.length ? <div className="control-grid" style={{ "--control-columns": visibleColumns, "--control-rows": visibleRows } as React.CSSProperties}>
-      {displayThreads.map((thread) => {
-        const threadSettings = settings[thread.id] || defaultSettingsForThread(thread, models, claudeModels, defaultModel);
-        return <ControlCard key={thread.id} thread={thread} variant={variant} models={models} claudeModels={claudeModels} settings={threadSettings}
-          liveText={liveText[thread.id] || EMPTY_TEXT_STREAM} liveToolOutput={liveToolOutput[thread.id] || EMPTY_TEXT_STREAM} liveItems={liveItems[thread.id] || EMPTY_LIVE_ITEMS} queue={queues[thread.id] || EMPTY_QUEUE} completed={completedSignals.has(thread.id)}
-          tokens={tokensForThread(thread, tokenUsage[thread.id])}
-          onSettings={onSettings} onOpen={onOpen} onRemove={onRemove}
-          onRefresh={requestRefresh} onError={onError} />;
-      })}
-    </div> : spark ? <div className="control-empty"><Sparkles size={32} color="#f5c451" /><span style={{ marginTop: 14, color: "#8d762d", fontSize: 8, fontWeight: 700, letterSpacing: 1.2, textTransform: "uppercase" }}>No spark sessions</span><h2>SparkBoard — Quick task fleet</h2><p>Launch a spark session for fast, lightweight tasks.</p>{onLaunch && <button className="primary-button" style={{ marginTop: 18, background: "#b88919", borderColor: "#d5ad3f" }} onClick={onLaunch}><Sparkles size={16} />Launch Spark session</button>}</div> : <div className="control-empty"><LayoutGrid size={28} /><h2>No sessions on deck</h2><p>Create a session or add one from the session list to start your Control Center.</p></div>}
-
-    {pageCount > 1 && <div className="control-pages"><button disabled={page === 0} onClick={() => setPage((value) => value - 1)}><ArrowLeft size={14} />Previous</button><span>Page {page + 1} of {pageCount} · {columns} across × 2 rows</span><button disabled={page >= pageCount - 1} onClick={() => setPage((value) => value + 1)}>Next<ChevronRight size={14} /></button></div>}
-  </section>;
-}, (previous, next) => previous.variant === next.variant
-  && previous.threads === next.threads
-  && previous.allThreads === next.allThreads
-  && previous.models === next.models
-  && previous.claudeModels === next.claudeModels
-  && previous.settings === next.settings
-  && previous.defaultModel === next.defaultModel
-  && previous.liveText === next.liveText
-  && previous.liveToolOutput === next.liveToolOutput
-  && previous.liveItems === next.liveItems
-  && previous.queues === next.queues
-  && previous.completedSignals === next.completedSignals
-  && previous.tokenUsage === next.tokenUsage
-  && previous.activityVersion === next.activityVersion
-  && previous.pollInterval === next.pollInterval);
-
-const ControlCenter = memo(function ControlCenter(props: ControlCenterProps) {
-  return <SessionBoard {...props} variant="control" />;
-});
-
-const SparkBoard = memo(function SparkBoard(props: ControlCenterProps) {
-  return <SessionBoard {...props} variant="spark" />;
-});
-
-type ControlCardProps = {
-  thread: Thread; variant: BoardVariant; models: CodexModel[]; claudeModels: ClaudeModelOption[]; settings: { model: string; effort: string };
-  liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; completed: boolean; tokens: number | null;
-  onSettings: (threadId: string, value: { model: string; effort: string }) => void; onOpen: (threadId: string) => void; onRemove: (threadId: string) => void; onRefresh: () => void; onError: (error: unknown) => void;
-};
-
-const ControlCard = memo(function ControlCard({ thread, variant, models, claudeModels, settings, liveText, liveToolOutput, liveItems, queue, completed, tokens, onSettings, onOpen, onRemove, onRefresh, onError }: ControlCardProps) {
-  const [text, setText] = useState("");
-  const [sending, setSending] = useState(false);
-  const assist = useComposerAssist(text, setText, thread.cwd);
-  const body = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
-  const claude = isClaudeThread(thread);
-  const spark = variant === "spark" || isSparkThread(thread);
-  const model = models.find((item) => item.model === settings.model) || models[0];
-  const runningTurn = useMemo(() => [...(thread.turns || [])].reverse().find((turn) => turn.status === "inProgress"), [thread.turns]);
-  const historyItems = useMemo(() => (thread.turns || []).flatMap((turn) => turn.items), [thread.turns]);
-  const historyIds = useMemo(() => new Set(historyItems.map((item) => item.id).filter(Boolean)), [historyItems]);
-  const streamingText = useMemo(() => Object.entries(liveText).filter(([id]) => !historyIds.has(id)), [historyIds, liveText]);
-  const allItems = useMemo(() => [...historyItems, ...unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
-    !(item.type === "agentMessage" && item.id && liveText[item.id])
-  )], [historyItems, liveItems, liveText]);
-  const items = useMemo(() => selectControlItems(allItems, 12), [allItems]);
-  const toolCount = useMemo(() => items.filter((item) => isToolItem(item)).length, [items]);
-  const running = thread.status.type === "active" || Boolean(runningTurn);
-  const state = running ? "running" : sessionVisualState(thread, completed);
-  const successfullyCompleted = state === "completed";
-
-  const onFeedScroll = useCallback(() => {
-    const element = body.current;
-    if (element) stickToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 40;
   }, []);
-  useEffect(() => {
-    if (!stickToBottom.current) return;
-    const frame = requestAnimationFrame(() => {
-      const element = body.current;
-      if (element) element.scrollTop = element.scrollHeight;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [items, liveToolOutput, streamingText]);
+  const interval = pollInterval > 0 ? pollInterval : 10_000;
+  const primary = transport === "live" ? "Live"
+    : transport === "polling" ? `Polling every ${formatInterval(interval)}`
+      : transport === "offline" ? "Offline" : "Reconnecting";
+  const lastSync = lastSyncedAt === null ? "Not synced yet" : `Last synced ${Math.max(0, Math.floor((now - lastSyncedAt) / 1_000))} seconds ago`;
+  const backend = backendHealth === "unknown" ? "Backend health unknown" : `Backend ${backendHealth}`;
+  const retry = nextReconnectAt === null ? "" : ` Automatic retry in ${Math.max(0, Math.ceil((nextReconnectAt - now) / 1_000))} seconds.`;
+  return <div className={`connection-status ${transport}`} title={`${primary}. ${lastSync}. ${backend}.${retry}`}>
+    <span className="sr-only" role="status" aria-atomic="true">{primary}. {backend}.</span>
+    <i className="connection-dot" aria-hidden="true" />
+    <span className="connection-copy" aria-hidden="true"><span><b>{primary}</b>{backendHealth !== "ready" && backendHealth !== "unknown" && <em>{backend}</em>}</span><small>{lastSync}</small></span>
+    {transport !== "live" && <button type="button" onClick={onReconnect} disabled={transport === "reconnecting" && nextReconnectAt === null} aria-label="Reconnect live stream now" title="Reconnect live stream now"><RefreshCw size={13} /></button>}
+  </div>;
+}
 
-  const send = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!text.trim() || sending) return;
-    const outgoing = text.trim(); setText(""); setSending(true);
-    try {
-      const slash = parseSlashCommand(outgoing);
-      if (slash?.command === "mention") {
-        setText("@");
-      } else if (slash) {
-        if (!await executeSlashCommand(thread, slash)) { setText(outgoing); return; }
-      } else {
-        await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
-      }
-      onRefresh();
-    } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
-  };
+function formatInterval(interval: number): string {
+  return interval % 1_000 === 0 ? `${interval / 1_000}s` : `${(interval / 1_000).toFixed(1)}s`;
+}
 
-  const changeModel = (modelId: string) => {
-    if (claude || spark) return;
-    const next = models.find((item) => item.model === modelId);
-    if (next) onSettings(thread.id, { model: next.model, effort: next.defaultReasoningEffort });
-  };
+function backendHealthFromStatus(status: Record<string, unknown> | undefined): BackendHealth {
+  if (!status) return "unknown";
+  if (status.available === true || status.state === "ready") return "ready";
+  if (status.state === "error") return "error";
+  if (status.available === false || ["offline", "connecting", "stopping", "stopped"].includes(String(status.state))) return "offline";
+  return "unknown";
+}
 
-  const effortOptions = claude ? CLAUDE_EFFORTS : spark ? ["high"] : model?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
-
-  return <article className={`control-card state-${state} ${running ? "running" : ""} ${successfullyCompleted ? "completed" : ""}`} style={controlCardAccentStyle(thread, variant)}>
-    <header>
-      <button className="control-title" onClick={() => onOpen(thread.id)}><span className={`status-dot ${state === "running" ? "active" : state}`} /><span><strong style={{ display: "flex", alignItems: "center", gap: 4 }}><ThreadProviderIcon thread={thread} size={11} /><span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{threadTitle(thread)}</span></strong><small><Folder size={11} />{basename(thread.cwd)}</small></span></button>
-      <div className="control-card-actions"><span className={`done-label ${state}`}><b style={{ color: providerAccent(thread), font: "inherit" }}>{providerLabel(thread)}</b><i style={{ margin: "0 3px", opacity: .55, fontStyle: "normal" }}>·</i>{sessionStateLabel(state)}</span><PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} compact />{queue.length > 0 && <span className="queue-count"><ListPlus size={11} />{queue.length}</span>}{toolCount > 0 && <span className="tool-count"><Command size={11} />{toolCount}</span>}<button onClick={() => onOpen(thread.id)} title="Open full session"><ChevronRight size={16} /></button><button onClick={() => onRemove(thread.id)} title={`Remove from ${spark ? "SparkBoard" : "Control Center"}`}><X size={15} /></button></div>
-    </header>
-    {thread.goal && <button type="button" className={`control-goal ${thread.goal.status}`} onClick={() => onOpen(thread.id)} title={thread.goal.objective}><Target size={11} /><span>{thread.goal.objective}</span><em>{goalStatusLabel(thread.goal.status)}</em></button>}
-    <div className="control-metrics"><span><Clock3 size={10} />{formatDuration(threadDurationSeconds(thread))}</span><span><Gauge size={10} />{tokens === null ? "Token usage unavailable" : `${formatTokenCount(tokens)} tokens`}</span></div>
-    <div className="control-feed" ref={body} onScroll={onFeedScroll}>
-      {!items.length && !streamingText.some(([, value]) => Boolean(value)) && <div className="control-waiting"><ThreadProviderIcon thread={thread} size={21} /><span>{running ? `${providerLabel(thread)} is starting…` : "Waiting for a task"}</span></div>}
-      {items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} provider={thread.backend} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
-      {streamingText.map(([id, value]) => value && <div className="compact-message agent live" key={id}><span><ThreadProviderIcon thread={thread} size={12} /></span><div><ReactMarkdown>{value}</ReactMarkdown><i className="typing-cursor" /></div></div>)}
-      {running && !streamingText.some(([, value]) => Boolean(value)) && <div className="compact-thinking"><LoaderCircle className="spin" size={13} />{providerLabel(thread)} working…</div>}
+function ThreadHeader({ thread, settings, notificationPermission, pinned, archiveShortcut, onNotifications, onReplay, onPin, onRename, onOrganize, onArchive }: {
+  thread: Thread;
+  settings: SessionSettings | null;
+  notificationPermission: DesktopNotificationPermission;
+  pinned: boolean;
+  archiveShortcut: string;
+  onNotifications: (preferences: NotificationPreferences) => void;
+  onReplay: () => void;
+  onPin: () => void;
+  onRename: () => void;
+  onOrganize: () => void;
+  onArchive: () => void;
+}) {
+  const archived = thread.archiveState === "archived";
+  const exportBase = `/api/sessions/${encodeURIComponent(thread.id)}/export`;
+  return <div className="thread-header">
+    <div className="thread-title"><div className="thread-icon"><Sparkles size={18} /></div><div><strong>{threadTitle(thread)}{archived ? " · Archived" : ""}</strong><span><Folder size={12} />{thread.cwd}{thread.gitInfo?.branch && <><i>·</i><GitBranch size={11} /><b>{thread.gitInfo.branch}</b></>}{settings?.model && <><i>·</i><em>{settings.model} · {settings.effort}</em></>}</span></div></div>
+    <div className="header-actions desktop-header-actions">
+      {settings && <SessionNotificationPreferences value={notificationPreferences(settings)} permission={notificationPermission} onChange={onNotifications} />}
+      <button className="icon-button" onClick={onReplay} aria-label="Open session replay" title="Session replay"><History size={16} /></button>
+      <details className="session-export"><summary className="icon-button" aria-label="Export session" title="Export session"><FileDown size={16} /></summary><div className="session-export-panel"><strong>Export session</strong><span>Secrets are redacted and raw tool output is excluded.</span><a href={`${exportBase}?format=markdown`} download={`forgedeck-session-${thread.id}.md`}><FileText size={15} /><span><b>Markdown</b><small>Human-readable report</small></span></a><a href={`${exportBase}?format=json`} download={`forgedeck-session-${thread.id}.json`}><FileJson size={15} /><span><b>JSON</b><small>Structured run record</small></span></a></div></details>
+      <button className="icon-button" onClick={onPin} aria-label={pinned ? "Unpin session" : "Pin session"} aria-pressed={pinned}>{pinned ? <PinOff size={16} /> : <Pin size={16} />}</button>
+      <button className="icon-button" disabled={archived} onClick={onRename} aria-label="Rename session"><Settings2 size={16} /></button>
+      <button className="icon-button" disabled={archived} onClick={onOrganize} aria-label="Edit category and tags"><Tags size={16} /></button>
+      <button className="icon-button danger" disabled={archived} onClick={onArchive} aria-label={archived ? "Session is archived" : "Archive session"} aria-keyshortcuts="Meta+W Control+W" title={archived ? "Session is archived" : `Archive session (${archiveShortcut})`}><Archive size={16} /></button>
     </div>
-    <div className="control-models"><select value={settings.model} disabled={claude || spark} onChange={(event) => changeModel(event.target.value)}>{claude ? claudeModels.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>) : spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : models.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><select value={settings.effort} disabled={spark} onChange={(event) => onSettings(thread.id, { ...settings, effort: event.target.value })}>{effortOptions.map((effort) => <option key={effort} value={effort}>{EFFORT_LABELS[effort] || effort}</option>)}</select></div>
-    {queue.length > 0 && <div className="control-queue"><span><ListPlus size={11} />Queued next</span>{queue.map((entry, index) => <div key={entry.id}><b>{index + 1}</b><em title={entry.text}>{entry.text}</em><button type="button" onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={11} /></button></div>)}</div>}
-    <form className="control-composer" onSubmit={send}>
-      <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} compact />
-      <input value={text} onChange={(event) => setText(event.target.value)} onKeyDown={assist.onKeyDown} placeholder={running ? "Queue the next task…" : "Send a task…"} />
-      <button className={running ? "queue" : ""} disabled={!text.trim() || sending} title={running ? "Queue next task" : "Send"}>{sending ? <LoaderCircle className="spin" size={14} /> : running ? <ListPlus size={14} /> : <Send size={14} />}</button>
-      {running && <button type="button" className="stop" onClick={() => void stopThread(thread.id, onRefresh, onError)} title="Stop active turn"><CircleStop size={15} /></button>}
-    </form>
-  </article>;
-}, (previous, next) => previous.thread === next.thread
-  && previous.variant === next.variant
-  && previous.models === next.models
-  && previous.claudeModels === next.claudeModels
-  && previous.settings === next.settings
-  && previous.liveText === next.liveText
-  && previous.liveToolOutput === next.liveToolOutput
-  && previous.liveItems === next.liveItems
-  && previous.queue === next.queue
-  && previous.completed === next.completed
-  && previous.tokens === next.tokens);
-
-const CompactItem = memo(function CompactItem({ item, provider = "codex", liveOutput }: { item: ThreadItem; provider?: Thread["backend"]; liveOutput?: string }) {
-  const providerName = provider === "claude" ? "Claude" : "Codex";
-  if (item.type === "userMessage") {
-    const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
-    return <div className="compact-message user"><div>{text}</div><span>YOU</span></div>;
-  }
-  if (item.type === "agentMessage") return <div className="compact-message agent"><span>{provider === "claude" ? <BrainCircuit size={12} /> : <Bot size={12} />}</span><div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
-  if (item.type === "reasoning") return <details className="compact-reasoning"><summary><BrainCircuit size={12} />Reasoning</summary><p>{item.summary?.join("\n")}</p></details>;
-  if (item.type === "plan") return <div className="compact-tool plan"><LayoutGrid size={13} /><span><strong>Plan updated</strong><small>{truncate(item.text || "", 140)}</small></span></div>;
-  if (item.type === "commandExecution") return <details className={`compact-tool ${item.status || ""}`} {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={13} /><span><strong>Command</strong><small>{item.command}</small></span><em>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className={`compact-tool ${item.status || ""}`} open><summary><Code2 size={13} /><span><strong>File changes</strong><small>{item.changes?.length || 0} file update{item.changes?.length === 1 ? "" : "s"}</small></span><em>{item.status}</em></summary><DiffView changes={item.changes || []} compact /></details>;
-  if (isToolItem(item)) return <details className={`compact-tool ${String(item.status || "completed")}`}><summary><Command size={13} /><span><strong>{item.tool ? String(item.tool) : toolLabel(item.type)}</strong><small>{item.server ? String(item.server) : `${providerName} tool`}</small></span><em>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments || item, null, 2)}</pre></details>;
-  return null;
-});
-
-type ChatProps = {
-  thread: Thread; loading: boolean; liveText: Record<string, string>; liveToolOutput: Record<string, string>; liveItems: Record<string, ThreadItem>; queue: QueueEntry[]; models: CodexModel[]; claudeModels: ClaudeModelOption[];
-  settings: { model: string; effort: string }; onSettings: (value: { model: string; effort: string }) => void;
-  onRefresh: () => Promise<void>; onError: (error: unknown) => void;
-};
-
-const Chat = memo(function Chat({ thread, loading, liveText, liveToolOutput, liveItems, queue, models, claudeModels, settings, onSettings, onRefresh, onError }: ChatProps) {
-  const [text, setText] = useState("");
-  const [sending, setSending] = useState(false);
-  const assist = useComposerAssist(text, setText, thread.cwd);
-  const scroller = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
-  const claude = isClaudeThread(thread);
-  const spark = isSparkThread(thread);
-  const providerName = providerLabel(thread);
-  const selectedModel = models.find((model) => model.model === settings.model) || models[0];
-  const runningTurn = useMemo(() => [...thread.turns].reverse().find((turn) => turn.status === "inProgress"), [thread.turns]);
-  const running = thread.status.type === "active" || Boolean(runningTurn);
-  const historyItems = useMemo(() => thread.turns.flatMap((turn) => turn.items), [thread.turns]);
-  const historyIds = useMemo(() => new Set(historyItems.map((item) => item.id).filter(Boolean)), [historyItems]);
-  const streamingText = useMemo(() => Object.entries(liveText).filter(([id]) => !historyIds.has(id)), [historyIds, liveText]);
-  const immediateItems = useMemo(() => unseenLiveItems(historyItems, Object.values(liveItems)).filter((item) =>
-    !(item.type === "agentMessage" && item.id && liveText[item.id])
-  ), [historyItems, liveItems, liveText]);
-
-  const onTranscriptScroll = useCallback(() => {
-    const element = scroller.current;
-    if (element) stickToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-  }, []);
-  useEffect(() => {
-    if (!stickToBottom.current) return;
-    const frame = requestAnimationFrame(() => {
-      const element = scroller.current;
-      if (element) element.scrollTop = element.scrollHeight;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [immediateItems, liveToolOutput, streamingText, thread.turns]);
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!text.trim() || sending) return;
-    const outgoing = text.trim(); setText(""); setSending(true);
-    try {
-      const slash = parseSlashCommand(outgoing);
-      if (slash?.command === "mention") {
-        setText("@");
-      } else if (slash) {
-        if (!await executeSlashCommand(thread, slash)) { setText(outgoing); return; }
-      } else {
-        await api(`/api/threads/${thread.id}/${running ? "queue" : "messages"}`, { method: "POST", body: JSON.stringify({ text: outgoing, ...settings }) });
-      }
-      await onRefresh();
-    } catch (error) { setText(outgoing); onError(error); } finally { setSending(false); }
-  };
-
-  const changeModel = (modelId: string) => {
-    if (claude || spark) return;
-    const model = models.find((item) => item.model === modelId)!;
-    onSettings({ model: model.model, effort: model.defaultReasoningEffort });
-  };
-
-  const effortOptions = claude ? CLAUDE_EFFORTS : spark ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
-
-  return <div className="chat-layout">
-    <div className="transcript" ref={scroller} onScroll={onTranscriptScroll}>
-      {loading && <div className="transcript-loading"><LoaderCircle className="spin" /> Loading session history…</div>}
-      {!loading && !thread.turns.length && <div className="empty-chat"><div><Sparkles size={26} /></div><h2>Ready at the forge</h2><p>Send the first task. It will keep running here even if you close this browser.</p></div>}
-      {thread.turns.map((turn) => <TurnView key={turn.id} turn={turn} provider={thread.backend} liveToolOutput={liveToolOutput} />)}
-      {immediateItems.map((item, index) => <ItemView key={item.id || `live-${index}`} item={item} provider={thread.backend} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
-      {streamingText.map(([id, value]) => value && <div className="message agent live" key={id}><div className="message-avatar" style={claude ? { color: "#cf75ff", background: "rgba(126, 54, 160, .13)", borderColor: "rgba(201, 105, 255, .3)" } : spark ? { color: "#f5c451", background: "rgba(153, 113, 20, .12)", borderColor: "rgba(245, 196, 81, .28)" } : undefined}><ThreadProviderIcon thread={thread} size={16} /></div><div className="message-body"><div className="message-meta">{providerName} <span>working now</span></div><ReactMarkdown>{value}</ReactMarkdown><span className="typing-cursor" /></div></div>)}
-      {runningTurn && !streamingText.some(([, value]) => Boolean(value)) && <div className="thinking-line"><LoaderCircle className="spin" size={17} /><span>{providerName} is working</span><i /><i /><i /></div>}
-    </div>
-
-    <div className="composer-zone">
-      {thread.goal && <GoalBar thread={thread} onRefresh={onRefresh} onError={onError} />}
-      {queue.length > 0 && <div className="queue-strip"><div><ListPlus size={14} /><strong>{queue.length} queued</strong><span>Runs automatically after the current turn</span></div><div>{queue.map((entry, index) => <div className="queue-entry" key={entry.id}><b>{index + 1}</b><span>{entry.text}</span><button onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} title="Remove queued task"><X size={13} /></button></div>)}</div></div>}
-      <form className="composer" onSubmit={submit}>
-        <ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} />
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? `Queue the next task while ${providerName} works…` : `Give ${providerName} a task…`}
-          rows={3} onKeyDown={(event) => { if (assist.onKeyDown(event)) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
-        <div className="composer-footer">
-          <div className="model-controls">
-            <label>{claude ? <BrainCircuit size={14} /> : spark ? <Sparkles size={14} /> : <Bot size={14} />}<select value={settings.model} disabled={claude || spark} onChange={(event) => changeModel(event.target.value)}>{claude ? claudeModels.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>) : spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
-            <label><BrainCircuit size={14} /><select value={settings.effort} disabled={spark} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{effortOptions.map((effort) => <option key={effort} value={effort}>{EFFORT_LABELS[effort] || effort}</option>)}</select></label>
-            <PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} />
-          </div>
-          <div className="composer-actions">{running && <button type="button" className="stop-button" onClick={() => void stopThread(thread.id, onRefresh, onError)}><CircleStop size={16} /> Stop</button>}
-            <button className={`send-button ${running ? "queue" : ""}`} disabled={!text.trim() || sending}>{sending ? <LoaderCircle className="spin" size={17} /> : running ? <ListPlus size={16} /> : <Send size={16} />}<span>{running ? "Queue" : "Send"}</span></button></div>
+    <div className="mobile-header-actions">
+      {settings && <SessionNotificationPreferences value={notificationPreferences(settings)} permission={notificationPermission} onChange={onNotifications} />}
+      <details className="mobile-session-menu">
+        <summary className="icon-button" aria-label="Open session actions"><EllipsisVertical size={18} /></summary>
+        <div className="mobile-session-menu-panel">
+          <strong>Session actions</strong>
+          <button onClick={onReplay}><History size={16} />Replay</button>
+          <a href={`${exportBase}?format=markdown`} download={`forgedeck-session-${thread.id}.md`}><FileText size={16} />Export Markdown</a>
+          <a href={`${exportBase}?format=json`} download={`forgedeck-session-${thread.id}.json`}><FileJson size={16} />Export JSON</a>
+          <button onClick={onPin}>{pinned ? <PinOff size={16} /> : <Pin size={16} />}{pinned ? "Unpin" : "Pin"}</button>
+          <button disabled={archived} onClick={onRename}><Settings2 size={16} />Rename</button>
+          <button disabled={archived} onClick={onOrganize}><Tags size={16} />Category and tags</button>
+          <button className="danger" disabled={archived} onClick={onArchive}><Archive size={16} />{archived ? "Archived" : "Archive"}</button>
         </div>
-      </form>
-      <p className="persistence-note"><Server size={12} />Safe to close this tab — work continues on the host.</p>
-    </div>
-  </div>;
-}, (previous, next) => previous.thread === next.thread
-  && previous.loading === next.loading
-  && previous.liveText === next.liveText
-  && previous.liveToolOutput === next.liveToolOutput
-  && previous.liveItems === next.liveItems
-  && previous.queue === next.queue
-  && previous.models === next.models
-  && previous.claudeModels === next.claudeModels
-  && previous.settings === next.settings);
-
-function PolicyButton({ thread, running, onRefresh, onError, compact = false }: { thread: Thread; running: boolean; onRefresh: () => void | Promise<void>; onError: (error: unknown) => void; compact?: boolean }) {
-  if (isClaudeThread(thread)) {
-    const mode = thread.claudePermissionMode || "default";
-    const plan = mode === "plan";
-    const bypass = mode === "bypassPermissions";
-    return <button type="button" className={`policy-button ${bypass ? "yolo" : "workspace"} ${compact ? "compact" : ""}`} disabled title={plan ? "Claude plan mode: read and plan only" : bypass ? "Claude bypassPermissions mode" : "Claude workspace-write sandbox"} style={plan ? { color: "#9d85ff", borderColor: "rgba(157, 133, 255, .28)", background: "rgba(157, 133, 255, .07)" } : undefined}>{plan ? <FileText size={compact ? 11 : 13} /> : <ShieldCheck size={compact ? 11 : 13} />}<span>{plan ? "PLAN" : bypass ? "YOLO" : compact ? "SAFE" : "Workspace"}</span></button>;
-  }
-  const yolo = thread.policy === "yolo";
-  const toggle = async () => {
-    if (running) return;
-    if (!yolo && !window.confirm("Enable YOLO mode for this session? Future turns will run with full system access and no approvals.")) return;
-    try {
-      await api(`/api/threads/${thread.id}/policy`, { method: "PATCH", body: JSON.stringify({ yolo: !yolo }) });
-      await onRefresh();
-    } catch (error) { onError(error); }
-  };
-  return <button type="button" className={`policy-button ${yolo ? "yolo" : "workspace"} ${compact ? "compact" : ""}`} disabled={running} onClick={() => void toggle()} title={running ? "Finish or stop the turn to change permissions" : yolo ? "Switch to workspace-write with approvals" : "Enable YOLO mode"}><ShieldCheck size={compact ? 11 : 13} /><span>{yolo ? "YOLO" : compact ? "SAFE" : "Workspace"}</span></button>;
-}
-
-async function stopThread(threadId: string, onRefresh: () => void | Promise<void>, onError: (error: unknown) => void): Promise<void> {
-  try {
-    await api(`/api/threads/${threadId}/interrupt`, { method: "POST", body: "{}" });
-    await onRefresh();
-  } catch (error) { onError(error); }
-}
-
-function GoalBar({ thread, onRefresh, onError }: { thread: Thread; onRefresh: () => Promise<void>; onError: (error: unknown) => void }) {
-  const goal = thread.goal!;
-  const run = async (args: string) => {
-    try {
-      await api(`/api/threads/${thread.id}/command`, { method: "POST", body: JSON.stringify({ command: "goal", args }) });
-      await onRefresh();
-    } catch (error) { onError(error); }
-  };
-  const edit = () => {
-    const objective = window.prompt("Goal objective", goal.objective);
-    if (objective?.trim() && objective.trim() !== goal.objective) void run(objective.trim());
-  };
-  const progress = goal.tokenBudget ? Math.min(100, Math.round(goal.tokensUsed / goal.tokenBudget * 100)) : null;
-  return <div className={`goal-bar ${goal.status}`}>
-    <span className="goal-icon"><Target size={14} /></span>
-    <div><span><strong>Goal</strong><em>{goalStatusLabel(goal.status)}</em>{progress !== null && <small>{progress}% token budget</small>}</span><p>{goal.objective}</p></div>
-    <div className="goal-actions">
-      <button type="button" onClick={() => void run(goal.status === "paused" ? "resume" : "pause")} title={goal.status === "paused" ? "Resume goal" : "Pause goal"}>{goal.status === "paused" ? <Play size={13} /> : <Pause size={13} />}</button>
-      <button type="button" onClick={edit} title="Edit goal"><Settings2 size={13} /></button>
-      <button type="button" onClick={() => void run("clear")} title="Clear goal"><X size={13} /></button>
+      </details>
     </div>
   </div>;
 }
 
-const TurnView = memo(function TurnView({ turn, provider, liveToolOutput = EMPTY_TEXT_STREAM }: { turn: Thread["turns"][number]; provider?: Thread["backend"]; liveToolOutput?: Record<string, string> }) {
-  return <div className={`turn ${turn.status}`}>
-    {turn.items.map((item, index) => <ItemView key={item.id || `${item.type}-${index}`} item={item} provider={provider} liveOutput={item.id ? liveToolOutput[item.id] : undefined} />)}
-    {turn.status === "failed" && <div className="turn-error">{turn.error?.message || "This turn failed."}</div>}
-  </div>;
-}, (previous, next) => previous.turn === next.turn && previous.provider === next.provider && previous.turn.items.every((item) => !item.id || previous.liveToolOutput?.[item.id] === next.liveToolOutput?.[item.id]));
+function Welcome({ onNew }: { onNew: () => void }) { return <div className="welcome"><div className="welcome-mark"><div className="brand-mark large"><span /><span /><span /></div></div><h1>No session selected</h1><p>Pick one from the sidebar, or launch a new session in any workspace. Work continues on this machine if you close the tab.</p><button className="primary-button" onClick={onNew}><Plus size={17} />New session</button></div>; }
 
-const ItemView = memo(function ItemView({ item, provider = "codex", liveOutput }: { item: ThreadItem; provider?: Thread["backend"]; liveOutput?: string }) {
-  const providerName = provider === "claude" ? "Claude" : "Codex";
-  if (item.type === "userMessage") {
-    const text = item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || "";
-    return <div className="message user"><div className="message-body"><div className="message-meta">You</div><p>{text}</p></div><div className="message-avatar">YOU</div></div>;
-  }
-  if (item.type === "agentMessage") return <div className="message agent"><div className="message-avatar" style={provider === "claude" ? { color: "#cf75ff", background: "rgba(126, 54, 160, .13)", borderColor: "rgba(201, 105, 255, .3)" } : undefined}>{provider === "claude" ? <BrainCircuit size={16} /> : <Bot size={16} />}</div><div className="message-body"><div className="message-meta">{providerName}</div><ReactMarkdown>{item.text || ""}</ReactMarkdown></div></div>;
-  if (item.type === "reasoning") return <details className="reasoning-item"><summary><BrainCircuit size={15} />Reasoning <ChevronRight size={14} /></summary><div>{item.summary?.map((part, index) => <ReactMarkdown key={index}>{part}</ReactMarkdown>)}</div></details>;
-  if (item.type === "commandExecution") return <details className="tool-item" {...(item.status === "inProgress" ? { open: true } : {})}><summary><TerminalSquare size={15} /><span><strong>Command</strong><code>{item.command}</code></span><em className={item.status}>{item.status}</em></summary>{(item.aggregatedOutput || liveOutput) && <pre>{item.aggregatedOutput || liveOutput}</pre>}</details>;
-  if (item.type === "fileChange") return <details className="tool-item" open><summary><Code2 size={15} /><span><strong>Files changed</strong><code>{item.changes?.length || 0} update{item.changes?.length === 1 ? "" : "s"}</code></span><em className={item.status}>{item.status}</em></summary><DiffView changes={item.changes || []} /></details>;
-  if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") return <details className="tool-item"><summary><Command size={15} /><span><strong>{item.tool || "Tool call"}</strong><code>{item.server || `${providerName} tool`}</code></span><em className={item.status}>{item.status}</em></summary><pre>{JSON.stringify(item.result || item.error || item.arguments, null, 2)}</pre></details>;
-  if (item.type === "plan") return <div className="plan-item"><LayoutGrid size={15} /><ReactMarkdown>{item.text || ""}</ReactMarkdown></div>;
-  if (["contextCompaction", "enteredReviewMode", "exitedReviewMode"].includes(item.type)) return null;
-  return <details className="tool-item generic-tool"><summary><Sparkles size={15} /><span><strong>{toolLabel(item.type)}</strong><code>{item.id || `${providerName} activity`}</code></span><em className={String(item.status || "completed")}>{String(item.status || "completed")}</em></summary><pre>{JSON.stringify(item, null, 2)}</pre></details>;
-});
-
-function DiffView({ changes, compact = false }: { changes: Array<Record<string, unknown>>; compact?: boolean }) {
-  return <div className={`diff-view ${compact ? "compact" : ""}`}>{changes.map((change, index) => {
-    const filePath = String(change.path || change.file || `File ${index + 1}`);
-    const diff = String(change.diff || change.unified_diff || "");
-    const kindValue = change.kind && typeof change.kind === "object" ? (change.kind as { type?: unknown }).type : change.kind;
-    const kind = String(kindValue || "update");
-    const additions = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
-    const deletions = diff.split("\n").filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
-    return <section className="diff-file" key={`${filePath}-${index}`}>
-      <header><Code2 size={12} /><strong>{filePath}</strong><span className={`diff-kind ${kind}`}>{kind}</span><em><b>+{additions}</b><i>-{deletions}</i></em></header>
-      {diff ? <pre>{diff.split("\n").map((line, lineIndex) => <span className={line.startsWith("+") && !line.startsWith("+++") ? "add" : line.startsWith("-") && !line.startsWith("---") ? "remove" : line.startsWith("@@") ? "hunk" : line.startsWith("+++") || line.startsWith("---") ? "file" : "context"} key={lineIndex}>{line || " "}</span>)}</pre> : <div className="diff-empty">Diff content unavailable</div>}
-    </section>;
-  })}</div>;
-}
-
-function useComposerAssist(text: string, setText: (value: string) => void, cwd: string) {
-  const [files, setFiles] = useState<AssistSuggestion[]>([]);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [dismissedFor, setDismissedFor] = useState<string | null>(null);
-  const slashMatch = text.match(/^\/([^\s]*)$/);
-  const mentionMatch = text.match(/(?:^|\s)@([^\s@]*)$/);
-  const mentionQuery = mentionMatch?.[1];
-
-  useEffect(() => {
-    if (mentionQuery === undefined) { setFiles([]); return; }
-    const timer = window.setTimeout(() => {
-      void api<{ data: Array<{ name: string; relativePath: string; type: "file" | "directory" }> }>(`/api/files?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(mentionQuery)}`)
-        .then((response) => setFiles(response.data.map((entry) => ({
-          id: `${entry.type}:${entry.relativePath}`, label: entry.relativePath, description: entry.type,
-          insert: entry.relativePath, kind: entry.type
-        }))))
-        .catch(() => setFiles([]));
-    }, 120);
-    return () => clearTimeout(timer);
-  }, [cwd, mentionQuery]);
-
-  const suggestions = useMemo(() => {
-    if (dismissedFor === text) return [];
-    if (slashMatch) {
-      const needle = slashMatch[1].toLowerCase();
-      return SLASH_COMMANDS.filter((item) => item.id.startsWith(needle) || item.label.includes(needle));
-    }
-    return mentionMatch ? files : [];
-  }, [text, dismissedFor, slashMatch?.[1], mentionMatch?.[1], files]);
-
-  useEffect(() => setActiveIndex(0), [suggestions.length, text]);
-
-  const choose = (suggestion: AssistSuggestion) => {
-    if (suggestion.kind === "command") setText(suggestion.insert);
-    else setText(text.replace(/(^|\s)@[^\s@]*$/, `$1@${suggestion.insert}${suggestion.kind === "directory" ? "/" : " "}`));
-    setDismissedFor(null);
-  };
-
-  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>): boolean => {
-    if (!suggestions.length) return false;
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      setActiveIndex((current) => (current + (event.key === "ArrowDown" ? 1 : -1) + suggestions.length) % suggestions.length);
-      return true;
-    }
-    if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
-      event.preventDefault();
-      choose(suggestions[activeIndex] || suggestions[0]);
-      return true;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setDismissedFor(text);
-      return true;
-    }
-    return false;
-  };
-  return { suggestions, activeIndex, choose, onKeyDown };
-}
-
-function ComposerAssist({ suggestions, activeIndex, onChoose, compact = false }: { suggestions: AssistSuggestion[]; activeIndex: number; onChoose: (suggestion: AssistSuggestion) => void; compact?: boolean }) {
-  if (!suggestions.length) return null;
-  return <div className={`composer-assist ${compact ? "compact" : ""}`}>{suggestions.slice(0, compact ? 6 : 10).map((suggestion, index) => <button type="button" className={index === activeIndex ? "active" : ""} key={suggestion.id} onMouseDown={(event) => event.preventDefault()} onClick={() => onChoose(suggestion)}><span>{suggestion.kind === "command" ? <Command size={13} /> : suggestion.kind === "directory" ? <Folder size={13} /> : <Code2 size={13} />}</span><strong>{suggestion.label}</strong><small>{suggestion.description}</small><kbd>{index === activeIndex ? "Tab" : ""}</kbd></button>)}</div>;
-}
-
-function parseSlashCommand(value: string): { command: string; args: string | null } | null {
-  const match = value.match(/^\/([a-z-]+)(?:\s+([\s\S]+))?$/i);
-  return match ? { command: match[1].toLowerCase(), args: match[2]?.trim() || null } : null;
-}
-
-async function executeSlashCommand(thread: Thread, slash: { command: string; args: string | null }): Promise<boolean> {
-  let args = slash.args;
-  if (slash.command === "goal" && (!args || args.toLowerCase() === "set")) {
-    const objective = window.prompt("Goal objective", thread.goal?.objective || "");
-    if (!objective?.trim()) return false;
-    args = objective.trim();
-  }
-  await api(`/api/threads/${thread.id}/command`, { method: "POST", body: JSON.stringify({ ...slash, args }) });
-  return true;
-}
-
-function goalStatusLabel(status: NonNullable<Thread["goal"]>["status"]): string {
-  return ({ active: "Active", paused: "Paused", blocked: "Blocked", usageLimited: "Usage limited", budgetLimited: "Budget limited", complete: "Complete" })[status];
-}
-
-function Welcome({ onNew }: { onNew: () => void }) {
-  return <div className="welcome"><div className="welcome-mark"><div className="brand-mark large"><span /><span /><span /></div></div><span className="eyebrow">LOCAL · PERSISTENT · YOUR ACCOUNT</span><h1>Your Codex fleet,<br /><em>one command deck.</em></h1><p>Launch independent coding sessions in any workspace. They keep moving when your browser doesn’t.</p><button className="primary-button" onClick={onNew}><Plus size={17} />Launch a session</button><div className="feature-row"><span><Server size={17} />Runs on this machine</span><span><ShieldCheck size={17} />Private by default</span><span><LayoutGrid size={17} />Unlimited workspaces</span></div></div>;
-}
-
-function NewSessionModal({ bootstrap, sessionClass = "standard", onClose, onCreated, onError }: { bootstrap: Bootstrap; sessionClass?: SessionClass; onClose: () => void; onCreated: (thread: Thread, model: string, effort: string, sessionClass: SessionClass) => Promise<void>; onError: (error: unknown) => void }) {
-  const spark = sessionClass === "spark";
-  const defaultModel = bootstrap.models.data.find((model) => model.isDefault) || bootstrap.models.data[0];
-  const claudeModels = bootstrap.claudeModelOptions || [];
-  const claudeAvailable = bootstrap.claudeAvailable === true && claudeModels.length > 0;
-  const [name, setName] = useState("");
-  const [category, setCategory] = useState("");
-  const [tags, setTags] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [backend, setBackend] = useState<SessionBackend>("codex");
-  const [model, setModel] = useState(spark ? SPARK_MODEL : defaultModel?.model || "");
-  const [effort, setEffort] = useState(spark ? "high" : defaultModel?.defaultReasoningEffort || "medium");
-  const [yolo, setYolo] = useState(false);
-  const [claudePermissionMode, setClaudePermissionMode] = useState<ClaudePermissionMode>("default");
-  const [browser, setBrowser] = useState<{ path: string | null; parent: string | null; entries: Array<{ name: string; path: string }> } | null>(null);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const selectedCodexModel = bootstrap.models.data.find((item) => item.model === model) || defaultModel;
-  const selectedClaudeModel = claudeModels.find((item) => item.model === model) || claudeModels[0];
-  const effortOptions = spark ? ["high"] : backend === "claude" ? CLAUDE_EFFORTS : selectedCodexModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
-
-  const chooseBackend = (next: SessionBackend) => {
-    if (spark || next === backend || (next === "claude" && !claudeAvailable)) return;
-    setBackend(next);
-    if (next === "claude") {
-      setModel(claudeModels[0].model);
-      setEffort("high");
-      return;
-    }
-    setModel(defaultModel?.model || "");
-    setEffort(defaultModel?.defaultReasoningEffort || "medium");
-  };
-
-  const browse = useCallback(async (target?: string) => {
-    const query = target ? `?path=${encodeURIComponent(target)}` : "";
-    setBrowser(await api(`/api/directories${query}`));
-  }, []);
-  useEffect(() => { void browse().catch(onError); }, [browse, onError]);
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!selectedPath) return;
-    setBusy(true);
-    try {
-      const response = await api<{ thread: Thread }>("/api/threads", {
-        method: "POST",
-        body: JSON.stringify({
-          cwd: selectedPath,
-          model: spark ? SPARK_MODEL : model,
-          effort: spark ? "high" : effort,
-          name,
-          category,
-          tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean),
-          prompt,
-          backend: spark ? "codex" : backend,
-          class: sessionClass,
-          ...(backend === "claude" && !spark ? { permissionMode: claudePermissionMode } : { yolo })
-        })
-      });
-      await onCreated(response.thread, spark ? SPARK_MODEL : model, spark ? "high" : effort, sessionClass);
-    } catch (error) { onError(error); } finally { setBusy(false); }
-  };
-
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <form className="new-modal" onSubmit={submit}>
-      <div className="modal-header"><div><span className="eyebrow" style={spark ? { color: "#f5c451" } : backend === "claude" ? { color: "#cf75ff" } : undefined}>{spark ? "NEW SPARK SESSION" : backend === "claude" ? "NEW CLAUDE SESSION" : "NEW CODEX SESSION"}</span><h2>{spark ? "Launch a quick task" : "Choose your launch settings"}</h2></div><button type="button" className="icon-button" onClick={onClose}><X size={19} /></button></div>
-      <div className="new-grid">
-        <section className="directory-picker">
-          <div className="section-label"><FolderOpen size={15} />Workspace directory</div>
-          <div className="path-bar"><button type="button" disabled={!browser?.parent} onClick={() => { if (browser?.parent) void browse(browser.parent).catch(onError); }}><ArrowLeft size={15} /></button><span title={browser?.path || "Workspace roots"}>{browser?.path || "Available roots"}</span></div>
-          <div className="folder-list">
-            {!browser && <LoaderCircle className="spin" />}
-            {browser?.entries.map((entry) => <button type="button" key={entry.path} onClick={() => { setSelectedPath(entry.path); void browse(entry.path).catch(onError); }} className={selectedPath === entry.path ? "selected" : ""}><Folder size={16} /><span>{entry.name}</span><ChevronRight size={15} /></button>)}
-            {browser && !browser.entries.length && <div className="folder-empty">No child directories</div>}
-          </div>
-          <button type="button" className={`select-directory ${browser?.path && selectedPath === browser.path ? "chosen" : ""}`} disabled={!browser?.path} onClick={() => setSelectedPath(browser!.path)}>{selectedPath === browser?.path ? <Check size={16} /> : <FolderOpen size={16} />}{selectedPath === browser?.path ? "Selected" : "Use this directory"}</button>
-        </section>
-        <section className="launch-settings">
-          <label className="field"><span>Session name <i>optional</i></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Uses the first task line automatically" maxLength={100} /></label>
-          <div className="organization-fields"><label className="field"><span>Category <i>optional</i></span><input value={category} onChange={(event) => setCategory(event.target.value)} placeholder="e.g. Product" maxLength={50} /></label><label className="field"><span>Tags <i>comma-separated</i></span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="bug, release" /></label></div>
-          {!spark && <div className="field"><span>Backend</span><div className="effort-grid"><button type="button" className={backend === "codex" ? "selected" : ""} onClick={() => chooseBackend("codex")}><Bot size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Codex</button><span title={!claudeAvailable ? "Claude Code CLI not installed or not authenticated" : undefined}><button type="button" aria-disabled={!claudeAvailable} className={backend === "claude" ? "selected" : ""} style={!claudeAvailable ? { opacity: .42, cursor: "not-allowed" } : backend === "claude" ? { color: "#cf75ff", borderColor: "rgba(201, 105, 255, .42)", background: "rgba(201, 105, 255, .09)" } : undefined} onClick={() => chooseBackend("claude")}><BrainCircuit size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Claude</button></span></div>{!claudeAvailable && <small>Claude Code CLI not installed or not authenticated</small>}</div>}
-          <label className="field"><span>Model</span><select value={model} disabled={spark} onChange={(event) => {
-            const nextModel = event.target.value;
-            setModel(nextModel);
-            if (backend === "codex") {
-              const next = bootstrap.models.data.find((item) => item.model === nextModel);
-              if (next) setEffort(next.defaultReasoningEffort);
-            }
-          }}>{spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : backend === "claude" ? claudeModels.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>) : bootstrap.models.data.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><small>{spark ? "Fast, lightweight Codex model locked for SparkBoard tasks." : backend === "claude" ? selectedClaudeModel?.description : selectedCodexModel?.description}</small></label>
-          <div className="field"><span>Thinking amount</span><div className="effort-grid">{effortOptions.map((option) => <button type="button" key={option} className={effort === option ? "selected" : ""} style={backend === "claude" && effort === option ? { color: "#cf75ff", borderColor: "rgba(201, 105, 255, .42)", background: "rgba(201, 105, 255, .09)" } : spark && effort === option ? { color: "#f5c451", borderColor: "rgba(245, 196, 81, .42)", background: "rgba(245, 196, 81, .09)" } : undefined} onClick={() => setEffort(option)}>{EFFORT_LABELS[option] || option}</button>)}</div></div>
-          <label className="field prompt-field"><span>First task <i>optional</i></span><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Start the session with a task, or leave it waiting…" rows={4} /></label>
-        </section>
-      </div>
-      <div className="modal-footer">{backend === "claude" && !spark ? <div style={{ flex: 1, minWidth: 0 }}><span style={{ display: "block", marginBottom: 5, color: "#7a8490", fontSize: 8, textTransform: "uppercase", letterSpacing: .7 }}>Claude permissions</span><div className="effort-grid" style={{ flexWrap: "nowrap" }}><button type="button" className={claudePermissionMode === "default" ? "selected" : ""} onClick={() => setClaudePermissionMode("default")} title="Claude default permission mode"><ShieldCheck size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Workspace-write sandbox</button><button type="button" className={claudePermissionMode === "plan" ? "selected" : ""} style={claudePermissionMode === "plan" ? { color: "#9d85ff", borderColor: "rgba(157, 133, 255, .42)", background: "rgba(157, 133, 255, .09)" } : undefined} onClick={() => setClaudePermissionMode("plan")} title="Read and plan only; no edits"><FileText size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />Plan mode</button><button type="button" className={claudePermissionMode === "bypassPermissions" ? "selected" : ""} onClick={() => setClaudePermissionMode("bypassPermissions")} title="No approvals; full system access"><Sparkles size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />YOLO mode</button></div></div> : <label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label>}<button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" style={spark ? { background: "#b88919", borderColor: "#d5ad3f" } : backend === "claude" ? { background: "#8746a6", borderColor: "#b16bd1" } : undefined} disabled={!selectedPath || !model || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : spark ? <Sparkles size={17} /> : backend === "claude" ? <BrainCircuit size={17} /> : <Sparkles size={17} />}Launch {spark ? "Spark session" : backend === "claude" ? "Claude session" : "session"}</button></div>
-    </form>
-  </div>;
-}
-
-function ApprovalTray({ requests, onResolved, onError }: { requests: PendingRequest[]; onResolved: (id: string | number) => void; onError: (error: unknown) => void }) {
-  const request = requests[0];
-  const params = request.params || {};
-  const questions = Array.isArray(params.questions) ? params.questions as Array<{ id: string; header: string; question: string; isSecret: boolean; options: Array<{ label: string; description: string }> | null }> : [];
-  const [answers, setAnswers] = useState<Record<string, string>>({});
-  useEffect(() => setAnswers({}), [request.id]);
-  const isKnown = request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval";
-  const isQuestion = request.method === "item/tool/requestUserInput";
-  const decide = async (decision: string) => {
-    try {
-      await api(`/api/approvals/${encodeURIComponent(String(request.id))}`, { method: "POST", body: JSON.stringify({ decision }) });
-      onResolved(request.id);
-    } catch (error) { onError(error); }
-  };
-  const answerQuestions = async () => {
-    try {
-      const mapped = Object.fromEntries(questions.map((question) => [question.id, { answers: [answers[question.id] || ""] }]));
-      await api(`/api/approvals/${encodeURIComponent(String(request.id))}`, { method: "POST", body: JSON.stringify({ result: { answers: mapped } }) });
-      onResolved(request.id);
-    } catch (error) { onError(error); }
-  };
-  return <div className="approval-tray">
-    <div className="approval-title"><div><ShieldCheck size={18} /><span>Codex needs approval <small>{requests.length > 1 ? `${requests.length} requests waiting` : "Session paused safely"}</small></span></div></div>
-    <div className="approval-content">
-      <strong>{request.method.includes("commandExecution") ? "Run this command?" : request.method.includes("fileChange") ? "Apply these file changes?" : "Codex is requesting input"}</strong>
-      {params.command ? <code>{String(params.command)}</code> : <p>{String(params.reason || "Review this request before continuing.")}</p>}
-      {Boolean(params.cwd) && <small><Folder size={12} />{String(params.cwd)}</small>}
-      {isQuestion && <div className="approval-questions">{questions.map((question) => <label key={question.id}><span>{question.header}<small>{question.question}</small></span>{question.options?.length ? <select value={answers[question.id] || ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}><option value="" disabled>Choose…</option>{question.options.map((option) => <option key={option.label} value={option.label}>{option.label} — {option.description}</option>)}</select> : <input type={question.isSecret ? "password" : "text"} value={answers[question.id] || ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} />}</label>)}</div>}
-    </div>
-    {isKnown ? <div className="approval-actions"><button onClick={() => void decide("decline")} className="deny">Decline</button><button onClick={() => void decide("accept")}>Allow once</button><button onClick={() => void decide("acceptForSession")} className="approve"><Check size={15} />Allow for session</button></div>
-      : isQuestion ? <div className="approval-actions"><button className="approve" disabled={questions.some((question) => !answers[question.id])} onClick={() => void answerQuestions()}><Check size={15} />Send answer</button></div>
-      : <div className="approval-actions"><span className="unsupported-request">Open the Codex CLI to answer this structured request.</span></div>}
-  </div>;
-}
-
-type ApiOptions = RequestInit & { allowUnauthenticated?: boolean };
-async function api<T = unknown>(url: string, options: ApiOptions = {}): Promise<T> {
-  const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
-  const payload: unknown = response.headers.get("content-type")?.includes("application/json") ? await response.json() : null;
-  if (!response.ok) {
-    if (response.status === 401 && !options.allowUnauthenticated && url !== "/api/auth") window.location.reload();
-    const message = isRecord(payload) && typeof payload.error === "string" ? payload.error : `Request failed (${response.status})`;
-    throw new Error(message);
-  }
-  return payload as T;
-}
-
-function threadTitle(thread: Thread): string { return thread.name || thread.preview || "Untitled session"; }
-function sessionSearchText(thread: Thread): string {
-  return [threadTitle(thread), thread.preview, thread.cwd, thread.category, thread.backend, thread.sessionClass, ...(thread.tags || [])].filter(Boolean).join(" ").toLocaleLowerCase();
-}
-function isClaudeThread(thread: Thread): boolean { return thread.backend === "claude"; }
-function isSparkThread(thread: Thread): boolean { return thread.sessionClass === "spark"; }
-function providerLabel(thread: Thread): "Codex" | "Claude" { return isClaudeThread(thread) ? "Claude" : "Codex"; }
-function providerAccent(thread: Thread): string { return isClaudeThread(thread) ? "#cf75ff" : isSparkThread(thread) ? "#f5c451" : "#6e9dff"; }
-function ThreadProviderIcon({ thread, size }: { thread: Thread; size: number }) {
-  if (isClaudeThread(thread)) return <BrainCircuit size={size} color="#cf75ff" />;
-  if (isSparkThread(thread)) return <Sparkles size={size} color="#f5c451" />;
-  return <Bot size={size} color="#6e9dff" />;
-}
-function providerBadgeStyle(thread: Thread): React.CSSProperties {
-  const accent = providerAccent(thread);
-  return { flex: "0 0 auto", padding: "2px 4px", border: `1px solid ${accent}4d`, borderRadius: 4, color: accent, background: `${accent}12`, fontSize: 6.5, fontStyle: "normal", fontWeight: 700, letterSpacing: .45, textTransform: "uppercase" };
-}
-function providerIconContainerStyle(thread: Thread): React.CSSProperties | undefined {
-  if (!isClaudeThread(thread) && !isSparkThread(thread)) return undefined;
-  const accent = providerAccent(thread);
-  return { color: accent, background: `${accent}14`, borderColor: `${accent}38` };
-}
-function controlCardAccentStyle(thread: Thread, variant: BoardVariant): React.CSSProperties | undefined {
-  if (isClaudeThread(thread)) return { borderColor: "rgba(201, 105, 255, .38)", boxShadow: "inset 0 1px rgba(201, 105, 255, .05), 0 10px 32px rgba(75, 24, 99, .16)" };
-  if (variant === "spark" || isSparkThread(thread)) return { borderColor: "rgba(245, 196, 81, .36)", boxShadow: "inset 0 1px rgba(245, 196, 81, .05), 0 10px 32px rgba(105, 77, 12, .14)" };
-  return undefined;
-}
-function defaultSettingsForThread(thread: Thread, models: CodexModel[], claudeModels: ClaudeModelOption[], defaultModel?: CodexModel): { model: string; effort: string } {
-  if (isSparkThread(thread)) return { model: SPARK_MODEL, effort: "high" };
-  if (isClaudeThread(thread)) return { model: thread.claudeModel || claudeModels[0]?.model || "", effort: thread.claudeEffort || "high" };
-  const model = defaultModel || models[0];
-  return { model: model?.model || "", effort: model?.defaultReasoningEffort || "medium" };
-}
-function basename(value: string): string { return value.split("/").filter(Boolean).pop() || value; }
-function initials(value: string): string { return value.split(/[@.\s_-]/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "CD"; }
-function formatPlan(value?: string | null): string { return value ? value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (char) => char.toUpperCase()) : "Codex"; }
-function hasInProgressTurn(thread: Thread): boolean { return Boolean(thread.turns?.some((turn) => turn.status === "inProgress")); }
-function sessionVisualState(thread: Thread, completed = false): "running" | "idle" | "completed" | "error" {
-  if (thread.status.type === "active" || hasInProgressTurn(thread)) return "running";
-  if (thread.status.type === "systemError") return "error";
-  return completed ? "completed" : "idle";
-}
-function sessionStateLabel(state: ReturnType<typeof sessionVisualState>): string {
-  return state === "running" ? "Working" : state === "completed" ? "Done" : state === "error" ? "Error" : "Idle";
-}
-function statusRank(thread: Thread, completed = false): number {
-  const state = sessionVisualState(thread, completed);
-  return state === "running" ? 4 : state === "error" ? 3 : state === "idle" ? 2 : 1;
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-function readStoredJson(key: string): unknown {
-  try {
-    const raw = readStoredString(key);
-    return raw === null ? null : JSON.parse(raw) as unknown;
-  } catch {
-    return null;
-  }
-}
-function readStoredString(key: string): string | null {
-  try { return localStorage.getItem(key); } catch { return null; }
-}
-function writeStoredString(key: string, value: string): void {
-  try { localStorage.setItem(key, value); } catch { /* Storage may be disabled or full. */ }
-}
-function writeStoredJson(key: string, value: unknown): void {
-  try { writeStoredString(key, JSON.stringify(value)); } catch { /* Ignore unserializable optional UI state. */ }
-}
-function readStoredStringArray(key: string): string[] {
-  const value = readStoredJson(key);
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-}
-function readStoredNumberRecord(key: string): Record<string, number> {
-  const value = readStoredJson(key);
-  if (!isRecord(value)) return {};
-  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])));
-}
-function readStoredTokenUsage(): Record<string, ThreadTokenUsage> {
-  const value = readStoredJson("forgedeck-token-usage");
-  if (!isRecord(value)) return {};
-  const result: Record<string, ThreadTokenUsage> = {};
-  for (const [threadId, candidate] of Object.entries(value)) {
-    const usage = normalizeTokenUsage(candidate);
-    if (usage) result[threadId] = usage;
-  }
-  return result;
-}
-function readThreadSettings(): ThreadSettings {
-  const value = readStoredJson("forgedeck-settings");
-  if (!isRecord(value)) return {};
-  const result: ThreadSettings = {};
-  for (const [threadId, candidate] of Object.entries(value)) {
-    if (!isRecord(candidate) || typeof candidate.model !== "string" || typeof candidate.effort !== "string") continue;
-    result[threadId] = { model: candidate.model, effort: candidate.effort };
-  }
-  return result;
-}
-function readSortMode(): SortMode {
-  const stored = readStoredString("forgedeck-sort");
-  return stored === "created" || stored === "name" || stored === "directory" || stored === "status" ? stored : "updated";
-}
-function parseEventData<T>(event: Event): T | null {
-  const data = (event as MessageEvent<unknown>).data;
-  if (typeof data !== "string") return null;
-  try {
-    return JSON.parse(data) as T;
-  } catch {
-    return null;
-  }
-}
-function readPollInterval(): number {
-  const stored = Number(readStoredString("forgedeck-poll-interval"));
-  return POLL_INTERVALS.includes(stored as typeof POLL_INTERVALS[number]) ? stored : 4_000;
-}
-function readTheme(): ThemeMode {
-  const stored = readStoredString("forgedeck-theme");
-  if (stored === "dark" || stored === "light") return stored;
-  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
-}
-function normalizedTimestamp(value: number): number { return value > 10_000_000_000 ? value / 1_000 : value; }
-function threadDurationSeconds(thread: Thread): number {
-  let total = 0;
-  let measuredTurns = 0;
-  const now = Date.now() / 1_000;
-  for (const turn of thread.turns || []) {
-    if (!turn.startedAt) continue;
-    const start = normalizedTimestamp(turn.startedAt);
-    const end = turn.completedAt ? normalizedTimestamp(turn.completedAt) : turn.status === "inProgress" ? now : normalizedTimestamp(thread.updatedAt);
-    total += Math.max(0, end - start);
-    measuredTurns += 1;
-  }
-  if (measuredTurns) return total;
-  const start = normalizedTimestamp(thread.createdAt);
-  const end = sessionVisualState(thread) === "running" ? now : normalizedTimestamp(Math.max(thread.updatedAt, thread.createdAt));
-  return Math.max(0, end - start);
-}
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return "<1m";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  if (hours < 24) return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h`;
-}
-function formatTokenCount(tokens: number): string {
-  if (tokens < 1_000) return String(tokens);
-  if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k`;
-  return `${(tokens / 1_000_000).toFixed(tokens < 10_000_000 ? 1 : 0)}m`;
-}
-function normalizeTokenUsage(value: unknown): ThreadTokenUsage | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const numberValue = (key: string) => typeof record[key] === "number" && Number.isFinite(record[key]) ? Math.max(0, Number(record[key])) : undefined;
-  const totalTokens = numberValue("totalTokens");
-  if (totalTokens === undefined) return null;
+function threadTitle(thread: Thread) { return thread.name || thread.preview || "Untitled session"; }
+function notificationCopy(event: LiveNotificationEvent): { title: string; message: string } {
+  if (event.kind === "completed") return { title: "Session completed", message: "The current turn finished successfully." };
+  if (event.kind === "failed") return { title: "Session failed", message: event.message ? truncateNotification(event.message) : "The current turn ended with an error." };
+  if (event.kind === "approval") return { title: "Approval needed", message: "Work is paused until you review the pending request." };
+  const count = event.queuedCount || 1;
   return {
-    totalTokens,
-    inputTokens: numberValue("inputTokens"),
-    outputTokens: numberValue("outputTokens"),
-    cachedInputTokens: numberValue("cachedInputTokens"),
-    reasoningOutputTokens: numberValue("reasoningOutputTokens")
+    title: "Session queued",
+    message: count > 1 ? `${count} new tasks were added to the queue.` : event.message ? `Queued: ${truncateNotification(event.message)}` : "A task was added to the queue."
   };
 }
-function extractThreadTokenUsage(thread: Thread): ThreadTokenUsage | null {
-  const candidate = (thread as Thread & { tokenUsage?: { total?: unknown } | unknown; usage?: unknown }).tokenUsage;
-  if (candidate && typeof candidate === "object" && "total" in candidate) {
-    const total = normalizeTokenUsage((candidate as { total?: unknown }).total);
-    if (total) return total;
-  }
-  return normalizeTokenUsage(candidate) || normalizeTokenUsage((thread as Thread & { usage?: unknown }).usage);
+function truncateNotification(value: string): string {
+  const normalized = value.trim().replace(/\s+/g, " ");
+  return normalized.length > 160 ? `${normalized.slice(0, 157)}…` : normalized;
 }
-function mergeThreadTokenUsage(current: Record<string, ThreadTokenUsage>, threads: Thread[]): Record<string, ThreadTokenUsage> {
-  let next = current;
-  for (const thread of threads) {
-    const usage = extractThreadTokenUsage(thread);
-    if (!usage || sameTokenUsage(current[thread.id], usage)) continue;
-    if (next === current) next = { ...current };
-    next[thread.id] = usage;
-  }
-  return next;
+function actionFailure(threadId: string, error: unknown, report: (error: unknown) => void, prefix?: string): SessionActionResult {
+  const normalized = error instanceof Error ? error : apiErrorFromPayload(error, { scope: "sessions", sessionId: threadId });
+  report(normalized);
+  return { threadId, status: "failed", message: prefix ? `${prefix}: ${normalized.message}` : normalized.message };
 }
-function tokensForThread(thread: Thread, usage?: ThreadTokenUsage): number | null {
-  return usage?.totalTokens ?? (thread.goal?.tokensUsed && thread.goal.tokensUsed > 0 ? thread.goal.tokensUsed : null);
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
-function timeAgo(timestamp: number): string {
-  const seconds = Math.max(0, Date.now() / 1000 - timestamp);
-  if (seconds < 60) return "now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d`;
-  return new Date(timestamp * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-function showError(error: unknown, setter: (value: string) => void) { setter(error instanceof Error ? error.message : String(error)); }
-function sameBootstrapSummary(current: Bootstrap | null, next: Bootstrap): boolean {
-  if (!current) return false;
-  return JSON.stringify([current.models, current.account, current.usage, current.backendStatus, current.roots, current.sparkAgentThreadIds, current.claudeAvailable, current.claudeModelOptions])
-    === JSON.stringify([next.models, next.account, next.usage, next.backendStatus, next.roots, next.sparkAgentThreadIds, next.claudeAvailable, next.claudeModelOptions]);
-}
-function samePendingRequests(current: PendingRequest[], next: PendingRequest[]): boolean {
-  return current.length === next.length && current.every((request, index) => request.id === next[index].id
-    && request.method === next[index].method
-    && request.receivedAt === next[index].receivedAt
-    && JSON.stringify(request.params) === JSON.stringify(next[index].params));
-}
-function sameQueue(current: QueueEntry[], next: QueueEntry[]): boolean {
-  return current.length === next.length && current.every((entry, index) => entry.id === next[index].id
-    && entry.text === next[index].text
-    && entry.model === next[index].model
-    && entry.effort === next[index].effort
-    && entry.createdAt === next[index].createdAt);
-}
-function sameQueues(current: Record<string, QueueEntry[]>, next: Record<string, QueueEntry[]>): boolean {
-  return sameRecord(current, next, (currentQueue, nextQueue) => Boolean(currentQueue) && sameQueue(currentQueue!, nextQueue));
-}
-function sameSet<T>(current: Set<T>, next: Set<T>): boolean {
-  return current.size === next.size && [...current].every((value) => next.has(value));
-}
-function sameRecord<T>(current: Record<string, T>, next: Record<string, T>, compare: (current: T | undefined, next: T) => boolean): boolean {
-  const currentKeys = Object.keys(current);
-  const nextKeys = Object.keys(next);
-  return currentKeys.length === nextKeys.length && nextKeys.every((key) => compare(current[key], next[key]));
-}
-function sameNumberRecord(current: Record<string, number>, next: Record<string, number>): boolean {
-  return sameRecord(current, next, (currentValue, nextValue) => currentValue === nextValue);
-}
-function sameThreadStatus(current: Thread["status"] | undefined, next: Thread["status"]): boolean {
-  if (!current || current.type !== next.type) return false;
-  const currentFlags = current.activeFlags || [];
-  const nextFlags = next.activeFlags || [];
-  return currentFlags.length === nextFlags.length && currentFlags.every((flag, index) => flag === nextFlags[index]);
-}
-function sameTokenUsage(current: ThreadTokenUsage | undefined, next: ThreadTokenUsage): boolean {
-  return Boolean(current)
-    && current!.totalTokens === next.totalTokens
-    && current!.inputTokens === next.inputTokens
-    && current!.outputTokens === next.outputTokens
-    && current!.cachedInputTokens === next.cachedInputTokens
-    && current!.reasoningOutputTokens === next.reasoningOutputTokens;
-}
-function threadItemRevision(item: ThreadItem | undefined): string {
-  if (!item) return "";
-  return [item.id, item.type, item.status, item.text?.length, item.aggregatedOutput?.length, item.exitCode,
-    item.summary?.length, item.changes?.length, JSON.stringify(item.error || null)].join(":");
-}
-function sameThreadSnapshot(current: Thread | undefined | null, next: Thread): boolean {
-  if (!current
-    || current.id !== next.id
-    || current.name !== next.name
-    || current.preview !== next.preview
-    || current.cwd !== next.cwd
-    || current.createdAt !== next.createdAt
-    || current.updatedAt !== next.updatedAt
-    || current.recencyAt !== next.recencyAt
-    || current.policy !== next.policy
-    || current.backend !== next.backend
-    || current.sessionClass !== next.sessionClass
-    || current.claudeModel !== next.claudeModel
-    || current.claudeEffort !== next.claudeEffort
-    || current.claudePermissionMode !== next.claudePermissionMode
-    || current.category !== next.category
-    || current.gitInfo?.branch !== next.gitInfo?.branch
-    || !sameThreadStatus(current.status, next.status)
-    || current.turns.length !== next.turns.length
-    || current.goal?.updatedAt !== next.goal?.updatedAt
-    || current.goal?.status !== next.goal?.status
-    || current.goal?.tokensUsed !== next.goal?.tokensUsed) return false;
-  const currentTurn = current.turns.at(-1);
-  const nextTurn = next.turns.at(-1);
-  if (next.backend === "claude" && currentTurn?.items.at(-1)?.text !== nextTurn?.items.at(-1)?.text) return false;
-  return currentTurn?.id === nextTurn?.id
-    && currentTurn?.status === nextTurn?.status
-    && currentTurn?.startedAt === nextTurn?.startedAt
-    && currentTurn?.completedAt === nextTurn?.completedAt
-    && currentTurn?.items.length === nextTurn?.items.length
-    && threadItemRevision(currentTurn?.items.at(-1)) === threadItemRevision(nextTurn?.items.at(-1));
-}
-function reconcileThreads(current: Thread[], next: Thread[]): Thread[] {
-  const byId = new Map(current.map((thread) => [thread.id, thread]));
-  let unchanged = current.length === next.length;
-  const reconciled = next.map((thread, index) => {
-    const previous = byId.get(thread.id);
-    const value = sameThreadSnapshot(previous, thread) ? previous! : thread;
-    if (current[index] !== value) unchanged = false;
-    return value;
-  });
-  return unchanged ? current : reconciled;
-}
-function sameThreadItem(current: ThreadItem | undefined, next: ThreadItem): boolean {
-  return current === next || Boolean(current) && JSON.stringify(current) === JSON.stringify(next);
-}
-function setNestedValue<T>(current: Record<string, Record<string, T>>, groupId: string, itemId: string, value: T, compare: (current: T | undefined, next: T) => boolean): Record<string, Record<string, T>> {
-  if (compare(current[groupId]?.[itemId], value)) return current;
-  return { ...current, [groupId]: { ...(current[groupId] || {}), [itemId]: value } };
-}
-function appendLiveDeltas(current: LiveStreams, deltas: LiveStreams): LiveStreams {
-  let next = current;
-  for (const [threadId, itemDeltas] of Object.entries(deltas)) {
-    const currentThread = current[threadId] || EMPTY_TEXT_STREAM;
-    const nextThread = { ...currentThread };
-    for (const [itemId, delta] of Object.entries(itemDeltas)) nextThread[itemId] = appendBoundedText(nextThread[itemId] || "", delta);
-    if (next === current) next = { ...current };
-    next[threadId] = nextThread;
-  }
-  return next;
-}
-function appendBoundedText(current: string, delta: string): string {
-  const next = current + delta;
-  if (next.length <= CLIENT_LIVE_OUTPUT_MAX_CHARS) return next;
-  const marker = "…[earlier output truncated]\n";
-  return marker + next.slice(-(CLIENT_LIVE_OUTPUT_MAX_CHARS - marker.length));
-}
-function mergeTokenUsage(current: Record<string, ThreadTokenUsage>, updates: Record<string, ThreadTokenUsage>): Record<string, ThreadTokenUsage> {
-  let next = current;
-  for (const [threadId, usage] of Object.entries(updates)) {
-    if (sameTokenUsage(current[threadId], usage)) continue;
-    if (next === current) next = { ...current };
-    next[threadId] = usage;
-  }
-  return next;
-}
-function mergeLiveState<T>(current: Record<string, Record<string, T>>, state: Record<string, LiveThreadState>, key: "items" | "agentText" | "toolOutput"): Record<string, Record<string, T>> {
-  let next = current;
-  for (const [threadId, value] of Object.entries(state)) {
-    const incoming = value[key] as Record<string, T>;
-    const existing = current[threadId] || {};
-    const merged = { ...existing, ...incoming };
-    const equal = sameRecord(existing, merged, (currentValue, nextValue) => currentValue === nextValue || JSON.stringify(currentValue) === JSON.stringify(nextValue));
-    if (equal) continue;
-    if (next === current) next = { ...current };
-    next[threadId] = merged;
-  }
-  return next;
-}
-function withoutSetValue<T>(values: Set<T>, value: T): Set<T> {
-  if (!values.has(value)) return values;
-  const next = new Set(values);
-  next.delete(value);
-  return next;
-}
-function useControlColumns(): number {
-  const getColumns = () => window.innerWidth >= 1700 ? 4 : window.innerWidth >= 1150 ? 3 : window.innerWidth >= 680 ? 2 : 1;
-  const [columns, setColumns] = useState(getColumns);
+function readSortMode(): SortMode { const value = readStoredString("forgedeck-sort"); return value === "created" || value === "name" || value === "directory" || value === "status" ? value : "updated"; }
+function readSortDirection(): SortDirection { return readStoredString("forgedeck-sort-direction") === "asc" ? "asc" : "desc"; }
+function readPollInterval() { const value = Number(readStoredString("forgedeck-poll-interval")); return POLL_INTERVALS.includes(value as typeof POLL_INTERVALS[number]) ? value : 4_000; }
+function readTheme(): ThemeMode { const value = readStoredString("forgedeck-theme"); return value === "dark" || value === "light" || value === "system" ? value : "system"; }
+function readView(): SidebarView { const value = readStoredString("forgedeck-view"); return value === "control" || value === "spark" || value === "missions" || value === "compare" || value === "evals" || value === "archive" ? value : "session"; }
+function shortcutModifierLabel(): string { return /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? "⌘" : "Ctrl+"; }
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
   useEffect(() => {
-    const queries = [window.matchMedia("(min-width: 680px)"), window.matchMedia("(min-width: 1150px)"), window.matchMedia("(min-width: 1700px)")];
-    const update = () => setColumns(getColumns());
-    for (const query of queries) query.addEventListener("change", update);
-    return () => { for (const query of queries) query.removeEventListener("change", update); };
-  }, []);
-  return columns;
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+  return matches;
 }
-function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
-  if (!Object.prototype.hasOwnProperty.call(record, key)) return record;
-  const next = { ...record };
-  delete next[key];
-  return next;
-}
-function truncate(value: string, limit: number): string { return value.length > limit ? `${value.slice(0, limit - 1)}…` : value; }
-function toolLabel(type: string): string {
-  return type.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (character) => character.toUpperCase());
-}
-function isToolItem(item: ThreadItem): boolean {
-  return !["userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "hookPrompt"].includes(item.type);
-}
-
-function messageFingerprint(item: ThreadItem): string | null {
-  if (item.type === "agentMessage") return `agent:${(item.text || "").trim()}`;
-  if (item.type !== "userMessage") return null;
-  const text = item.content?.filter((part) => part.type === "text").map((part) => part.text || "").join("\n").trim() || "";
-  return `user:${text}`;
-}
-
-function unseenLiveItems(history: ThreadItem[], live: ThreadItem[]): ThreadItem[] {
-  const historyIds = new Set(history.map((item) => item.id).filter(Boolean));
-  const historyMessageCounts = new Map<string, number>();
-  const canonicalUserMessages = new Set(live.filter((item) => item.type === "userMessage" && item.id && !item.id.startsWith("user-")).map(messageFingerprint).filter((value): value is string => Boolean(value)));
-  for (const item of history) {
-    const fingerprint = messageFingerprint(item);
-    if (fingerprint) historyMessageCounts.set(fingerprint, (historyMessageCounts.get(fingerprint) || 0) + 1);
-  }
-  return live.filter((item) => {
-    if (item.id && historyIds.has(item.id)) return false;
-    const fingerprint = messageFingerprint(item);
-    if (item.type === "userMessage" && item.id?.startsWith("user-") && fingerprint && canonicalUserMessages.has(fingerprint)) return false;
-    if (!fingerprint) return true;
-    const historyCount = historyMessageCounts.get(fingerprint) || 0;
-    if (historyCount > 0) {
-      historyMessageCounts.set(fingerprint, historyCount - 1);
-      return false;
-    }
-    return true;
-  });
-}
-
-function selectControlItems(items: ThreadItem[], limit: number): ThreadItem[] {
-  const selected = new Set<number>();
-  for (let index = Math.max(0, items.length - limit); index < items.length; index += 1) selected.add(index);
-  let retainedChanges = 0;
-  for (let index = items.length - 1; index >= 0 && retainedChanges < 2; index -= 1) {
-    if (items[index].type === "fileChange") {
-      selected.add(index);
-      retainedChanges += 1;
-    }
-  }
-  return [...selected].sort((a, b) => a - b).map((index) => items[index]);
+function readLinkedSessionId(): string | null {
+  const value = new URLSearchParams(window.location.search).get("session");
+  return value && /^[a-zA-Z0-9_-]{8,128}$/.test(value) ? value : null;
 }

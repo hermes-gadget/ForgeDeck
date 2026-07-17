@@ -23,7 +23,8 @@ test("apply_patch wrappers are not classified as shell commands", () => {
 
 test("writable rollout discovery distinguishes live sessions from stale files", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-proc-"));
-  const rollout = path.join(os.homedir(), ".codex", "sessions", "2026", "rollout-live.jsonl");
+  const sessionsRoot = path.join(os.homedir(), ".codex", "sessions");
+  const rollout = path.join(sessionsRoot, "2026", "rollout-live.jsonl");
   const fd = path.join(root, "123", "fd");
   const fdinfo = path.join(root, "123", "fdinfo");
   fs.mkdirSync(fd, { recursive: true });
@@ -34,14 +35,17 @@ test("writable rollout discovery distinguishes live sessions from stale files", 
   fs.writeFileSync(path.join(fdinfo, "45"), "pos:\t0\nflags:\t0100000\n");
 
   try {
-    assert.deepEqual(findWritableRolloutPaths(root), new Set([rollout]));
+    assert.deepEqual(findWritableRolloutPaths(root, sessionsRoot), new Set([rollout]));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("writable rollout discovery degrades safely without procfs", () => {
-  assert.equal(findWritableRolloutPaths(path.join(os.tmpdir(), "forgedeck-missing-proc")), null);
+  assert.equal(findWritableRolloutPaths(
+    path.join(os.tmpdir(), "forgedeck-missing-proc"),
+    path.join(os.homedir(), ".codex", "sessions")
+  ), null);
 });
 
 test("latest lifecycle state is recovered from beyond the retained activity tail", () => {

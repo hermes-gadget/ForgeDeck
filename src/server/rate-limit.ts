@@ -17,7 +17,10 @@ export function createRateLimiter(options: RateLimitOptions) {
 
   return (req: Request, res: Response, next: NextFunction): void => {
     const now = Date.now();
-    const key = options.key?.(req) || req.ip || req.socket.remoteAddress || "unknown";
+    // socket.remoteAddress is assigned by the transport and cannot be rotated
+    // with a spoofed X-Forwarded-For header. Deployments that terminate at a
+    // trusted proxy may provide an explicit validated key function instead.
+    const key = options.key?.(req) || req.socket.remoteAddress || "unknown";
     let window = windows.get(key);
     if (!window || window.resetAt <= now) {
       window = { count: 0, resetAt: now + options.windowMs };

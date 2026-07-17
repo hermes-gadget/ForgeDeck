@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks";
-import type { Request, RequestHandler } from "express";
 import { logger } from "./logger.js";
+import type { Request, RequestHandler } from "express";
 
 type MutableRouteStats = {
   count: number;

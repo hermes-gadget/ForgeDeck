@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
 import { CodexBridge, CodexBridgeError, type CodexNotification } from "./codex-bridge.js";
+import type { AddressInfo } from "node:net";
 
 type ProtocolHarness = { handleLine: (line: string) => void };
 
@@ -23,17 +23,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
   }
 }
 
-async function withMockServer(run: (server: WebSocketServer) => Promise<void>): Promise<void> {
-  const previousUrl = process.env.CODEX_APP_SERVER_URL;
+async function withMockServer(run: (server: WebSocketServer, url: string) => Promise<void>): Promise<void> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(server, "listening");
   const address = server.address() as AddressInfo;
-  process.env.CODEX_APP_SERVER_URL = `ws://127.0.0.1:${address.port}`;
   try {
-    await run(server);
+    await run(server, `ws://127.0.0.1:${address.port}`);
   } finally {
-    if (previousUrl === undefined) delete process.env.CODEX_APP_SERVER_URL;
-    else process.env.CODEX_APP_SERVER_URL = previousUrl;
     for (const client of server.clients) client.terminate();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -129,7 +125,7 @@ test("archiving a session dismisses every pending request for that thread", () =
 });
 
 test("a safe RPC recovers across a transient transport crash with exponential retry", async () => {
-  await withMockServer(async (server) => {
+  await withMockServer(async (server, url) => {
     let attempts = 0;
     installProtocolHandler(server, (socket, message) => {
       if (message.method !== "thread/read") return;
@@ -138,7 +134,12 @@ test("a safe RPC recovers across a transient transport crash with exponential re
       else socket.send(JSON.stringify({ id: message.id, result: { thread: { id: "thread-789" } } }));
     });
 
-    const bridge = new CodexBridge({ requestRetries: 2, retryBaseDelayMs: 1, retryMaxDelayMs: 2 });
+    const bridge = new CodexBridge({
+      runtime: { bin: "codex", appServerUrl: url, environment: {} },
+      requestRetries: 2,
+      retryBaseDelayMs: 1,
+      retryMaxDelayMs: 2
+    });
     bridge.on("error", () => undefined);
     try {
       const result = await bridge.request<{ thread: { id: string } }>("thread/read", { threadId: "thread-789" }, 1_000);
@@ -153,7 +154,7 @@ test("a safe RPC recovers across a transient transport crash with exponential re
 });
 
 test("a dispatched turn/start is not replayed after an ambiguous connection loss", async () => {
-  await withMockServer(async (server) => {
+  await withMockServer(async (server, url) => {
     let attempts = 0;
     installProtocolHandler(server, (socket, message) => {
       if (message.method !== "turn/start") return;
@@ -161,7 +162,12 @@ test("a dispatched turn/start is not replayed after an ambiguous connection loss
       socket.terminate();
     });
 
-    const bridge = new CodexBridge({ requestRetries: 2, retryBaseDelayMs: 1, retryMaxDelayMs: 2 });
+    const bridge = new CodexBridge({
+      runtime: { bin: "codex", appServerUrl: url, environment: {} },
+      requestRetries: 2,
+      retryBaseDelayMs: 1,
+      retryMaxDelayMs: 2
+    });
     bridge.on("error", () => undefined);
     try {
       await assert.rejects(bridge.request("turn/start", { threadId: "thread-abc", input: [] }, 1_000));
@@ -175,7 +181,7 @@ test("a dispatched turn/start is not replayed after an ambiguous connection loss
 });
 
 test("active session state is reconciled after a connection crash", async () => {
-  await withMockServer(async (server) => {
+  await withMockServer(async (server, url) => {
     installProtocolHandler(server, (socket, message) => {
       if (message.method === "thread/read") {
         socket.send(JSON.stringify({
@@ -186,6 +192,7 @@ test("active session state is reconciled after a connection crash", async () => 
     });
 
     const bridge = new CodexBridge({
+      runtime: { bin: "codex", appServerUrl: url, environment: {} },
       reconnectBaseDelayMs: 1,
       reconnectMaxDelayMs: 2,
       sessionRecoveryTimeoutMs: 100
@@ -234,11 +241,14 @@ test("running session tracking is capped to prevent unbounded retention", () => 
 });
 
 test("timed out RPCs are removed from pending state and reflected in metrics", async () => {
-  await withMockServer(async (server) => {
+  await withMockServer(async (server, url) => {
     installProtocolHandler(server, () => {
       // Deliberately leave the request unanswered.
     });
-    const bridge = new CodexBridge({ requestRetries: 2 });
+    const bridge = new CodexBridge({
+      runtime: { bin: "codex", appServerUrl: url, environment: {} },
+      requestRetries: 2
+    });
     bridge.on("error", () => undefined);
     try {
       await assert.rejects(
