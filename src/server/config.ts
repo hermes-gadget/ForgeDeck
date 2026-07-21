@@ -221,13 +221,13 @@ const CONFIG_DEFINITIONS: readonly ConfigDefinition[] = Object.freeze([
   definition("FORGEDECK_AUDIT_MAX_BYTES", CONFIG_DEFAULTS.auditMaxBytes, "Maximum retained audit data size in bytes."),
   definition("FORGEDECK_MCP_ACTOR_LIFETIME_HOURS", CONFIG_DEFAULTS.mcpActorLifetimeHours, "MCP credential lifetime in hours; refresh preserves the actor identity."),
   definition("FORGEDECK_MCP_ACTOR_INACTIVITY_TTL_HOURS", CONFIG_DEFAULTS.mcpActorInactivityTtlHours, "Inactive MCP credential expiry in hours; recovery preserves the actor identity."),
-  definition("FORGEDECK_URL", "http://127.0.0.1:FORGEDECK_PORT", "Dashboard API URL used by the stdio MCP server."),
-  definition("FORGEDECK_MCP_TOKEN_FILE", "FORGEDECK_DATA_DIR/mcp-token", "MCP bootstrap-token path."),
+  definition("FORGEDECK_URL", "http://127.0.0.1:4173", "Dashboard API URL used by the stdio MCP server."),
+  definition("FORGEDECK_MCP_TOKEN_FILE", "${FORGEDECK_DATA_DIR}/mcp-token", "MCP bootstrap-token path."),
   definition("FORGEDECK_MCP_CLIENT_ID", CONFIG_DEFAULTS.mcpClientId, "Stable MCP client scope used to persist and recover one actor identity."),
   definition("FORGEDECK_LOG_LEVEL", CONFIG_DEFAULTS.logLevel, "Structured log threshold: debug, info, warn, or error."),
   definition("FORGEDECK_REQUEST_LOG_SAMPLE_RATE", CONFIG_DEFAULTS.requestLogSampleRate, "Successful request-log sample rate from 0 to 1."),
   definition("NODE_ENV", CONFIG_DEFAULTS.nodeEnvironment, "Runtime mode; non-production modes include error stacks."),
-  definition("PATH", `${CONFIG_DEFAULTS.executableSearchPath}${path.delimiter}~/.local/bin`, "Executable search path inherited by adapters.", false)
+  definition("PATH", `${CONFIG_DEFAULTS.executableSearchPath}${path.delimiter}${"$"}{HOME}/.local/bin`, "Executable search path inherited by adapters.", false)
 ]);
 
 /** Renders the checked-in operator reference without maintaining a second defaults list. */
