@@ -1,0 +1,14 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/server/index.ts",
+    "src/server/**/*.test.ts",
+    "scripts/*.mjs"
+  ],
+  "project": ["src/**/*.{ts,tsx}", "scripts/*.mjs"],
+  "ignore": ["build/**", "dist/**", ".improvements/**"],
+  "ignoreIssues": {
+    "src/shared/contracts.ts": ["exports", "types"]
+  },
+  "ignoreBinaries": ["which"]
+}

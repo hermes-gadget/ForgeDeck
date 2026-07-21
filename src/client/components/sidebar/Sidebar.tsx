@@ -208,7 +208,7 @@ export const Sidebar = memo(function Sidebar({
       <button ref={(element) => setViewRef("control", element)} id="workspace-tab-control" role="tab" aria-controls="workspace-panel" aria-label={`Control Center, ${controlIds.size} sessions`} aria-selected={view === "control"} tabIndex={view === "control" ? 0 : -1} className={view === "control" ? "active" : ""} title={`Board · ${modifierLabel}[ / ${modifierLabel}]`} onKeyDown={(event) => handleViewKeyDown(event, "control")} onClick={() => onView("control")}><LayoutGrid size={12} />Board<span>{controlIds.size}</span></button>
       <button ref={(element) => setViewRef("spark", element)} id="workspace-tab-spark" role="tab" aria-controls="workspace-panel" aria-label={`SparkBoard, ${sparkIds.size} sessions`} aria-selected={view === "spark"} tabIndex={view === "spark" ? 0 : -1} className={view === "spark" ? "active" : ""} title={`Spark · ${modifierLabel}[ / ${modifierLabel}]`} onKeyDown={(event) => handleViewKeyDown(event, "spark")} onClick={() => onView("spark")}><Sparkles size={12} />Spark<span>{sparkIds.size}</span></button>
     </div>
-    <UsageCard usage={bootstrap.usage} plan={bootstrap.account.account?.planType} backendStatus={bootstrap.backendStatus} />
+    <UsageCard usage={bootstrap.usage} backendStatus={bootstrap.backendStatus} />
     <div className="session-tools">
       <label className="search-box" title="Search sessions (/)"><Search size={15} /><span className="sr-only">Search sessions</span><input ref={searchRef} value={search} onChange={(event) => onSearch(event.target.value)} placeholder="Find a session…  /" /></label>
       <select value={sortMode} onChange={(event) => onSort(event.target.value as SortMode)} aria-label="Sort sessions; pinned sessions stay first" title="Sort sessions">
@@ -353,7 +353,7 @@ function ProviderUsageRow({ icon, provider, name, available, percent = null }: P
   return <div className={`provider-usage-row provider-${provider} ${available ? "" : "unavailable"}`}><span className="provider-usage-icon">{icon}</span><strong>{name}</strong>{!available ? <span className="provider-usage-status">Unavailable</span> : <span className="provider-usage-meter"><span>{roundedPercent === null ? "—" : `${roundedPercent}%`}</span><progress max={100} value={roundedPercent ?? 0} aria-label={`${name} usage`} /></span>}</div>;
 }
 
-function UsageCard({ usage, plan, backendStatus }: { usage: Usage | null; plan?: string; backendStatus?: Bootstrap["backendStatus"] }) {
+function UsageCard({ usage, backendStatus }: { usage: Usage | null; backendStatus?: Bootstrap["backendStatus"] }) {
   const legacyCodex = usage?.rateLimitsByLimitId?.codex || usage?.rateLimits;
   const clamp = (value?: number) => value === undefined ? null : Math.min(100, Math.max(0, value));
   return <section className="usage-card" aria-label="Provider usage"><div className="usage-top"><span><Gauge size={15} /> Usage</span></div><div className="provider-usage-list">
@@ -369,7 +369,6 @@ function ProviderIcon({ thread, size }: { thread: Thread; size: number }) {
 function threadTitle(thread: Thread) { return thread.name || thread.preview || "Untitled session"; }
 function basename(value: string) { return value.split("/").filter(Boolean).pop() || value; }
 function initials(value: string) { return value.split(/[@.\s_-]/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "FD"; }
-function formatPlan(value?: string | null) { return value ? value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (char) => char.toUpperCase()) : "Codex"; }
 function guardianStatusText(thread: Thread): string | null {
   const state = thread.guardian;
   if (!state) return null;
