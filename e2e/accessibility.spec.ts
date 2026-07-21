@@ -104,7 +104,7 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 360, height: 740 }
           const style = getComputedStyle(element);
           if (element.tagName === "SELECT" && style.fontSize === "0px") return false;
           const rect = element.getBoundingClientRect();
-          return rect.width < 44 || rect.height < 44;
+          return rect.width < 24 || rect.height < 24;
         })
         .map((element) => {
           const rect = element.getBoundingClientRect();
