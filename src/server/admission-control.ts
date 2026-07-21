@@ -92,7 +92,7 @@ export type QuotaSnapshot = {
  * A reset-less Claude rejection is an incomplete provider signal, so it must
  * not inherit an unusually long operator-configured quota lifetime forever.
  */
-export const CLAUDE_RESETLESS_EXHAUSTION_MAX_AGE_MS = 60 * 60_000;
+const CLAUDE_RESETLESS_EXHAUSTION_MAX_AGE_MS = 60 * 60_000;
 
 export function quotaObservationLifetimeMs(
   quota: Pick<QuotaSnapshot, "provider" | "usedPercent" | "resetAt">,
