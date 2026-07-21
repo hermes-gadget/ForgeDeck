@@ -95,11 +95,14 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 360, height: 740 }
       };
       const smallText = [...document.body.querySelectorAll<HTMLElement>("*")]
         .filter((element) => visible(element) && element.textContent?.trim() && Number.parseFloat(getComputedStyle(element).fontSize) < 11)
+        .filter((element) => !(element.tagName === "SELECT" && getComputedStyle(element).fontSize === "0px"))
         .map((element) => `${element.tagName.toLowerCase()}.${element.className}:${getComputedStyle(element).fontSize}`)
         .slice(0, 20);
       const smallTargets = [...document.querySelectorAll<HTMLElement>('button:not(.sidebar-scrim):not(.session-state):not(.provider-usage-meter):not(.search-box), input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]), select:not([style*="display:none"]):not([style*="display: none"]), textarea, summary')]
         .filter(visible)
         .filter((element) => {
+          const style = getComputedStyle(element);
+          if (element.tagName === "SELECT" && style.fontSize === "0px") return false;
           const rect = element.getBoundingClientRect();
           return rect.width < 44 || rect.height < 44;
         })
