@@ -11,8 +11,7 @@ export function mergeBackendStatus(status: AccountStatus, patch: BackendStatusPa
     ...status,
     backendStatus: {
       codex: patch.codex ? { ...status.backendStatus.codex, ...patch.codex } : status.backendStatus.codex,
-      spark: patch.spark ? { ...status.backendStatus.spark, ...patch.spark } : status.backendStatus.spark,
-      claude: patch.claude ? { ...status.backendStatus.claude, ...patch.claude } : status.backendStatus.claude
+      spark: patch.spark ? { ...status.backendStatus.spark, ...patch.spark } : status.backendStatus.spark
     }
   };
 }

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { timestampSchema } from "../shared/contracts.js";
 import { ForgeDeckApiError, endpointMayUseAdapter } from "./mcp-client.js";
-import type { AccountStatus, Bootstrap } from "../shared/contracts.js";
+import type { AccountStatus } from "../shared/contracts.js";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -67,9 +67,9 @@ export function summarizeThread(thread: JsonObject, activeIds: Set<string>, owne
     backend: stringOrNull(thread.backend) || stringOrNull(thread.provider) || "codex",
     session_class: stringOrNull(thread.sessionClass) || "standard",
     preset: stringOrNull(thread.preset),
-    model: firstString(thread.claudeModel, thread.model, lastTurn?.model),
-    reasoning_effort: firstString(thread.claudeEffort, thread.reasoningEffort, thread.reasoning_effort, thread.effort, lastTurn?.reasoningEffort, lastTurn?.effort),
-    effort: firstString(thread.claudeEffort, thread.reasoningEffort, thread.reasoning_effort, thread.effort, lastTurn?.reasoningEffort, lastTurn?.effort),
+    model: firstString(thread.model, lastTurn?.model),
+    reasoning_effort: firstString(thread.reasoningEffort, thread.reasoning_effort, thread.effort, lastTurn?.reasoningEffort, lastTurn?.effort),
+    effort: firstString(thread.reasoningEffort, thread.reasoning_effort, thread.effort, lastTurn?.reasoningEffort, lastTurn?.effort),
     state: running ? "running" : gated ? "gated" : stringOrNull(lastTurn?.status) || "idle",
     completion: compactValue(completion),
     agent_owned: owned,
@@ -394,7 +394,7 @@ export async function presentToolResult(action: () => Promise<JsonObject>): Prom
 }
 
 /** Shapes backend availability and quota data for MCP tools. */
-export function presentUsage(status: AccountStatus, bootstrap?: Bootstrap): JsonObject {
+export function presentUsage(status: AccountStatus): JsonObject {
   const usage = asObject(status.usage);
   const byLimitId = asObject(usage.rateLimitsByLimitId);
   const defaultLimits = asObject(usage.rateLimits);
@@ -407,14 +407,10 @@ export function presentUsage(status: AccountStatus, bootstrap?: Bootstrap): Json
   const backendStatus = asObject(status.backendStatus);
   const codexStatus = asObject(backendStatus.codex);
   const sparkStatus = asObject(backendStatus.spark);
-  const claudeStatus = asObject(backendStatus.claude);
-  const claudeActiveCount = Number(claudeStatus.activeCount);
-  const claudeMaxConcurrent = Number(claudeStatus.maxConcurrent);
   const account = asObject(asObject(status.account).account);
   const runtimeAvailable = asObject(status.runtime).available !== false;
   const codexAvailable = runtimeAvailable && codexStatus.available === true;
   const sparkAvailable = runtimeAvailable && sparkStatus.available === true;
-  const claudeAvailable = status.claudeAvailable === true;
   return {
     codex: {
       available: codexAvailable,
@@ -424,16 +420,6 @@ export function presentUsage(status: AccountStatus, bootstrap?: Bootstrap): Json
     spark: {
       available: sparkAvailable,
       rateLimit: publicRateLimit(sparkLimits)
-    },
-    claude: {
-      available: claudeAvailable,
-      subscriptionActive: claudeAvailable,
-      rateLimit: publicRateLimit(asObject(claudeStatus.rateLimit)),
-      activeCount: Number.isFinite(claudeActiveCount) ? claudeActiveCount : 0,
-      maxConcurrent: Number.isFinite(claudeMaxConcurrent) ? claudeMaxConcurrent : null,
-      modelOptions: (bootstrap?.claudeModelOptions || (Array.isArray(claudeStatus.modelOptions) ? claudeStatus.modelOptions.map(asObject) : []))
-        .map((model) => model.model)
-        .filter((model): model is string => typeof model === "string")
     }
   };
 }

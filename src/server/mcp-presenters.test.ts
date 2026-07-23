@@ -67,7 +67,7 @@ test("MCP session health distinguishes idle, stalled, failed, and normal session
   assert.equal(summarizeSessionHealth({
     ...base,
     status: { type: "idle" },
-    turns: [{ status: "completed", error: { message: "Claude exited with status 1" }, items: [] }]
+    turns: [{ status: "completed", error: { message: "Provider exited with status 1" }, items: [] }]
   }, new Set(), now), "error");
   assert.equal(summarizeSessionHealth({
     ...base,

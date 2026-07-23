@@ -7,7 +7,7 @@ export type SortMode = "updated" | "created" | "name" | "directory" | "status";
 export type SortDirection = "asc" | "desc";
 export type ThreadFilters = {
   status: "all" | "active" | "idle" | "error";
-  backend: "all" | "codex" | "claude";
+  backend: "all" | "codex";
   sessionClass: "all" | "standard" | "spark";
   model: string;
   workspace: string;

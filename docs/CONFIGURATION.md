@@ -34,7 +34,6 @@ ForgeDeck reads its environment once at process construction. Explicit overrides
 | `FORGEDECK_SPARK_TTL_HOURS` | `1` | Idle Spark-session archival age in hours; 0 disables it. |
 | `FORGEDECK_STANDARD_MAX_CONCURRENT` | `6` | Maximum concurrent standard Codex turns. |
 | `FORGEDECK_SPARK_MAX_CONCURRENT` | `16` | Maximum concurrent Spark turns. |
-| `FORGEDECK_CLAUDE_MAX_CONCURRENT` | `4` | Maximum concurrent Claude turns. |
 | `FORGEDECK_QUOTA_HEADROOM_PERCENT` | `10` | Provider quota percentage reserved before admission. |
 | `FORGEDECK_QUOTA_RESET_PROXIMITY_MS` | `300000` | Nearby quota-reset window in milliseconds. |
 | `FORGEDECK_QUOTA_STALE_MS` | `300000` | Maximum quota-observation age in milliseconds. |
@@ -43,8 +42,6 @@ ForgeDeck reads its environment once at process construction. Explicit overrides
 | `FORGEDECK_READ_MAX_CONCURRENT` | `16` | Maximum shared read and health operations. |
 | `FORGEDECK_MUTATION_MAX_CONCURRENT` | `5` | Maximum shared mutation and archive operations. |
 | `FORGEDECK_MAINTENANCE_CHUNK_SIZE` | `25` | Maximum records processed per maintenance chunk. |
-| `FORGEDECK_CLAUDE_BIN` | `claude` | Claude executable path or command name. |
-| `FORGEDECK_CLAUDE_AVAILABILITY_CACHE_TTL_MS` | `30000` | Claude availability cache duration in milliseconds. |
 | `CODEX_BIN` | `codex` | Codex executable path or command name. |
 | `CODEX_APP_SERVER_URL` | `none` | Existing Codex app-server WebSocket URL. |
 | `CODEX_HOME` | `~/.codex` | Codex state directory used by the external monitor. |

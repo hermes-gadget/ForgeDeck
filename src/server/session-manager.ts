@@ -36,7 +36,7 @@ import type { Artifact, ArtifactStatus, ModelPreset } from "../shared/contracts.
 export { DEFAULT_SESSION_TTL_MS } from "./config.js";
 
 export type SessionClass = "standard" | "spark";
-export type SessionBackend = "codex" | "claude";
+export type SessionBackend = "codex";
 export type SessionArchiveReason = "manual" | "ttl";
 export type WorkspaceLeaseMode = "read-only" | "exclusive";
 export type WorkspaceLease = {
@@ -70,8 +70,6 @@ export type SessionMetadata = {
   preset: ModelPreset | null;
   model: string | null;
   effort: string | null;
-  permissionMode: string | null;
-  maxTurns: number | null;
   lastPrompt: string | null;
   blueprintId: string | null;
   blueprintVersion: number | null;
@@ -211,8 +209,6 @@ type MetadataUpdate = {
   preset?: ModelPreset | null;
   model?: string | null;
   effort?: string | null;
-  permissionMode?: string | null;
-  maxTurns?: number | null;
   lastPrompt?: string | null;
   blueprintId?: string | null;
   blueprintVersion?: number | null;
@@ -450,10 +446,6 @@ export class SessionManager {
     model?: string;
     reasoningEffort?: string;
     effort?: string;
-    claudeModel?: string;
-    claudeEffort?: string;
-    claudePermissionMode?: string;
-    claudeMaxTurns?: number;
     blueprintId?: string;
     blueprintVersion?: number;
     blueprintEnvironment?: string;
@@ -503,13 +495,7 @@ export class SessionManager {
       ...(metadata.blueprintId ? { blueprintId: metadata.blueprintId } : {}),
       ...(metadata.blueprintVersion ? { blueprintVersion: metadata.blueprintVersion } : {}),
       ...(metadata.blueprintEnvironment ? { blueprintEnvironment: metadata.blueprintEnvironment } : {}),
-      ...(metadata.blueprintModelConfiguration ? { blueprintModelConfiguration: { ...metadata.blueprintModelConfiguration } } : {}),
-      ...(backend === "claude" ? {
-        ...(metadata.model ? { claudeModel: metadata.model } : {}),
-        ...(metadata.effort ? { claudeEffort: metadata.effort } : {}),
-        ...(metadata.permissionMode ? { claudePermissionMode: metadata.permissionMode } : {}),
-        ...(metadata.maxTurns ? { claudeMaxTurns: metadata.maxTurns } : {})
-      } : {})
+      ...(metadata.blueprintModelConfiguration ? { blueprintModelConfiguration: { ...metadata.blueprintModelConfiguration } } : {})
     };
   }
 
@@ -530,8 +516,6 @@ export class SessionManager {
         preset: update.preset === undefined ? previous?.preset || null : normalizeModelPreset(update.preset),
         model: update.model === undefined ? previous?.model || null : normalizeNullableString(update.model),
         effort: update.effort === undefined ? previous?.effort || null : normalizeNullableString(update.effort),
-        permissionMode: update.permissionMode === undefined ? previous?.permissionMode || null : normalizeNullableString(update.permissionMode),
-        maxTurns: update.maxTurns === undefined ? previous?.maxTurns || null : normalizeNullableInteger(update.maxTurns),
         lastPrompt: update.lastPrompt === undefined ? previous?.lastPrompt || null : normalizeNullableString(update.lastPrompt),
         blueprintId: update.blueprintId === undefined ? previous?.blueprintId || null : normalizeNullableString(update.blueprintId),
         blueprintVersion: update.blueprintVersion === undefined ? previous?.blueprintVersion || null : normalizeNullableInteger(update.blueprintVersion),
@@ -1394,10 +1378,6 @@ function timelineSummaryText(type: string, values: {
   if (values.method === "item/started") return `${readable(values.itemType || "item")} started`;
   if (values.method === "item/completed") return `${readable(values.itemType || "item")} completed`;
   if (values.method === "item/agentMessage/delta") return "Agent response updated";
-  if (type === "claude-turn") {
-    if (values.state === "failed") return `Claude turn failed${values.error ? `: ${values.error}` : ""}`;
-    return `Claude turn ${readable(values.state || "updated")}`;
-  }
   if (type === "guardian") return `Guardian ${readable(values.reason || values.state || "updated")}`;
   if (type === "queue") return values.error ? `Queue error: ${values.error}` : "Queue updated";
   if (type === "threads") return `Session ${readable(values.action || "updated")}`;
@@ -1405,8 +1385,8 @@ function timelineSummaryText(type: string, values: {
   return [readable(type), values.action || values.state || values.status || values.reason].filter(Boolean).join(" · ");
 }
 
-function terminalOutcome(type: string, method: string | null, state: string | null, status: string | null): SessionEventOutcome | null {
-  const terminal = method === "turn/completed" || (type === "claude-turn" && (state === "completed" || state === "failed"));
+function terminalOutcome(_type: string, method: string | null, state: string | null, status: string | null): SessionEventOutcome | null {
+  const terminal = method === "turn/completed";
   if (!terminal) return null;
   const normalized = (status || state || "completed").toLocaleLowerCase("en-US");
   if (normalized === "failed" || normalized === "error") return "failed";
@@ -1603,14 +1583,12 @@ function normalizeStoredMetadata(value: unknown): SessionMetadata {
     createdAt: finiteNumber(candidate.createdAt),
     updatedAt: finiteNumber(candidate.updatedAt),
     sessionClass: candidate.sessionClass === "spark" ? "spark" : "standard",
-    backend: candidate.backend === "claude" ? "claude" : "codex",
+    backend: "codex",
     cwd: normalizeNullableString(candidate.cwd),
     name: normalizeNullableString(candidate.name),
     preset: normalizeModelPreset((candidate as Record<string, unknown>).preset),
     model: normalizeNullableString(candidate.model),
     effort: normalizeNullableString(candidate.effort),
-    permissionMode: normalizeNullableString(candidate.permissionMode),
-    maxTurns: normalizeNullableInteger(candidate.maxTurns),
     lastPrompt: normalizeNullableString((candidate as Record<string, unknown>).lastPrompt),
     blueprintId: normalizeNullableString((candidate as Record<string, unknown>).blueprintId),
     blueprintVersion: normalizeNullableInteger((candidate as Record<string, unknown>).blueprintVersion),
@@ -1789,7 +1767,7 @@ function normalizeSessionClass(value: unknown, previous: SessionClass | undefine
 
 function normalizeBackend(value: unknown, previous: SessionBackend | undefined): SessionBackend {
   if (value === undefined) return previous || "codex";
-  if (value !== "codex" && value !== "claude") throw new Error("Invalid session backend");
+  if (value !== "codex") throw new Error("Invalid session backend");
   return value;
 }
 
@@ -1869,7 +1847,7 @@ function finiteNullableNumber(value: unknown): number | null {
 function emptyMetadata(): SessionMetadata {
   return {
     tags: [], category: null, createdAt: 0, updatedAt: 0, sessionClass: "standard", backend: "codex",
-    cwd: null, name: null, preset: null, model: null, effort: null, permissionMode: null, maxTurns: null, lastPrompt: null,
+    cwd: null, name: null, preset: null, model: null, effort: null, lastPrompt: null,
     blueprintId: null, blueprintVersion: null, blueprintEnvironment: null, blueprintModelConfiguration: null,
     archiveState: "active", archivedAt: null, archiveReason: null, pinned: false,
     knowledgePackIds: [], knowledgeContextInjectedAt: null, policyWarnings: [], workspaceLeaseMode: "exclusive",
@@ -1956,7 +1934,7 @@ function normalizeBlueprintModelConfiguration(value: unknown): BlueprintRunModel
   if (!model) return null;
   const preset = normalizeModelPreset(candidate.preset);
   return {
-    backend: candidate.backend === "claude" ? "claude" : "codex",
+    backend: "codex",
     model,
     effort: normalizeNullableString(candidate.effort),
     ...(preset ? { preset } : {})

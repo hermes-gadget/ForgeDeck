@@ -24,7 +24,7 @@ test("comparisons persist parallel outputs, pairwise diffs, and judge state in S
         { provider: "codex", model: "model-a", reasoningEffort: "low" },
         { provider: "codex", model: "model-b", reasoningEffort: "high" }
       ],
-      judge: { provider: "claude", model: "sonnet", reasoningEffort: "high" }
+      judge: { provider: "codex", model: "model-c", reasoningEffort: "high" }
     });
     assert.equal(created.status, "queued");
     assert.equal(created.results.length, 2);

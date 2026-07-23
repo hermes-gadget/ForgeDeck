@@ -1,15 +1,15 @@
 # ForgeDeck
 
-ForgeDeck is a private, local-first web command deck for running many Codex and Claude Code sessions at once. Pick a workspace, choose from the models and reasoning levels available on your Codex or Claude account, and leave turns running after every browser tab has closed.
+ForgeDeck is a private, local-first web command deck for running many Codex sessions at once. Pick a workspace, choose from the models and reasoning levels available on your Codex account, and leave turns running after every browser tab has closed.
 
-The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. ForgeDeck talks to the installed `codex app-server` and `claude` CLI, which continue using the host's existing logins and session stores.
+The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. ForgeDeck talks to the installed `codex app-server`, which continues using the host's existing login and session store.
 
 ## What it includes
 
-- Persistent Codex and Claude Code threads that survive browser disconnects and server restarts
-- Account-native model and reasoning choices loaded dynamically from Codex and Claude
+- Persistent Codex threads that survive browser disconnects and server restarts
+- Account-native model and reasoning choices loaded dynamically from Codex
 - Transparent Quick, Balanced, and Deep presets with manual model/effort control
-- Live account plan usage percentage and reset time for Codex, Claude, and Spark
+- Live account plan usage percentage and reset time for Codex and Spark
 - Loopback-only networking by default, with explicit LAN acknowledgement and reverse-proxy origin controls
 - Password-protected, HttpOnly browser sessions with login throttling
 - Directory-only workspace browser with configurable roots and credential-folder blocking
@@ -31,7 +31,7 @@ The browser never receives `~/.codex/auth.json`, API keys, or ChatGPT tokens. Fo
 
 ## Run it
 
-Requirements: Node.js 22+, a logged-in Codex CLI, and optionally a logged-in Claude Code CLI for Claude sessions.
+Requirements: Node.js 22+ and a logged-in Codex CLI.
 
 ```bash
 npm install
@@ -101,8 +101,6 @@ The service installer is Linux/systemd-specific. External-session liveness also 
 | `FORGEDECK_EXTERNAL_MONITOR` | `on` | Enable read-only monitoring of other local Codex sessions |
 | `FORGEDECK_LOG_LEVEL` | `info` | Structured log threshold: `debug`, `info`, `warn`, or `error` |
 | `CODEX_BIN` | `codex` on `PATH` | Codex executable path |
-| `FORGEDECK_CLAUDE_MAX_CONCURRENT` | `4` | Maximum concurrent Claude Code sessions |
-| `FORGEDECK_CLAUDE_TTL_HOURS` | `2` | Idle Claude session archive age |
 | `FORGEDECK_URL` | `http://127.0.0.1:4173` | Dashboard API URL used by the stdio MCP server |
 | `FORGEDECK_MCP_TOKEN_FILE` | `.data/mcp-token` | MCP bootstrap token path for nonstandard installations |
 | `FORGEDECK_MCP_CLIENT_ID` | `forgedeck-stdio` | Stable scope for one MCP actor; use a distinct value per independent client |

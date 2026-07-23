@@ -80,9 +80,9 @@ test("inventory search covers prompts and facets filter combined provider summar
       source: "mcp",
       turns: [{ items: [{ type: "userMessage", content: [{ type: "text", text: "Find the sapphire regression" }] }] }]
     }),
-    thread("claude", 20, {
-      backend: "claude",
-      model: "sonnet",
+    thread("review", 20, {
+      backend: "codex",
+      model: "gpt-review",
       cwd: "/work/site",
       tags: ["frontend"],
       source: "user",

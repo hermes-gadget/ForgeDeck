@@ -7,10 +7,6 @@ const baseline = {
   "src/client/state/thread-store.ts": { exports: ["useThreadSummary"] },
   "src/client/types.ts": { types: ["ReasoningOption", "Turn", "ThreadGoal", "RateWindow", "RateSnapshot"] },
   "src/server/capacity.ts": { exports: ["CapacityCancelledError", "CapacityUnavailableError"] },
-  "src/server/claude-bridge.ts": {
-    exports: ["ClaudeBridgeError"],
-    types: ["ClaudeTurnState", "ClaudeTurnTerminalReason"]
-  },
   "src/server/codex-bridge.ts": {
     exports: ["CodexRpcError", "CodexUnavailableError"],
     types: ["RpcErrorPayload", "BridgeOfflineEvent", "BridgeReadyEvent"]

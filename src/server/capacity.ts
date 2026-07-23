@@ -1,4 +1,4 @@
-export type CapacityBackend = "codex/standard" | "codex/spark" | "claude";
+export type CapacityBackend = "codex/standard" | "codex/spark";
 
 export type CapacityMetrics = {
   limit: number;
@@ -52,7 +52,7 @@ type Pool = {
   metrics: MutableMetrics;
 };
 
-const BACKENDS: readonly CapacityBackend[] = ["codex/standard", "codex/spark", "claude"];
+const BACKENDS: readonly CapacityBackend[] = ["codex/standard", "codex/spark"];
 
 /** Raised when an atomic capacity reservation cannot be obtained by its deadline. */
 export class CapacityUnavailableError extends Error {
@@ -92,8 +92,7 @@ export class CapacityManager {
     }
     this.pools = {
       "codex/standard": createPool(limits["codex/standard"]),
-      "codex/spark": createPool(limits["codex/spark"]),
-      claude: createPool(limits.claude)
+      "codex/spark": createPool(limits["codex/spark"])
     };
   }
 

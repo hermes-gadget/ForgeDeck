@@ -18,7 +18,6 @@ test("server config parses bounded settings and trusted origins", () => {
     FORGEDECK_SPARK_TTL_HOURS: "0.5",
     FORGEDECK_STANDARD_MAX_CONCURRENT: "7",
     FORGEDECK_SPARK_MAX_CONCURRENT: "20",
-    FORGEDECK_CLAUDE_MAX_CONCURRENT: "5",
     FORGEDECK_QUOTA_HEADROOM_PERCENT: "12.5",
     FORGEDECK_QUOTA_RESET_PROXIMITY_MS: "90000",
     FORGEDECK_QUOTA_STALE_MS: "600000",
@@ -33,7 +32,6 @@ test("server config parses bounded settings and trusted origins", () => {
     FORGEDECK_MAINTENANCE_CHUNK_SIZE: "20",
     FORGEDECK_MCP_CLIENT_ID: "editor:test-client",
     FORGEDECK_LIVE_OUTPUT_BUDGET_BYTES: "262144",
-    FORGEDECK_CLAUDE_BIN: "/opt/claude/bin/claude",
     FORGEDECK_EXTERNAL_MONITOR_POLL_MS: "1500"
   });
 
@@ -49,7 +47,6 @@ test("server config parses bounded settings and trusted origins", () => {
   assert.equal(config.sparkTtlMs, 30 * 60_000);
   assert.equal(config.standardMaxConcurrent, 7);
   assert.equal(config.sparkMaxConcurrent, 20);
-  assert.equal(config.claudeMaxConcurrent, 5);
   assert.equal(config.admissionHeadroomPercent, 12.5);
   assert.equal(config.admissionResetProximityMs, 90_000);
   assert.equal(config.admissionQuotaStaleMs, 600_000);
@@ -60,7 +57,6 @@ test("server config parses bounded settings and trusted origins", () => {
   assert.equal(config.maintenanceChunkSize, 20);
   assert.equal(config.mcpClientId, "editor:test-client");
   assert.equal(config.liveOutputBudgetBytes, 256 * 1024);
-  assert.equal(config.claudeBin, "/opt/claude/bin/claude");
   assert.equal(config.externalMonitorPollMs, 1500);
 });
 
@@ -87,7 +83,6 @@ test("server config applies ForgeDeck concurrency and TTL defaults", () => {
   assert.equal(config.sparkTtlMs, 60 * 60_000);
   assert.equal(config.standardMaxConcurrent, 6);
   assert.equal(config.sparkMaxConcurrent, 16);
-  assert.equal(config.claudeMaxConcurrent, 4);
   assert.equal(config.admissionHeadroomPercent, 10);
   assert.equal(config.admissionResetProximityMs, 5 * 60_000);
   assert.equal(config.admissionDefaultPolicy, "wait");
@@ -96,7 +91,6 @@ test("server config applies ForgeDeck concurrency and TTL defaults", () => {
   assert.equal(config.operationMutationConcurrency, 5);
   assert.equal(config.maintenanceChunkSize, 25);
   assert.equal(config.liveOutputBudgetBytes, 384 * 1024);
-  assert.equal(config.claudeBin, "claude");
   assert.equal(config.mcpClientId, "forgedeck-stdio");
 });
 

@@ -40,16 +40,6 @@ import {
   type ResolvedBlueprintRun
 } from "./blueprints.js";
 import { CapacityCancelledError, CapacityManager, CapacityUnavailableError, type CapacityBackend } from "./capacity.js";
-import {
-  CLAUDE_EFFORT_LEVELS,
-  ClaudeBridge,
-  ClaudeBridgeError,
-  type ClaudePlanUsage,
-  type ClaudeOutputSnapshot,
-  type ClaudeTurnSnapshot
-} from "./claude-bridge.js";
-import { parseClaudeOutput } from "./claude-output.js";
-import { buildClaudeUsageStatus, claudeQuotaSnapshot } from "./claude-rate-limit.js";
 import { CodexBridge, CodexBridgeError, CodexRpcError, CodexUnavailableError, type ServerRequest } from "./codex-bridge.js";
 import {
   buildComparisonDiffs,
@@ -157,11 +147,6 @@ const mutationOperations = new AdaptiveOperationPool({
   isBackpressureError: isOperationBackpressureError
 });
 const codex = new CodexBridge({ runtime: runtimeOptions.codex, backgroundScheduler: readOperations });
-const claudeBridge = new ClaudeBridge({
-  ...runtimeOptions.claude,
-  readScheduler: readOperations,
-  mutationScheduler: mutationOperations
-});
 const capacity = new CapacityManager(runtimeOptions.capacity);
 const admission = new AdmissionController(sessions, runtimeOptions.admission);
 const INTERACTIVE_CAPACITY_WAIT_MS = 5_000;
@@ -202,8 +187,6 @@ type ThreadPolicy = "workspace-write" | "yolo";
 const policyFile = path.join(dataDir, "thread-policies.json");
 const threadPolicies = loadThreadPolicies();
 const activeThreads = new Set<string>();
-const claudeActiveThreads = new Set<string>();
-const claudeGuardianSignals = new Map<string, string>();
 type ActivitySource = "bridge" | "external";
 const activeThreadSources = new Map<string, Set<ActivitySource>>();
 const activeTurnIds = new Map<string, string>();
@@ -265,31 +248,18 @@ const allowedCorsOrigins = config.trustedOrigins;
 type ModelListResponse = { data: Array<{ id: string; model: string; supportedReasoningEfforts: Array<{ reasoningEffort: string }> }> };
 type UsageResponse = { rateLimits?: unknown; rateLimitsByLimitId?: Record<string, unknown> | null };
 const modelCache = new AsyncTtlCache<ModelListResponse>(runtimeOptions.caches.modelTtlMs);
-const claudeAvailabilityCache = new AsyncTtlCache<boolean>(runtimeOptions.caches.claudeAvailabilityTtlMs);
 type AccountStatusCore = {
   account: unknown | null;
   usage: UsageResponse | null;
   models: ModelListResponse;
-  claudeAvailable: boolean;
   errors: unknown[];
 };
 const accountStatusCache = new AsyncTtlCache<AccountStatusCore>(3_000);
 const quotaCache = new AsyncTtlCache<UsageResponse>(3_000);
-const CLAUDE_USAGE_REFRESH_INTERVAL_MS = 60_000;
-const claudeUsageCache = new AsyncTtlCache<ClaudePlanUsage | null>(CLAUDE_USAGE_REFRESH_INTERVAL_MS);
-let cachedClaudeUsage: ClaudePlanUsage | null = null;
 const serverIdentity = {
   id: `forgedeck-${crypto.createHash("sha256").update(path.resolve(dataDir)).digest("hex").slice(0, 16)}`,
   name: "ForgeDeck"
 };
-const CLAUDE_MODEL_OPTIONS = [
-  { id: "sonnet", model: "sonnet", displayName: "Claude Sonnet 5", description: "Latest Sonnet — balanced speed and capability for most coding work." },
-  { id: "fable", model: "fable", displayName: "Claude Fable 5", description: "Anthropic's most intelligent model for the hardest reasoning work." },
-  { id: "opus", model: "opus", displayName: "Claude Opus 4.8", description: "Most powerful Opus model for complex reasoning work." },
-  { id: "haiku", model: "haiku", displayName: "Claude Haiku 4.5", description: "Fast and efficient Claude model for smaller tasks." }
-] as const;
-const CLAUDE_MODELS = new Set<string>(CLAUDE_MODEL_OPTIONS.map((option) => option.model));
-const CLAUDE_EFFORTS = new Set<string>(CLAUDE_EFFORT_LEVELS);
 const apiRateLimiter = createRateLimiter({
   ...runtimeOptions.rateLimit,
   key: (req) => config.trustProxy ? req.ip || req.socket.remoteAddress || "unknown" : req.socket.remoteAddress || "unknown"
@@ -436,9 +406,8 @@ app.get("/api/health", (_req, res) => {
       background,
       sessions: {
         status: "ok",
-        active: activeThreads.size + claudeActiveThreads.size,
+        active: activeThreads.size,
         activeCodex: activeThreads.size,
-        activeClaude: claudeActiveThreads.size,
         queuedMessages: [...messageQueues.values()].reduce((total, queue) => total + queue.length, 0),
         drainingQueues: drainingQueues.size,
         pendingArchives: archivingThreadIds.size,
@@ -592,7 +561,6 @@ app.get("/api/bootstrap", async (req, res, next) => {
       health: publicHealthSummary(),
       models: modelsResult[0].status === "fulfilled" ? modelsResult[0].value : { data: [] },
       roots: workspaces.roots,
-      claudeModelOptions: CLAUDE_MODEL_OPTIONS,
       background: backgroundTasks.getHealth(),
       degraded: errors.length > 0,
       errors
@@ -903,9 +871,7 @@ app.post("/api/evals", async (req, res, next) => {
   try {
     const input = evalRequestSchema.parse(req.body);
     const workspace = await workspaces.validate(input.workspace);
-    await Promise.all(input.models.map((model) => model.provider === "claude"
-      ? Promise.resolve(validateClaudeModelChoice(model.model, model.reasoningEffort))
-      : validateModelChoice(model.model, model.reasoningEffort)));
+    await Promise.all(input.models.map((model) => validateModelChoice(model.model, model.reasoningEffort)));
     const evaluation = sessions.evals.create({ ...input, workspace });
     setImmediate(() => {
       void runEval(evaluation).catch((error) => {
@@ -949,9 +915,7 @@ app.post("/api/compare", async (req, res, next) => {
     const input = compareRequestSchema.parse(req.body);
     const workspace = await workspaces.validate(input.workspace);
     const models = input.judge ? [...input.models, input.judge] : input.models;
-    await Promise.all(models.map((model) => model.provider === "claude"
-      ? Promise.resolve(validateClaudeModelChoice(model.model, model.reasoningEffort))
-      : validateModelChoice(model.model, model.reasoningEffort)));
+    await Promise.all(models.map((model) => validateModelChoice(model.model, model.reasoningEffort)));
     const comparison = sessions.comparisons.create({ ...input, workspace });
     setImmediate(() => {
       void runComparison(comparison).catch((error) => {
@@ -1042,8 +1006,8 @@ app.get("/api/threads", async (req, res, next) => {
   try {
     const sessionClass = optionalEnumQuery(req, "sessionClass", ["standard", "spark"] as const)
       ?? optionalEnumQuery(req, "class", ["standard", "spark"] as const);
-    const backend = optionalEnumQuery(req, "provider", ["codex", "claude"] as const)
-      ?? optionalEnumQuery(req, "backend", ["codex", "claude"] as const);
+    const backend = optionalEnumQuery(req, "provider", ["codex"] as const)
+      ?? optionalEnumQuery(req, "backend", ["codex"] as const);
     const limit = numberQuery(req, "limit", 100, 1, 200);
     const sortKey = enumQuery(req, "sortKey", ["created_at", "updated_at", "name", "directory", "status"] as const, "updated_at");
     const sortDirection = enumQuery(req, "sortDirection", ["asc", "desc"], "desc");
@@ -1214,7 +1178,7 @@ app.post("/api/sessions/:threadId/lease", async (req, res, next) => {
       throw httpError("Lease mode must be read-only, exclusive, or null to release", 400, "INVALID_WORKSPACE_LEASE_MODE");
     }
     await ensureSessionExists(threadId);
-    const active = activeThreads.has(threadId) || claudeActiveThreads.has(threadId);
+    const active = activeThreads.has(threadId);
     const current = sessions.workspaceLeaseForSession(threadId);
     if (active && (req.body.mode === null || (current && current.mode !== req.body.mode))) {
       throw httpError("An active session cannot release or change its workspace lease", 409, "WORKSPACE_LEASE_ACTIVE");
@@ -1259,7 +1223,7 @@ app.get("/api/threads/:threadId/recovery", (req, res, next) => {
       threadId,
       state,
       queue: messageQueues.get(threadId) || [],
-      active: activeThreads.has(threadId) || claudeActiveThreads.has(threadId)
+      active: activeThreads.has(threadId)
     }));
   } catch (error) {
     next(error);
@@ -1485,40 +1449,6 @@ app.post("/api/threads/:threadId/messages", async (req, res, next) => {
     const threadId = validThreadId(req.params.threadId);
     const actor = requestAuditActor(res);
     const { text, model, effort, admissionPolicy, projection } = parseMessageInput(req.body);
-    if (isClaudeSession(threadId)) {
-      validateClaudeMessageChoice(threadId, model, effort);
-      const result = await withThreadOperation(threadId, async () => {
-        assertSessionNotArchiving(threadId);
-        const state = await claudeRead(() => claudeBridge.status(threadId));
-        if (state.active) {
-          reconcileTurnCapacity(threadId);
-          throw httpError("This Claude session already has an active turn", 409, "SESSION_ACTIVE");
-        }
-        await enforceResumePolicy(threadId, { model, reasoningEffort: effort }, actor);
-        releaseTurnCapacity(threadId, true);
-        if (effort) await updateClaudeEffort(threadId, effort, actor);
-        await acquireTurnCapacity(threadId, "claude", INTERACTIVE_CAPACITY_WAIT_MS, { model, policy: admissionPolicy, projection });
-        let turn;
-        try {
-          await sessions.setMetadata(threadId, { lastPrompt: text }, actor);
-          const prepared = await prepareKnowledgePackMessage(threadId, text);
-          turn = await claudeMutation(() => claudeBridge.sendMessage(threadId, prepared.text));
-          await markKnowledgePackMessageInjected(threadId, prepared.markInjected);
-          recordAcceptedRequest(threadId, model, turn.id);
-          guardian.beginRun(threadId);
-        } catch (error) {
-          observeProviderFailure("claude", error);
-          releaseTurnCapacity(threadId, false);
-          throw error;
-        }
-        await sessions.touch(threadId);
-        await sessions.record(threadId, "turn_started", actor, { backend: "claude" });
-        broadcast("threads", { action: "updated", threadId, backend: "claude" });
-        return { ok: true, turn: turn.snapshot() };
-      });
-      res.status(202).json(result);
-      return;
-    }
     await validateModelChoice(model, effort);
     const result = await withThreadOperation(threadId, async () => {
       assertSessionNotArchiving(threadId);
@@ -1555,26 +1485,6 @@ app.post("/api/threads/:threadId/command", async (req, res, next) => {
     const command = requiredString(req.body?.command, "Command").toLowerCase();
     const args = optionalString(req.body?.args);
     if (command !== "archive") assertSessionNotArchiving(threadId);
-    if (isClaudeSession(threadId)) {
-      if (command === "archive") {
-        res.status(202).json(await archiveSession(threadId, "command", "user", requestIdempotencyKey(req)));
-        return;
-      }
-      if (command === "stop") {
-        res.json(await interruptClaudeSession(threadId, "user"));
-        return;
-      }
-      if (command === "rename") {
-        if (!args) throw httpError("Use /rename followed by a session name", 400);
-        const name = args.slice(0, 100);
-        await sessions.setMetadata(threadId, { name }, "user");
-        await sessions.record(threadId, "renamed", "user", { name });
-        broadcast("threads", { action: "updated", threadId });
-        res.json({ ok: true });
-        return;
-      }
-      throw httpError(`ForgeDeck command /${command} is not supported for Claude sessions`, 400, "CLAUDE_COMMAND_UNSUPPORTED");
-    }
     if (command === "compact") {
       res.json(await withMutableThreadOperation(threadId, () => codexMutation("thread/compact/start", { threadId }, 60_000)));
       return;
@@ -1639,8 +1549,7 @@ app.post("/api/threads/:threadId/queue", async (req, res, next) => {
     const threadId = validThreadId(req.params.threadId);
     const actor = requestAuditActor(res);
     const { text, model, effort, admissionPolicy, projection } = parseMessageInput(req.body);
-    if (isClaudeSession(threadId)) validateClaudeMessageChoice(threadId, model, effort);
-    else await validateModelChoice(model, effort);
+    await validateModelChoice(model, effort);
     const { entry, position } = await withThreadOperation(threadId, async () => {
       await ensureSessionExists(threadId);
       const queued: QueuedMessage = {
@@ -1693,10 +1602,6 @@ app.post("/api/threads/:threadId/interrupt", async (req, res, next) => {
     const threadId = validThreadId(req.params.threadId);
     const actor = requestAuditActor(res);
     assertSessionNotArchiving(threadId);
-    if (isClaudeSession(threadId)) {
-      res.json(await interruptClaudeSession(threadId, actor));
-      return;
-    }
     const requestedTurnId = optionalBoundedString(req.body?.turnId, "Turn id", 128);
     if (requestedTurnId && !/^[a-zA-Z0-9_-]{1,128}$/.test(requestedTurnId)) throw httpError("Invalid turn id", 400, "INVALID_TURN_ID");
     res.json(await withMutableThreadOperation(threadId, async () => {
@@ -1722,18 +1627,6 @@ app.patch("/api/threads/:threadId/policy", async (req, res, next) => {
     assertAllowedKeys(req.body, ["yolo"]);
     if (typeof req.body.yolo !== "boolean") throw httpError("YOLO must be a boolean", 400, "INVALID_YOLO");
     const policy: ThreadPolicy = req.body.yolo ? "yolo" : "workspace-write";
-    if (isClaudeSession(threadId)) {
-      const state = await claudeRead(() => claudeBridge.status(threadId));
-      if (state.active) throw httpError("Stop or finish the current turn before changing permissions", 409);
-      const permissionMode = req.body.yolo ? "bypassPermissions" : "default";
-      await claudeMutation(() => claudeBridge.setPermissionMode(threadId, permissionMode));
-      await sessions.setMetadata(threadId, { permissionMode }, actor);
-      threadPolicies.set(threadId, policy);
-      persistThreadPolicies();
-      await sessions.record(threadId, "policy_changed", actor, { policy, permissionMode });
-      res.json({ policy, permissionMode });
-      return;
-    }
     await withMutableThreadOperation(threadId, async () => {
       if (activeThreads.has(threadId) || await findActiveTurnId(threadId)) throw httpError("Stop or finish the current turn before changing permissions", 409);
       await codexMutation("thread/resume", { threadId, excludeTurns: true }, 60_000);
@@ -1763,16 +1656,6 @@ app.patch("/api/threads/:threadId", async (req, res, next) => {
     assertAllowedKeys(req.body, ["name", "tags", "category", "guardian"]);
     if (!("name" in req.body) && !("tags" in req.body) && !("category" in req.body) && !("guardian" in req.body)) throw httpError("At least one session field is required", 400);
     const guardianPolicy = "guardian" in req.body ? guardianPolicyFromRequest(req.body.guardian) : null;
-    if (isClaudeSession(threadId)) {
-      await ensureSessionExists(threadId);
-      const name = "name" in req.body ? boundedString(req.body.name, "Name", 100) : undefined;
-      const metadata = await sessions.setMetadata(threadId, { name, tags: req.body.tags, category: req.body.category }, "user");
-      const guardianState = guardianPolicy ? guardian.configure(threadId, guardianPolicy) : guardian.get(threadId);
-      if (name) await sessions.record(threadId, "renamed", "user", { name });
-      broadcast("threads", { action: "updated", threadId });
-      res.json({ result: { ok: true }, ...metadata, guardian: guardianState });
-      return;
-    }
     const result = await withMutableThreadOperation(threadId, async () => {
       await ensureSessionExists(threadId);
       let renameResult: unknown = { ok: true };
@@ -1915,13 +1798,6 @@ codex.on("error", (error) => {
     }))
   });
 });
-claudeBridge.on("turnState", (snapshot) => {
-  handleClaudeTurnState(snapshot);
-});
-claudeBridge.on("output", (snapshot) => {
-  handleClaudeOutput(snapshot);
-});
-
 if (fs.existsSync(distDir)) {
   app.use("/assets", express.static(path.join(distDir, "assets"), { index: false, maxAge: "1y", immutable: true }));
   app.use(express.static(distDir, { index: false, maxAge: "1h", immutable: false }));
@@ -1985,38 +1861,6 @@ resumeIncompleteSessionOperations();
 scheduleRunner.start();
 missionRunner.start();
 void codex.start().then(resumeIncompleteSessionOperations).catch(() => undefined);
-void recoverClaudeSessions();
-backgroundTasks.register({
-  name: "claude-activity",
-  safeFailureMessage: "Claude session activity could not be refreshed",
-  task: refreshClaudeActivity,
-  intervalMs: 2_000,
-  maxAttempts: 3,
-  retryBaseDelayMs: 200
-});
-backgroundTasks.register({
-  name: "claude-usage",
-  safeFailureMessage: "Claude plan usage could not be refreshed",
-  task: async () => {
-    const available = await claudeAvailabilityCache.get(() => readClaudeAvailability({
-      priority: "background",
-      fairnessKey: "claude-usage-availability"
-    }));
-    if (available) await refreshClaudeUsage(true);
-  },
-  intervalMs: CLAUDE_USAGE_REFRESH_INTERVAL_MS,
-  maxAttempts: 2,
-  retryBaseDelayMs: 1_000
-});
-backgroundTasks.register({
-  name: "claude-cleanup",
-  safeFailureMessage: "Claude session cleanup is unavailable",
-  task: () => claudeBridge.cleanStaleSessions(),
-  intervalMs: 60 * 60_000,
-  initialDelayMs: 60 * 60_000,
-  maxAttempts: 2,
-  retryBaseDelayMs: 1_000
-});
 backgroundTasks.register({
   name: "session-expiry",
   safeFailureMessage: "Expired sessions could not be inspected",
@@ -2164,10 +2008,6 @@ async function markKnowledgePackMessageInjected(threadId: string, shouldMark: bo
 }
 
 async function drainQueue(threadId: string): Promise<void> {
-  if (isClaudeSession(threadId)) {
-    await drainClaudeQueue(threadId);
-    return;
-  }
   if (drainingQueues.has(threadId) || admissionPausedQueues.has(threadId) || archivingThreadIds.has(threadId) || !(messageQueues.get(threadId)?.length)) return;
   drainingQueues.add(threadId);
   let entry: QueuedMessage | undefined;
@@ -2220,62 +2060,6 @@ async function drainQueue(threadId: string): Promise<void> {
       broadcastQueue(threadId, error);
     }
     logger.warn("Could not start queued turn", { threadId, error });
-  } finally {
-    drainingQueues.delete(threadId);
-  }
-}
-
-async function drainClaudeQueue(threadId: string): Promise<void> {
-  if (drainingQueues.has(threadId) || admissionPausedQueues.has(threadId) || archivingThreadIds.has(threadId) || !(messageQueues.get(threadId)?.length)) return;
-  drainingQueues.add(threadId);
-  let entry: QueuedMessage | undefined;
-  try {
-    await withMutableThreadOperation(threadId, async () => {
-      const queueOptions = { priority: "background", fairnessKey: `message-queue:${threadId}` } as const;
-      const state = await claudeRead(() => claudeBridge.status(threadId), 30_000, queueOptions);
-      if (state.active) {
-        setClaudeThreadActive(threadId, true);
-        reconcileTurnCapacity(threadId);
-        return;
-      }
-      setClaudeThreadActive(threadId, false);
-      releaseTurnCapacity(threadId, true);
-      const queue = messageQueues.get(threadId) || [];
-      entry = queue[0];
-      if (!entry) return;
-      const queuedEntry = entry;
-      validateClaudeMessageChoice(threadId, queuedEntry.model, queuedEntry.effort);
-      await enforceResumePolicy(threadId, { model: queuedEntry.model, reasoningEffort: queuedEntry.effort }, "queue");
-      if (queuedEntry.effort) await updateClaudeEffort(threadId, queuedEntry.effort, "system");
-      await acquireTurnCapacity(threadId, "claude", QUEUE_CAPACITY_WAIT_MS, {
-        model: queuedEntry.model,
-        policy: queuedEntry.admissionPolicy,
-        projection: queuedEntry.projection
-      });
-      try {
-        await sessions.setMetadata(threadId, { lastPrompt: queuedEntry.text }, "system");
-        const prepared = await prepareKnowledgePackMessage(threadId, queuedEntry.text);
-        await claudeMutation(() => claudeBridge.sendMessage(threadId, prepared.text), 30_000, queueOptions);
-        await markKnowledgePackMessageInjected(threadId, prepared.markInjected);
-        recordAcceptedRequest(threadId, queuedEntry.model, queuedEntry.id);
-        guardian.beginRun(threadId);
-      } catch (error) {
-        observeProviderFailure("claude", error);
-        releaseTurnCapacity(threadId, false);
-        throw error;
-      }
-      queue.shift();
-      if (queue.length) messageQueues.set(threadId, queue);
-      else messageQueues.delete(threadId);
-      persistMessageQueues();
-      await sessions.touch(threadId);
-      await sessions.record(threadId, "queued_message_started", "system", { queueId: entry.id, backend: "claude" });
-      broadcastQueue(threadId);
-    });
-  } catch (error) {
-    scheduleAdmissionQueueRetry(threadId, error);
-    if (entry) broadcastQueue(threadId, error);
-    logger.warn("Could not start queued Claude turn", { threadId, error });
   } finally {
     drainingQueues.delete(threadId);
   }
@@ -2390,43 +2174,6 @@ async function validateModelChoice(modelId: string, effort: string | null): Prom
   }
 }
 
-function validateClaudeModelChoice(model: string, effort: string | null): void {
-  if (!CLAUDE_MODELS.has(model)) throw httpError("That Claude model is not available", 400, "INVALID_CLAUDE_MODEL");
-  if (effort && !CLAUDE_EFFORTS.has(effort)) throw httpError("That Claude effort level is not available", 400, "INVALID_CLAUDE_EFFORT");
-}
-
-function validateClaudeMessageChoice(threadId: string, model: string, effort: string | null): void {
-  validateClaudeModelChoice(model, effort);
-  const metadata = sessions.metadataFor(threadId);
-  if (metadata.backend !== "claude") throw httpError("Claude session not found", 404, "SESSION_NOT_FOUND");
-  if (metadata.model && metadata.model !== model) {
-    throw httpError("A Claude session's model is locked at creation", 400, "CLAUDE_MODEL_LOCKED");
-  }
-}
-
-async function updateClaudeEffort(threadId: string, effort: string, actor: string): Promise<void> {
-  const metadata = sessions.metadataFor(threadId);
-  if (metadata.effort === effort) return;
-  await claudeMutation(() => claudeBridge.setEffort(threadId, effort));
-  await sessions.setMetadata(threadId, { effort }, actor);
-}
-
-async function interruptClaudeSession(threadId: string, actor: string): Promise<Record<string, unknown>> {
-  return withThreadOperation(threadId, async () => {
-    assertSessionNotArchiving(threadId);
-    const state = await claudeRead(() => claudeBridge.status(threadId));
-    if (!state.active) throw httpError("This Claude session has no active turn", 409, "SESSION_IDLE");
-    reconcileTurnCapacity(threadId);
-    await sessions.record(threadId, "interrupt_requested", actor, {
-      backend: "claude",
-      turnId: state.turn?.id || null
-    });
-    const terminal = await claudeMutation(() => claudeBridge.stop(threadId));
-    if (!terminal) throw httpError("Claude process disappeared before acknowledging interruption", 409, "CLAUDE_PROCESS_LOST");
-    return { ok: true, turn: terminal };
-  });
-}
-
 async function retryGuardianRun(threadId: string): Promise<void> {
   await submitGuardianRecovery(threadId, null);
 }
@@ -2435,11 +2182,9 @@ async function escalateGuardianRun(threadId: string, requestedModel: string | nu
   const metadata = sessions.metadataFor(threadId);
   const currentModel = metadata.model;
   if (!currentModel) throw new Error("The stalled session has no recorded model to escalate");
-  const targetModel = metadata.backend === "claude"
-    ? selectStrongerModel(currentModel, [...CLAUDE_MODELS], requestedModel)
-    : selectStrongerModel(currentModel, (await readModels()).data
-      .filter((model) => !metadata.effort || model.supportedReasoningEfforts.some((option) => option.reasoningEffort === metadata.effort))
-      .map((model) => model.model), requestedModel);
+  const targetModel = selectStrongerModel(currentModel, (await readModels()).data
+    .filter((model) => !metadata.effort || model.supportedReasoningEfforts.some((option) => option.reasoningEffort === metadata.effort))
+    .map((model) => model.model), requestedModel);
   await submitGuardianRecovery(threadId, targetModel);
   return targetModel;
 }
@@ -2452,43 +2197,6 @@ async function submitGuardianRecovery(threadId: string, targetModel: string | nu
     const model = targetModel || metadata.model;
     if (!model) throw new Error("The stalled session has no recorded model to retry");
     await enforceResumePolicy(threadId, { model, reasoningEffort: metadata.effort }, "guardian");
-
-    if (metadata.backend === "claude") {
-      validateClaudeModelChoice(model, metadata.effort);
-      const state = await claudeRead(() => claudeBridge.status(threadId), 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      });
-      if (state.active) await claudeMutation(() => claudeBridge.stop(threadId), 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      });
-      releaseTurnCapacity(threadId, true);
-      if (targetModel) {
-        await claudeMutation(() => claudeBridge.setModel(threadId, model), 30_000, {
-          priority: "background",
-          fairnessKey: `guardian:${threadId}`
-        });
-        await sessions.setMetadata(threadId, { model }, "guardian");
-      }
-      await acquireTurnCapacity(threadId, "claude", QUEUE_CAPACITY_WAIT_MS, { model });
-      try {
-        const turn = await claudeMutation(() => claudeBridge.sendMessage(threadId, prompt), 30_000, {
-          priority: "background",
-          fairnessKey: `guardian:${threadId}`
-        });
-        recordAcceptedRequest(threadId, model, turn.id);
-      } catch (error) {
-        releaseTurnCapacity(threadId, false);
-        throw error;
-      }
-      await sessions.touch(threadId);
-      await sessions.record(threadId, targetModel ? "guardian_escalation_submitted" : "guardian_retry_submitted", "guardian", {
-        backend: "claude",
-        model
-      });
-      return;
-    }
 
     await validateModelChoice(model, metadata.effort);
     const turnId = activeTurnIds.get(threadId) || await findActiveTurnId(threadId);
@@ -2535,30 +2243,17 @@ async function submitGuardianRecovery(threadId: string, targetModel: string | nu
 
 async function pauseGuardianRun(threadId: string): Promise<void> {
   await withMutableThreadOperation(threadId, async () => {
-    const metadata = sessions.metadataFor(threadId);
-    if (metadata.backend === "claude") {
-      const state = await claudeRead(() => claudeBridge.status(threadId), 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      });
-      if (state.active) await claudeMutation(() => claudeBridge.stop(threadId), 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      });
-      setClaudeThreadActive(threadId, false);
-    } else {
-      const turnId = activeTurnIds.get(threadId) || await findActiveTurnId(threadId);
-      if (turnId) await codexMutation("turn/interrupt", { threadId, turnId }, 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      });
-      await codexMutation("thread/goal/set", { threadId, status: "paused" }, 30_000, {
-        priority: "background",
-        fairnessKey: `guardian:${threadId}`
-      }).catch(() => undefined);
-      setThreadActivity(threadId, "bridge", false);
-      setThreadActivity(threadId, "external", false);
-    }
+    const turnId = activeTurnIds.get(threadId) || await findActiveTurnId(threadId);
+    if (turnId) await codexMutation("turn/interrupt", { threadId, turnId }, 30_000, {
+      priority: "background",
+      fairnessKey: `guardian:${threadId}`
+    });
+    await codexMutation("thread/goal/set", { threadId, status: "paused" }, 30_000, {
+      priority: "background",
+      fairnessKey: `guardian:${threadId}`
+    }).catch(() => undefined);
+    setThreadActivity(threadId, "bridge", false);
+    setThreadActivity(threadId, "external", false);
     releaseTurnCapacity(threadId, true);
     await sessions.record(threadId, "guardian_operator_notified", "guardian", {
       reason: "recovery_attempts_exhausted",
@@ -2580,125 +2275,7 @@ function guardianAuditDetails(state: RunGuardianState): Record<string, unknown> 
   };
 }
 
-function handleClaudeTurnState(snapshot: ClaudeTurnSnapshot): void {
-  inventoryIndex.invalidate();
-  const terminal = snapshot.state === "completed" || snapshot.state === "failed";
-  if (terminal) {
-    setClaudeThreadActive(snapshot.threadId, false);
-    releaseTurnCapacity(snapshot.threadId, true);
-    guardian.complete(snapshot.threadId);
-  } else {
-    setClaudeThreadActive(snapshot.threadId, true);
-    capacity.reconcile("claude", snapshot.threadId);
-    if (sessions.hasMetadata(snapshot.threadId)) {
-      guardian.activate(snapshot.threadId);
-      guardian.activity(snapshot.threadId, false);
-    }
-  }
-  broadcast("claude-turn", snapshot);
-  if (!terminal) return;
-  void refreshClaudeUsage(true).catch((error) => logger.debug("Could not refresh Claude plan usage after a turn", { error }));
-  void recordClaudeTerminalState(snapshot);
-  const timer = setTimeout(() => void drainQueue(snapshot.threadId), 50);
-  timer.unref();
-}
-
-function handleClaudeOutput(snapshot: ClaudeOutputSnapshot): void {
-  const parsed = parseClaudeOutput(snapshot.text, snapshot.turnId);
-  if (parsed.rateLimit) {
-    const quota = claudeQuotaSnapshot(parsed.rateLimit, snapshot.observedAt);
-    if (quota && admission.observeQuota(quota)) {
-      logger.info("Observed Claude API rate limit", {
-        threadId: snapshot.threadId,
-        status: parsed.rateLimit.status,
-        rateLimitType: parsed.rateLimit.rateLimitType,
-        resetsAt: quota.resetAt
-      });
-      broadcast("backend-status", { claude: publicClaudeUsageStatus() });
-    }
-  }
-  if (!parsed.structured || !parsed.items.length) return;
-  const items = Object.fromEntries(parsed.items.flatMap((item) => item.id ? [[item.id, item]] : []));
-  liveRecovery.replace(snapshot.threadId, {
-    items,
-    agentText: {},
-    toolOutput: {},
-    active: true,
-    completedAt: null,
-    updatedAt: snapshot.observedAt,
-    tokenUsage: null
-  });
-  guardian.activity(snapshot.threadId, true);
-  broadcast("claude-output", {
-    threadId: snapshot.threadId,
-    turnId: snapshot.turnId,
-    observedAt: snapshot.observedAt,
-    items: parsed.items
-  });
-}
-
-async function recordClaudeTerminalState(snapshot: ClaudeTurnSnapshot): Promise<void> {
-  if (!sessions.hasMetadata(snapshot.threadId)) return;
-  try {
-    try {
-      const state = await claudeRead(() => claudeBridge.status(snapshot.threadId), 30_000, {
-        priority: "background",
-        fairnessKey: `claude-usage:${snapshot.threadId}`
-      });
-      const tokenUsage = claudeTokenUsage(state.text);
-      if (tokenUsage) {
-        admission.recordTokens(
-          usageAttribution(snapshot.threadId),
-          tokenUsage,
-          `tokens:claude:${snapshot.threadId}:${snapshot.id}`
-        );
-      }
-    } catch (error) {
-      logger.debug("Could not read Claude token usage", { threadId: snapshot.threadId, error });
-    }
-    await sessions.record(
-      snapshot.threadId,
-      snapshot.state === "completed" ? "turn_completed" : "turn_failed",
-      "claude",
-      {
-        backend: "claude",
-        turnId: snapshot.id,
-        exitCode: snapshot.exitCode,
-        reason: snapshot.reason,
-        error: snapshot.error
-      }
-    );
-    broadcast("threads", { action: "updated", threadId: snapshot.threadId, backend: "claude" });
-  } catch (error) {
-    logger.warn("Could not record terminal Claude turn state", { threadId: snapshot.threadId, error });
-  }
-}
-
-function claudeTokenUsage(text: string): ReturnType<typeof normalizeTokenSnapshot> {
-  const usageIndex = text.lastIndexOf('"usage"');
-  if (usageIndex < 0) return null;
-  const fragment = text.slice(usageIndex, usageIndex + 4_000);
-  const read = (...names: string[]): number => {
-    for (const name of names) {
-      const match = new RegExp(`"${name}"\\s*:\\s*(\\d+)`, "i").exec(fragment);
-      if (match) return Number(match[1]);
-    }
-    return 0;
-  };
-  const directInput = read("input_tokens", "inputTokens");
-  const cachedAggregate = read("cached_input_tokens", "cachedInputTokens");
-  const cachedInput = cachedAggregate || (
-    read("cache_read_input_tokens", "cacheReadInputTokens")
-    + read("cache_creation_input_tokens", "cacheCreationInputTokens")
-  );
-  const outputTokens = read("output_tokens", "outputTokens");
-  const inputTokens = directInput + cachedInput;
-  const totalTokens = inputTokens + outputTokens;
-  return totalTokens > 0 ? { inputTokens, outputTokens, cachedInputTokens: cachedInput, reasoningOutputTokens: 0, totalTokens } : null;
-}
-
 function capacityBackendForThread(threadId: string): CapacityBackend {
-  if (isClaudeSession(threadId)) return "claude";
   return sessionClassFor(threadId) === "spark" ? "codex/spark" : "codex/standard";
 }
 
@@ -2716,9 +2293,6 @@ async function acquireTurnCapacity(
 ): Promise<AdmissionDecision> {
   sessions.acquireWorkspaceLease(threadId);
   try {
-    if (backend === "claude" && sessions.metadataFor(threadId).workspaceLeaseMode === "read-only") {
-      await claudeMutation(() => claudeBridge.setPermissionMode(threadId, "plan"));
-    }
     const provider = usageProviderForBackend(backend);
     await refreshProviderQuota(provider);
     const attribution = usageAttribution(threadId, options.model, options.workspaceId, options.blueprintId, provider);
@@ -2729,10 +2303,7 @@ async function acquireTurnCapacity(
     });
     publishAdmissionDecision(threadId, decision);
     if (!decision.admitted) throw new AdmissionDeniedError(decision);
-    if (decision.target && (
-      decision.target.provider !== provider
-      || (provider === "claude" && decision.target.model !== attribution.model)
-    )) {
+    if (decision.target && decision.target.provider !== provider) {
       admission.releaseReservation(threadId);
       throw new AdmissionDeniedError({ ...decision, admitted: false });
     }
@@ -2778,7 +2349,6 @@ function clearCapacityRecovery(threadId: string): void {
 }
 
 function usageProviderForBackend(backend: CapacityBackend): UsageProvider {
-  if (backend === "claude") return "claude";
   return backend === "codex/spark" ? "spark" : "codex";
 }
 
@@ -2791,7 +2361,7 @@ function usageAttribution(
 ): UsageAttribution {
   const metadata = sessions.metadataFor(threadId);
   return {
-    provider: providerOverride || (metadata.backend === "claude" ? "claude" : metadata.sessionClass === "spark" ? "spark" : "codex"),
+    provider: providerOverride || (metadata.sessionClass === "spark" ? "spark" : "codex"),
     model: modelOverride || metadata.model || "unknown",
     runId: threadId,
     workspaceId: workspaceOverride === undefined ? metadata.cwd : workspaceOverride,
@@ -2893,15 +2463,13 @@ async function readAccountStatusCore(): Promise<AccountStatusCore> {
   const results = await Promise.allSettled([
     codexRead("account/read", { refreshToken: false }),
     readProviderQuota(),
-    readModels(),
-    claudeAvailabilityCache.get(() => readClaudeAvailability())
+    readModels()
   ]);
-  const [accountResult, usageResult, modelsResult, claudeResult] = results;
+  const [accountResult, usageResult, modelsResult] = results;
   return {
     account: accountResult.status === "fulfilled" ? accountResult.value : null,
     usage: usageResult.status === "fulfilled" ? usageResult.value : null,
     models: modelsResult.status === "fulfilled" ? modelsResult.value : { data: [] },
-    claudeAvailable: claudeResult.status === "fulfilled" && claudeResult.value,
     errors: results
       .filter((result): result is PromiseRejectedResult => result.status === "rejected")
       .map((result) => result.reason)
@@ -2917,14 +2485,6 @@ async function readProviderQuota(): Promise<UsageResponse> {
 }
 
 async function refreshProviderQuota(provider: UsageProvider): Promise<void> {
-  if (provider === "claude") {
-    try {
-      await refreshClaudeUsage(true);
-    } catch (error) {
-      logger.debug("Provider quota could not be refreshed before admission", { provider, error });
-    }
-    return;
-  }
   try {
     await readProviderQuota();
   } catch (error) {
@@ -2945,40 +2505,6 @@ function observeQuotaUsage(usage: UsageResponse): void {
   for (const snapshot of normalizeRateLimitSnapshots("spark", sparkRateLimit || codexRateLimit, observedAt)) admission.observeQuota(snapshot);
 }
 
-function publicClaudeUsageStatus() {
-  return buildClaudeUsageStatus({
-    activeCount: claudeActiveThreads.size,
-    maxConcurrent: config.claudeMaxConcurrent,
-    planUsage: cachedClaudeUsage,
-    quotaEvents: sessions.latestQuotaEvents(),
-    quotaStaleMs: admission.settings.quotaStaleMs
-  });
-}
-
-async function refreshClaudeUsage(force = false): Promise<void> {
-  if (force) claudeUsageCache.clear();
-  const usage = await claudeUsageCache.get(() => runReadOperation(
-    (context) => claudeBridge.readUsage(context.signal),
-    15_000,
-    { fairnessKey: "claude-usage" }
-  ));
-  const changed = cachedClaudeUsage?.usedPercent !== usage?.usedPercent
-    || (cachedClaudeUsage === null) !== (usage === null);
-  cachedClaudeUsage = usage;
-  if (changed) broadcast("backend-status", { claude: publicClaudeUsageStatus() });
-}
-
-function setClaudeThreadActive(threadId: string, active: boolean): boolean {
-  const changed = active
-    ? !claudeActiveThreads.has(threadId)
-    : claudeActiveThreads.has(threadId);
-  if (!changed) return false;
-  if (active) claudeActiveThreads.add(threadId);
-  else claudeActiveThreads.delete(threadId);
-  broadcast("backend-status", { claude: publicClaudeUsageStatus() });
-  return true;
-}
-
 function publicAccountStatus(core: AccountStatusCore, includeEmail: boolean) {
   const errors = [
     ...core.errors.map((error) => publicError(error)),
@@ -2992,8 +2518,8 @@ function publicAccountStatus(core: AccountStatusCore, includeEmail: boolean) {
   }) ?? null;
   const standardRateLimit = byLimitId.codex && byLimitId.codex !== sparkRateLimit ? byLimitId.codex : codexRateLimit;
   const sparkActiveThreadIds = [...activeThreads].filter((threadId) => sessionClassFor(threadId) === "spark");
-  const activeThreadIds = [...new Set([...activeThreads, ...claudeActiveThreads])];
-  const agentThreadIds = [...new Set([...mcpAccess.listAgentThreads(), ...claudeActiveThreads])];
+  const activeThreadIds = [...activeThreads];
+  const agentThreadIds = mcpAccess.listAgentThreads();
   const sparkAgentThreadIds = agentThreadIds.filter((threadId) => sessionClassFor(threadId) === "spark");
   return {
     account: core.account === null
@@ -3010,11 +2536,6 @@ function publicAccountStatus(core: AccountStatusCore, includeEmail: boolean) {
         available: core.models.data.some((model) => model.id === "gpt-5.3-codex-spark" || model.model === "gpt-5.3-codex-spark"),
         rateLimit: sparkRateLimit,
         activeCount: sparkActiveThreadIds.length
-      },
-      claude: {
-        available: core.claudeAvailable,
-        ...publicClaudeUsageStatus(),
-        modelOptions: CLAUDE_MODEL_OPTIONS
       }
     },
     runtime: publicRuntimeStatus(),
@@ -3022,7 +2543,6 @@ function publicAccountStatus(core: AccountStatusCore, includeEmail: boolean) {
     agentThreadIds,
     sparkAgentThreadIds,
     sparkActiveThreadIds,
-    claudeAvailable: core.claudeAvailable,
     admission: { settings: admission.settings },
     degraded: errors.length > 0,
     errors
@@ -3376,7 +2896,7 @@ async function sweepExpiredSessions(): Promise<void> {
   try {
     const maintenanceOptions = { priority: "background", fairnessKey: "session-ttl-sweep" } as const;
     const threads = await listAllSessions({}, maintenanceOptions);
-    const activeIds = new Set([...activeThreads, ...claudeActiveThreads]);
+    const activeIds = new Set(activeThreads);
     const expired = threads.filter((thread) => {
       const ttlMs = thread.sessionClass === "spark" ? sparkTtlMs : sessionTtlMs;
       return isSessionExpired(thread, activeIds, ttlMs);
@@ -3411,20 +2931,6 @@ async function readSession(threadId: string, includeTurns: boolean): Promise<Rec
   const indexedArchived = inventoryIndex.archiveStateFor(threadId) === "archived";
   if (removedThreadIds.has(threadId) && !indexedArchived) throw httpError("Session has been removed", 404, "SESSION_NOT_FOUND");
   assertSessionNotArchiving(threadId);
-  if (isClaudeSession(threadId)) return withThreadOperation(threadId, async () => {
-    try {
-      const thread = await readClaudeSession(threadId);
-      if (includeTurns) await sessions.persistCanonicalHistory(thread);
-      return thread;
-    } catch (error) {
-      if (!(error instanceof ClaudeBridgeError)) throw error;
-      const metadata = { id: threadId, ...sessions.metadataFor(threadId) };
-      logger.warn("Claude session detail was unavailable; using durable metadata", { threadId, error });
-      return metadata.archiveState === "archived"
-        ? archivedClaudeSession(metadata)
-        : inventorySummary(unavailableClaudeSession(metadata), "active");
-    }
-  });
   if (unavailableThreadIds.has(threadId) && !indexedArchived) throw httpError("This session no longer has a Codex rollout", 404, "SESSION_UNAVAILABLE");
   return withThreadOperation(threadId, async () => {
     const [snapshot, goal] = await Promise.all([
@@ -3453,7 +2959,7 @@ async function archiveSession(threadId: string, reason: string, actor: string, i
       threadId,
       reason,
       actor,
-      backend: isClaudeSession(threadId) ? "claude" : "codex"
+      backend: "codex"
     }, threadId);
     archivingThreadIds.add(threadId);
     removedThreadIds.add(threadId);
@@ -3567,16 +3073,11 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
   let threadId = current.remoteThreadId;
   try {
     if (!threadId) {
-      threadId = input.backend === "claude"
-        ? await ensureClaudeCreateRemote(current, input)
-        : await ensureCodexCreateRemote(current, input);
+      threadId = await ensureCodexCreateRemote(current, input);
       current = sessions.getSessionOperation(operation.id) || current;
     }
 
     await sessions.updateSessionOperation(operation.id, { step: "persisting_local", remoteThreadId: threadId });
-    const permissionMode = input.leaseMode === "read-only"
-      ? "plan"
-      : input.permissionMode || (input.yolo ? "bypassPermissions" : "default");
     await sessions.setMetadata(threadId, {
       tags: input.tags,
       category: input.category,
@@ -3587,8 +3088,6 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
       preset: input.preset,
       model: input.model,
       effort: input.effort,
-      permissionMode: input.backend === "claude" ? permissionMode : null,
-      maxTurns: input.maxTurns,
       lastPrompt: input.prompt,
       blueprintId: input.blueprintId,
       blueprintVersion: input.blueprintVersion,
@@ -3601,9 +3100,7 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
     }, input.actor);
     if (input.guardianPolicy) guardian.configure(threadId, input.guardianPolicy);
     if (input.mcpActorId) mcpAccess.assignThread(threadId, input.mcpActorId);
-    threadPolicies.set(threadId, input.backend === "claude"
-      ? permissionMode === "bypassPermissions" ? "yolo" : "workspace-write"
-      : input.yolo ? "yolo" : "workspace-write");
+    threadPolicies.set(threadId, input.yolo ? "yolo" : "workspace-write");
     persistThreadPolicies();
     knownThreadIds.add(threadId);
     await sessions.record(threadId, "created", input.actor, {
@@ -3618,8 +3115,6 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
       fileScope: input.fileScope,
       backend: input.backend,
       sessionClass: input.sessionClass,
-      permissionMode: input.backend === "claude" ? permissionMode : null,
-      maxTurns: input.maxTurns,
       blueprintId: input.blueprintId,
       blueprintVersion: input.blueprintVersion,
       blueprintEnvironment: input.blueprintEnvironment,
@@ -3634,7 +3129,7 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
     let initialTurnStarted = false;
     const latest = sessions.getSessionOperation(operation.id) || current;
     let compensation = latest.compensation;
-    if (input.backend === "codex" && compensation.nameApplied !== true) {
+    if (compensation.nameApplied !== true) {
       await sessions.updateSessionOperation(operation.id, { step: "naming_remote" });
       try {
         await codexMutation("thread/name/set", { threadId, name: input.name }, 30_000, durableMutationOptions("session-create-name"));
@@ -3658,30 +3153,8 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
         await sessions.updateSessionOperation(operation.id, { step: "starting_initial_turn", compensation });
         try {
           const prepared = await prepareKnowledgePackMessage(threadId, input.prompt);
-          if (input.backend === "claude") {
-            await acquireTurnCapacity(threadId, "claude", input.capacityWaitMs || INTERACTIVE_CAPACITY_WAIT_MS, {
-              model: input.model,
-              workspaceId: input.cwd,
-              blueprintId: input.blueprintId,
-              policy: input.admissionPolicy,
-              projection: input.projection
-            });
-            try {
-              await claudeMutation(
-                () => claudeBridge.sendMessage(threadId!, prepared.text),
-                60_000,
-                durableMutationOptions("session-create-initial-turn")
-              );
-            } catch (error) {
-              releaseTurnCapacity(threadId, false);
-              throw error;
-            }
-            recordAcceptedRequest(threadId, input.model, null);
-            await sessions.touch(threadId);
-            await sessions.record(threadId, "turn_started", input.actor, { backend: "claude", initial: true, operationId: operation.id });
-          } else {
-            claimBridgeThread(threadId);
-            try {
+          claimBridgeThread(threadId);
+          try {
             await sessions.withSession(threadId, () => startTurn(
                 threadId!,
                 prepared.text,
@@ -3692,10 +3165,9 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
                 input.admissionPolicy,
                 input.projection
               ));
-            } catch (error) {
-              releaseBridgeThread(threadId);
-              throw error;
-            }
+          } catch (error) {
+            releaseBridgeThread(threadId);
+            throw error;
           }
           await markKnowledgePackMessageInjected(threadId, prepared.markInjected);
           guardian.beginRun(threadId);
@@ -3715,9 +3187,7 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
     }
 
     await sessions.updateSessionOperation(operation.id, { step: "reading_result" });
-    const thread = input.backend === "claude"
-      ? await readClaudeSession(threadId, durableReadOptions("session-create-result"))
-      : await readCreatedCodexSession(threadId, input.name);
+    const thread = await readCreatedCodexSession(threadId, input.name);
     const result = { thread, initialTurnStarted, warnings };
     const completed = await sessions.updateSessionOperation(operation.id, {
       status: "succeeded",
@@ -3751,56 +3221,6 @@ async function runCreateOperation(operation: SessionOperation): Promise<void> {
     }
     throw error;
   }
-}
-
-async function ensureClaudeCreateRemote(operation: SessionOperation, input: DurableCreateInput): Promise<string> {
-  const threadId = validAdapterThreadId(input.proposedThreadId);
-  const exists = await claudeRead(() => claudeBridge.exists(threadId), 30_000, durableReadOptions("session-create-discovery"));
-  if (exists) {
-    await sessions.updateSessionOperation(operation.id, {
-      remoteThreadId: threadId,
-      step: "remote_created",
-      compensation: { ...operation.compensation, remoteMutation: "discovered", remoteCleanup: "pending" }
-    });
-    return threadId;
-  }
-  const permissionMode = input.leaseMode === "read-only"
-    ? "plan"
-    : input.permissionMode || (input.yolo ? "bypassPermissions" : "default");
-  await sessions.updateSessionOperation(operation.id, {
-    step: "creating_remote",
-    compensation: { ...operation.compensation, remoteMutation: "in_flight", remoteCleanup: "pending" }
-  });
-  try {
-    await claudeMutation(
-      () => claudeBridge.start({
-        threadId,
-        cwd: input.cwd,
-        model: input.model,
-        effort: input.effort || undefined,
-        permissionMode,
-        maxTurns: input.maxTurns
-      }),
-      60_000,
-      durableMutationOptions("session-create-remote")
-    );
-  } catch (error) {
-    const discovered = await claudeRead(
-      () => claudeBridge.exists(threadId),
-      30_000,
-      durableReadOptions("session-create-discovery")
-    ).catch(() => false);
-    if (!discovered) {
-      if (isRetryableOperationError(error)) throw new DurableOperationRetryError(error);
-      throw error;
-    }
-  }
-  await sessions.updateSessionOperation(operation.id, {
-    remoteThreadId: threadId,
-    step: "remote_created",
-    compensation: { ...operation.compensation, remoteMutation: "completed", remoteCleanup: "pending" }
-  });
-  return threadId;
 }
 
 async function ensureCodexCreateRemote(operation: SessionOperation, input: DurableCreateInput): Promise<string> {
@@ -3893,23 +3313,17 @@ async function compensateCreateOperation(operation: SessionOperation): Promise<v
     nextAttemptAt: null
   });
   try {
-    if (input.backend === "claude") {
-      if (await claudeRead(() => claudeBridge.exists(threadId), 30_000, durableReadOptions("session-create-compensation"))) {
-        await claudeMutation(() => claudeBridge.archive(threadId), 60_000, durableMutationOptions("session-create-compensation"));
-      }
-    } else {
-      const state = await discoverCodexArchiveState(threadId);
-      if (state === "active") {
-        try {
-          await sessions.withInventory(() => codexMutation(
-            "thread/archive",
-            { threadId },
-            60_000,
-            durableMutationOptions("session-create-compensation")
-          ));
-        } catch (error) {
-          if (!isMissingThreadError(error) && await discoverCodexArchiveState(threadId) === "active") throw error;
-        }
+    const state = await discoverCodexArchiveState(threadId);
+    if (state === "active") {
+      try {
+        await sessions.withInventory(() => codexMutation(
+          "thread/archive",
+          { threadId },
+          60_000,
+          durableMutationOptions("session-create-compensation")
+        ));
+      } catch (error) {
+        if (!isMissingThreadError(error) && await discoverCodexArchiveState(threadId) === "active") throw error;
       }
     }
   } catch (error) {
@@ -3960,11 +3374,7 @@ async function runArchiveOperation(operation: SessionOperation): Promise<void> {
       broadcastQueue(threadId);
     }
     try {
-      if (input.backend === "claude") {
-        const state = await claudeRead(() => claudeBridge.status(threadId), 30_000, durableReadOptions("session-archive-prepare"));
-        if (state.active) reconcileTurnCapacity(threadId);
-        compensation = { ...compensation, activeTurnId: state.turn?.id || null };
-      } else if (!unavailableThreadIds.has(threadId)) {
+      if (!unavailableThreadIds.has(threadId)) {
         const activeTurnId = await findActiveTurnId(threadId);
         compensation = { ...compensation, activeTurnId };
         if (activeTurnId) {
@@ -3996,24 +3406,20 @@ async function runArchiveOperation(operation: SessionOperation): Promise<void> {
   compensation = current.compensation;
   let archiveState = compensation.remoteArchive === "completed"
     ? "archived_or_missing" as const
-    : await discoverRemoteArchiveState(input.backend, threadId);
+    : await discoverRemoteArchiveState(threadId);
   if (archiveState === "active") {
     compensation = { ...compensation, remoteArchive: "in_flight" };
     await sessions.updateSessionOperation(operation.id, { step: "archiving_remote", compensation });
     try {
-      if (input.backend === "claude") {
-        await claudeMutation(() => claudeBridge.archive(threadId), 60_000, durableMutationOptions("session-archive-remote", input.actor));
-      } else {
-        await sessions.withInventory(() => codexMutation(
-          "thread/archive",
-          { threadId },
-          60_000,
-          durableMutationOptions("session-archive-remote", input.actor)
-        ));
-      }
+      await sessions.withInventory(() => codexMutation(
+        "thread/archive",
+        { threadId },
+        60_000,
+        durableMutationOptions("session-archive-remote", input.actor)
+      ));
       archiveState = "archived_or_missing";
     } catch (error) {
-      archiveState = await discoverRemoteArchiveState(input.backend, threadId).catch(() => "active" as const);
+      archiveState = await discoverRemoteArchiveState(threadId).catch(() => "active" as const);
       if (archiveState === "active") throw error;
     }
   }
@@ -4066,12 +3472,7 @@ async function failArchiveOperation(operation: SessionOperation, error: unknown)
   broadcast("threads", { action: "updated", threadId, reason: "archive_failed", operationId: operation.id });
 }
 
-async function discoverRemoteArchiveState(backend: SessionBackend, threadId: string): Promise<"active" | "archived_or_missing"> {
-  if (backend === "claude") {
-    return await claudeRead(() => claudeBridge.exists(threadId), 30_000, durableReadOptions("session-archive-discovery"))
-      ? "active"
-      : "archived_or_missing";
-  }
+async function discoverRemoteArchiveState(threadId: string): Promise<"active" | "archived_or_missing"> {
   if (unavailableThreadIds.has(threadId)) return "archived_or_missing";
   return discoverCodexArchiveState(threadId);
 }
@@ -4194,7 +3595,6 @@ class DurableOperationRetryError extends Error {
 type DurableCreateInput = SessionCreationInput & {
   actor: string;
   mcpActorId: string | null;
-  proposedThreadId?: string;
   serviceName: string;
   blueprintModelConfiguration: { backend: SessionBackend; model: string; effort: string | null; preset: ModelPreset | null } | null;
   knowledgePackIds: string[];
@@ -4220,12 +3620,10 @@ async function cleanupSessionTraces(
   const hadPolicy = threadPolicies.delete(threadId);
   const hadMetadata = preserveMetadata ? false : await sessions.removeMetadata(threadId);
   const hadLiveState = liveRecovery.delete(threadId);
-  const hadActivity = activeThreads.has(threadId) || claudeActiveThreads.has(threadId) || activeThreadSources.has(threadId) || activeTurnIds.has(threadId);
+  const hadActivity = activeThreads.has(threadId) || activeThreadSources.has(threadId) || activeTurnIds.has(threadId);
   const hadOwnership = ownershipReleased || mcpAccess.listAgentThreads().includes(threadId);
 
   activeThreads.delete(threadId);
-  setClaudeThreadActive(threadId, false);
-  claudeGuardianSignals.delete(threadId);
   const hadGuardian = guardian.remove(threadId);
   clearCapacityRecovery(threadId);
   releaseTurnCapacity(threadId, true);
@@ -4264,7 +3662,7 @@ function reconcileSessionInventory(threadIds: Set<string>): void {
   const locallyTracked = new Set([
     ...messageQueues.keys(), ...threadPolicies.keys(), ...mcpAccess.listAgentThreads(),
     ...sessions.trackedThreadIds(), ...liveRecovery.keys(), ...activeThreadSources.keys()
-  ].filter((threadId) => !isClaudeSession(threadId)));
+  ]);
   const staleThreadIds: string[] = [];
   for (const threadId of locallyTracked) {
     if (archivingThreadIds.has(threadId)) continue;
@@ -4299,8 +3697,7 @@ async function listAllSessions(
 ): Promise<Array<Record<string, unknown>>> {
   return sessions.withInventory(async () => {
     const threads: Array<Record<string, unknown>> = [];
-    if (filters.backend !== "claude") {
-      try {
+    try {
         const archiveStates = includeArchived ? [false, true] : [false];
         for (const archived of archiveStates) {
           try {
@@ -4329,33 +3726,9 @@ async function listAllSessions(
             logger.warn("Archived Codex sessions could not be included in the inventory", { error });
           }
         }
-      } catch (error) {
-        if (filters.backend === "codex") throw error;
-        logger.warn("Codex sessions could not be included in the combined session list", { error });
-      }
-    }
-    if (filters.backend !== "codex" && filters.sessionClass !== "spark") {
-      const claudeSessions = sessions.listAllSessions(filters.sessionClass).filter((metadata) => metadata.backend === "claude");
-      const activeClaudeSessions = claudeSessions.filter((metadata) => metadata.archiveState === "active");
-      const snapshots = await Promise.all(activeClaudeSessions.map(async (metadata) => {
-        try {
-          return await readClaudeSession(metadata.id, operationOptions);
-        } catch (error) {
-          // One unavailable tmux session must not make the entire combined
-          // inventory fail. Preserve the durable metadata and surface the
-          // affected card as unavailable until the next successful refresh.
-          logger.warn("Claude session status was unavailable; using durable metadata", { threadId: metadata.id, error });
-          return unavailableClaudeSession(metadata);
-        }
-      }));
-      threads.push(...snapshots
-        .filter((thread) => typeof thread.id === "string" && !removedThreadIds.has(thread.id))
-        .map((thread) => inventorySummary(thread, "active")));
-      if (includeArchived) {
-        threads.push(...claudeSessions
-          .filter((metadata) => metadata.archiveState === "archived")
-          .map(archivedClaudeSession));
-      }
+    } catch (error) {
+      if (filters.backend === "codex") throw error;
+      logger.warn("Codex sessions could not be included in the session list", { error });
     }
     return threads;
   });
@@ -4379,42 +3752,6 @@ function inventorySummary(thread: Record<string, unknown>, archiveState: "active
   };
 }
 
-function archivedClaudeSession(metadata: ReturnType<SessionManager["listAllSessions"]>[number]): Record<string, unknown> {
-  const createdAt = metadata.createdAt > 0 ? metadata.createdAt / 1_000 : 0;
-  const updatedAt = metadata.archivedAt && metadata.archivedAt > 0 ? metadata.archivedAt / 1_000 : createdAt;
-  return inventorySummary(sessions.enrich({
-    id: metadata.id,
-    name: metadata.name,
-    preview: metadata.lastPrompt || "Archived Claude session",
-    cwd: metadata.cwd || "",
-    model: metadata.model,
-    modelProvider: "anthropic",
-    createdAt,
-    updatedAt,
-    recencyAt: updatedAt,
-    status: { type: "idle" },
-    turns: []
-  }), "archived");
-}
-
-function unavailableClaudeSession(metadata: ReturnType<SessionManager["listAllSessions"]>[number]): Record<string, unknown> {
-  const createdAt = metadata.createdAt > 0 ? metadata.createdAt / 1_000 : 0;
-  const updatedAt = metadata.updatedAt > 0 ? metadata.updatedAt / 1_000 : createdAt;
-  return sessions.enrich({
-    id: metadata.id,
-    name: metadata.name,
-    preview: metadata.lastPrompt || "Claude session status is temporarily unavailable",
-    cwd: metadata.cwd || "",
-    model: metadata.model,
-    modelProvider: "anthropic",
-    createdAt,
-    updatedAt,
-    recencyAt: updatedAt,
-    status: { type: "systemError" },
-    turns: []
-  });
-}
-
 async function archiveEntry(thread: Record<string, unknown>) {
   const id = validThreadId(typeof thread.id === "string" ? thread.id : "");
   const metadata = sessions.metadataFor(id);
@@ -4433,7 +3770,7 @@ async function archiveEntry(thread: Record<string, unknown>) {
   const remainingTimeMs = permanentDeletionAt === null ? null : Math.max(0, permanentDeletionAt - Date.now());
   const sessionClass = thread.sessionClass === "spark" ? "spark" as const : "standard" as const;
   const ttlMs = sessionClass === "spark" ? sparkTtlMs : sessionTtlMs;
-  const backend = thread.backend === "claude" || thread.provider === "claude" ? "claude" as const : "codex" as const;
+  const backend = "codex" as const;
   return {
     id,
     name: typeof thread.name === "string" && thread.name.trim()
@@ -4456,10 +3793,7 @@ async function archiveEntry(thread: Record<string, unknown>) {
 async function restoreArchivedSession(threadId: string, actor: string): Promise<Record<string, unknown>> {
   return withThreadOperation(threadId, async () => {
     assertSessionNotArchiving(threadId);
-    const metadata = sessions.metadataFor(threadId);
-    if (metadata.backend === "claude" && metadata.archiveState === "archived") {
-      throw httpError("This provider cannot restore archived sessions", 409, "RESTORE_UNAVAILABLE");
-    }
+    sessions.metadataFor(threadId);
     const archived = (await listCodexThreadsRaw(true, threadId)).find((thread) => thread.id === threadId);
     if (!archived) throw httpError("Archived session not found", 404, "ARCHIVED_SESSION_NOT_FOUND");
     await enforceResumePolicy(threadId, {}, actor);
@@ -4496,152 +3830,11 @@ function providerTimestampMs(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
-async function readClaudeSession(threadId: string, operationOptions: OperationOptions = {}): Promise<Record<string, unknown>> {
-  const metadata = sessions.metadataFor(threadId);
-  if (metadata.backend !== "claude") throw httpError("Claude session not found", 404, "SESSION_NOT_FOUND");
-  const [exists, state] = await claudeRead(
-    () => Promise.all([claudeBridge.exists(threadId), claudeBridge.status(threadId)]),
-    30_000,
-    operationOptions
-  );
-  const wasActive = claudeActiveThreads.has(threadId);
-  if (state.active) {
-    setClaudeThreadActive(threadId, true);
-    reconcileTurnCapacity(threadId);
-    guardian.activate(threadId);
-  } else {
-    setClaudeThreadActive(threadId, false);
-    releaseTurnCapacity(threadId, true);
-  }
-  const guardianSignal = crypto.createHash("sha256").update(`${state.turn?.id || ""}\0${state.turn?.state || ""}\0${state.text}`).digest("base64url");
-  const previousGuardianSignal = claudeGuardianSignals.get(threadId);
-  claudeGuardianSignals.set(threadId, guardianSignal);
-  if (state.active && previousGuardianSignal && previousGuardianSignal !== guardianSignal) guardian.activity(threadId, true);
-  if (wasActive && !state.active) {
-    guardian.complete(threadId);
-    await sessions.record(threadId, "turn_completed", "claude", { backend: "claude" });
-    setTimeout(() => void drainQueue(threadId), 50).unref();
-  }
-  const createdAt = metadata.createdAt > 0 ? metadata.createdAt / 1_000 : 0;
-  const updatedAt = metadata.updatedAt > 0 ? metadata.updatedAt / 1_000 : createdAt;
-  const turnId = state.turn?.id || `claude-turn-${metadata.updatedAt || metadata.createdAt}`;
-  const itemId = `claude-output-${metadata.updatedAt || metadata.createdAt}`;
-  const parsedOutput = parseClaudeOutput(state.text, turnId);
-  const fallbackOutput = parsedOutput.structured || state.active ? "" : state.text.trim();
-  const output = parsedOutput.displayText || fallbackOutput;
-  const outputItems = parsedOutput.items.length
-    ? parsedOutput.items
-    : output ? [{ id: itemId, type: "agentMessage" as const, text: output }] : [];
-  const turnStatus = state.active
-    ? "inProgress"
-    : state.turn?.state === "failed"
-      ? "failed"
-      : state.turn?.reason === "interrupted"
-        ? "interrupted"
-        : "completed";
-  const promptItem = metadata.lastPrompt ? { id: `${itemId}-prompt`, type: "userMessage" as const, content: [{ type: "text" as const, text: metadata.lastPrompt }] } : null;
-  const turns = output || state.active || state.turn ? [{
-    id: turnId,
-    items: [
-      ...(promptItem ? [promptItem] : []),
-      ...outputItems
-    ],
-    status: turnStatus,
-    error: state.turn?.error ? { message: state.turn.error } : null,
-    startedAt: state.turn?.startedAt || metadata.updatedAt || metadata.createdAt,
-    completedAt: state.active ? null : state.turn?.completedAt || metadata.updatedAt || metadata.createdAt
-  }] : [];
-  liveRecovery.replace(threadId, {
-    items: state.active ? Object.fromEntries(outputItems.flatMap((item) => item.id ? [[item.id, item]] : [])) : {},
-    agentText: {},
-    toolOutput: {},
-    active: state.active,
-    completedAt: state.active ? null : metadata.updatedAt || null,
-    updatedAt: Date.now(),
-    tokenUsage: null
-  });
-  return sessions.enrich({
-    id: threadId,
-    name: metadata.name,
-    preview: output.slice(0, 240),
-    cwd: metadata.cwd || "",
-    model: metadata.model,
-    modelProvider: "anthropic",
-    createdAt,
-    updatedAt,
-    recencyAt: updatedAt,
-    status: { type: state.active ? "active" : exists ? "idle" : "systemError" },
-    turns,
-    policy: threadPolicies.get(threadId) || "workspace-write",
-    claudeOutput: state.text,
-    claudeTurn: state.turn,
-    guardian: guardian.get(threadId)
-  });
-}
-
-let claudeRefreshPromise: Promise<void> | null = null;
-function refreshClaudeActivity(): Promise<void> {
-  if (claudeRefreshPromise) return claudeRefreshPromise;
-  claudeRefreshPromise = (async () => {
-    const claudeSessions = sessions.listAllSessions().filter((metadata) => metadata.backend === "claude" && metadata.archiveState === "active");
-    const results = await Promise.allSettled(claudeSessions.map((metadata) => readClaudeSession(metadata.id, {
-      priority: "background",
-      fairnessKey: "claude-activity-refresh",
-      deadline: Date.now() + 15_000
-    })));
-    for (const result of results) {
-      if (result.status === "rejected") logger.debug("Could not refresh Claude session status", { error: result.reason });
-    }
-    if (results.length > 0 && results.every((result) => result.status === "rejected")) {
-      throw new AggregateError(results.map((result) => (result as PromiseRejectedResult).reason), "Claude activity refresh failed");
-    }
-  })().finally(() => { claudeRefreshPromise = null; });
-  return claudeRefreshPromise;
-}
-
-async function recoverClaudeSessions(): Promise<void> {
-  try {
-    const recovered = await claudeRead(() => claudeBridge.recoverOrphans(), 60_000, {
-      priority: "background",
-      fairnessKey: "claude-recovery"
-    });
-    for (const threadId of recovered) {
-      if (!sessions.hasMetadata(threadId)) {
-        await sessions.setMetadata(threadId, {
-          backend: "claude",
-          sessionClass: "standard",
-          cwd: projectRoot,
-          name: "Recovered Claude session",
-          model: "sonnet",
-          effort: "high",
-          permissionMode: "default",
-          maxTurns: 15
-        }, "system");
-        await sessions.record(threadId, "recovered", "system", { backend: "claude", orphaned: true });
-      } else if (!isClaudeSession(threadId)) {
-        logger.warn("Ignoring recovered Claude tmux session whose id belongs to a Codex session", { threadId });
-        continue;
-      } else {
-        await sessions.record(threadId, "recovered", "system", { backend: "claude" });
-      }
-      knownThreadIds.add(threadId);
-    }
-    await claudeBridge.cleanStaleSessions();
-    await refreshClaudeActivity();
-    for (const threadId of messageQueues.keys()) {
-      if (isClaudeSession(threadId)) void drainQueue(threadId);
-    }
-    if (recovered.length) logger.info("Recovered Claude tmux sessions", { recovered: recovered.length });
-  } catch (error) {
-    logger.warn("Could not recover Claude tmux sessions", { error });
-  }
-}
-
 let codexGuardianRecoveryPromise: Promise<void> | null = null;
 function recoverCodexGuardianMonitoring(): Promise<void> {
   if (codexGuardianRecoveryPromise) return codexGuardianRecoveryPromise;
   codexGuardianRecoveryPromise = (async () => {
-    const recoverable = guardian.list().filter((state) => state.active && !isClaudeSession(state.threadId));
+    const recoverable = guardian.list().filter((state) => state.active);
     for (const state of recoverable) {
       try {
         const snapshot = await codexRead<{ thread: ThreadSnapshot }>(
@@ -4666,10 +3859,6 @@ function recoverCodexGuardianMonitoring(): Promise<void> {
     if (recoverable.length) logger.info("Recovered Codex guardian monitoring", { sessions: recoverable.length });
   })().finally(() => { codexGuardianRecoveryPromise = null; });
   return codexGuardianRecoveryPromise;
-}
-
-function isClaudeSession(threadId: string): boolean {
-  return sessions.metadataFor(threadId).backend === "claude";
 }
 
 function sessionClassFor(threadId: string): SessionClass {
@@ -4756,22 +3945,6 @@ function codexMutation<T = unknown>(method: string, params?: unknown, timeoutMs 
   }), timeoutMs, options);
 }
 
-function claudeRead<T>(operation: () => Promise<T>, timeoutMs = 30_000, options: OperationOptions = {}): Promise<T> {
-  return claudeBridge.withOperationOptions(scopedOperationOptions(timeoutMs, options), operation);
-}
-
-function claudeMutation<T>(operation: () => Promise<T>, timeoutMs = 30_000, options: OperationOptions = {}): Promise<T> {
-  return claudeBridge.withOperationOptions(scopedOperationOptions(timeoutMs, options), operation);
-}
-
-function readClaudeAvailability(options: OperationOptions = {}): Promise<boolean> {
-  return runReadOperation(
-    (context) => ClaudeBridge.checkAvailable(runtimeOptions.claudeAvailability, context.signal),
-    15_000,
-    options
-  );
-}
-
 function scopedOperationOptions(timeoutMs: number, options: OperationOptions): OperationOptions {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("Operation timeout must be positive");
   const scope = requestOperationScope.getStore();
@@ -4794,10 +3967,6 @@ function yieldToEventLoop(): Promise<void> {
 
 async function ensureSessionExists(threadId: string): Promise<void> {
   assertSessionNotArchiving(threadId);
-  if (isClaudeSession(threadId)) {
-    if (!await claudeRead(() => claudeBridge.exists(threadId))) throw httpError("Claude session not found", 404, "SESSION_NOT_FOUND");
-    return;
-  }
   if (unavailableThreadIds.has(threadId)) throw httpError("Session not found", 404, "SESSION_NOT_FOUND");
   const snapshot = await codexRead<{ thread: Record<string, unknown> }>("thread/read", { threadId, includeTurns: false }, 60_000);
   synchronizeThreadSnapshot(snapshot.thread);
@@ -4922,8 +4091,6 @@ type SessionCreationInput = {
   yolo: boolean;
   leaseMode: WorkspaceLeaseMode;
   fileScope: string[] | null;
-  permissionMode: string | null;
-  maxTurns: number;
   name: string;
   prompt: string | null;
   tags: string[];
@@ -4981,14 +4148,7 @@ async function acceptSessionCreation(
   const cwd = await workspaces.validate(input.cwd);
   const { backend, model, effort } = input;
   const blueprintModelConfiguration = resolvedBlueprint ? { backend, model, effort, preset: input.preset } : null;
-  if (backend === "claude") {
-    validateClaudeModelChoice(model, effort);
-    if (!await claudeAvailabilityCache.get(() => readClaudeAvailability())) {
-      throw httpError("Claude Code is not installed or authenticated", 503, "CLAUDE_UNAVAILABLE");
-    }
-  } else {
-    await validateModelChoice(model, effort);
-  }
+  await validateModelChoice(model, effort);
   const policyDecision = evaluatePreflightPolicy({
     sessionClass: input.sessionClass,
     model,
@@ -5006,10 +4166,7 @@ async function acceptSessionCreation(
     blueprintModelConfiguration,
     knowledgePackIds: sessions.knowledgePacks.packIdsForWorkspace(cwd),
     ...(options.capacityWaitMs === undefined ? {} : { capacityWaitMs: options.capacityWaitMs }),
-    serviceName: `ForgeDeck/${crypto.createHash("sha256").update(options.idempotencyKey).digest("hex").slice(0, 24)}`,
-    ...(backend === "claude" ? {
-      proposedThreadId: `claude-${crypto.createHash("sha256").update(options.idempotencyKey).digest("hex").slice(0, 32)}`
-    } : {})
+    serviceName: `ForgeDeck/${crypto.createHash("sha256").update(options.idempotencyKey).digest("hex").slice(0, 24)}`
   };
   const result = await sessions.createSessionOperation("create", options.idempotencyKey, operationInput);
   scheduleSessionOperation(result.operation.id);
@@ -5030,7 +4187,7 @@ function evaluatePreflightPolicy(input: PolicyPreflightInput): PolicyDecision {
   return sessions.policies.evaluate({
     ...input,
     timeOfDay,
-    concurrency: activeThreads.size + claudeActiveThreads.size
+    concurrency: activeThreads.size
   });
 }
 
@@ -5300,10 +4457,6 @@ async function waitForEvalThread(threadId: string, deadline: number): Promise<{ 
 }
 
 async function stopEvalThread(threadId: string): Promise<void> {
-  if (isClaudeSession(threadId)) {
-    await interruptClaudeSession(threadId, "eval-timeout");
-    return;
-  }
   const turnId = await findActiveTurnId(threadId);
   if (turnId) await codexMutation("turn/interrupt", { threadId, turnId }, 30_000, durableMutationOptions("eval-timeout"));
 }
@@ -5489,11 +4642,10 @@ function parseSessionCreation(value: unknown): SessionCreationInput {
   const cwd = input.cwd;
   const backend = input.provider;
   const sessionClass = input.sessionClass;
-  if (backend === "claude" && sessionClass === "spark") throw httpError("Spark sessions only support the Codex backend", 400, "INVALID_SESSION_CLASS");
   const requestedModel = input.model || null;
   const model = sessionClass === "spark"
     ? "gpt-5.3-codex-spark"
-    : requestedModel || (backend === "claude" ? "sonnet" : (() => { throw httpError("Model is required", 400, "INVALID_MODEL"); })());
+    : requestedModel || (() => { throw httpError("Model is required", 400, "INVALID_MODEL"); })();
   // Infer Spark only when the client omitted class; an explicit standard class
   // must remain standard even when it selects the Spark model.
   const effectiveClass: SessionClass = !Object.prototype.hasOwnProperty.call(source, "class")
@@ -5503,8 +4655,6 @@ function parseSessionCreation(value: unknown): SessionCreationInput {
     ? "spark"
     : sessionClass;
   const effort = effectiveClass === "spark" ? "high" : input.reasoningEffort;
-  const permissionMode = input.permissionMode || null;
-  const maxTurns = input.maxTurns;
   const prompt = input.prompt || null;
   const explicitName = input.name || null;
   const name = singleLine(explicitName || deriveSessionName(prompt), "Name");
@@ -5529,8 +4679,8 @@ function parseSessionCreation(value: unknown): SessionCreationInput {
   const guardianPolicy = input.guardian ? guardianPolicyFromRequest(input.guardian) : null;
   return {
     cwd, backend, sessionClass: effectiveClass, preset: input.preset || null, model, effort, yolo: input.yolo,
-    leaseMode: input.leaseMode, fileScope: input.fileScope || null, permissionMode,
-    maxTurns, name, prompt, tags, category, blueprintId, blueprintVersion, blueprintEnvironment,
+    leaseMode: input.leaseMode, fileScope: input.fileScope || null,
+    name, prompt, tags, category, blueprintId, blueprintVersion, blueprintEnvironment,
     blueprintVariables, admissionPolicy, projection, guardianPolicy
   };
 }
@@ -5566,7 +4716,6 @@ function applyBlueprintToSession(input: SessionCreationInput, resolved: Resolved
     prompt: resolved.prompt || null,
     yolo: mode === "never",
     leaseMode: mode === "plan" ? "read-only" : input.leaseMode,
-    permissionMode: backend === "claude" ? (mode === "never" ? "bypassPermissions" : mode === "plan" ? "plan" : "default") : null,
     blueprintId: resolved.manifest.id,
     blueprintVersion: resolved.manifest.version,
     guardianPolicy
@@ -5603,7 +4752,7 @@ function parseDeclaredAdmissionPolicy(value: unknown): DeclaredExhaustionPolicy 
     assertObject(value.target, "Admission target");
     assertAllowedKeys(value.target, ["provider", "model"]);
     target = {
-      provider: enumBody(value.target.provider, ["codex", "spark", "claude"] as const, "codex"),
+      provider: enumBody(value.target.provider, ["codex", "spark"] as const, "codex"),
       model: boundedString(value.target.model, "Admission target model", 128)
     };
   }
@@ -5969,21 +5118,6 @@ function translateBoundaryError(error: unknown, requestId: string): ForgeDeckErr
       requestId,
       status: error.status,
       scope: "sessions"
-    });
-  }
-  if (error instanceof ClaudeBridgeError) {
-    if (error.code === "TMUX_SESSION_NOT_FOUND") {
-      return new NotFoundError("Claude session not found", { cause: error, code: "SESSION_NOT_FOUND", requestId, scope: "sessions" });
-    }
-    const timedOut = error.code === "TMUX_TIMEOUT";
-    return new BackendUnavailableError(timedOut ? "Claude backend did not respond in time" : "Claude backend could not complete the request", {
-      cause: error,
-      code: timedOut ? "CLAUDE_TIMEOUT" : "CLAUDE_UNAVAILABLE",
-      requestId,
-      retryable: !error.indeterminate,
-      retryAfter: !error.indeterminate ? 2 : undefined,
-      status: timedOut ? 504 : 503,
-      scope: "runtime"
     });
   }
   if (error instanceof CodexUnavailableError) {

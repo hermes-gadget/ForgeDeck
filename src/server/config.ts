@@ -40,7 +40,6 @@ export type ForgeDeckConfig = Readonly<{
   sparkTtlMs: number;
   standardMaxConcurrent: number;
   sparkMaxConcurrent: number;
-  claudeMaxConcurrent: number;
   admissionHeadroomPercent: number;
   admissionResetProximityMs: number;
   admissionQuotaStaleMs: number;
@@ -49,8 +48,6 @@ export type ForgeDeckConfig = Readonly<{
   operationReadConcurrency: number;
   operationMutationConcurrency: number;
   maintenanceChunkSize: number;
-  claudeBin: string;
-  claudeAvailabilityCacheTtlMs: number;
   codexBin: string;
   codexAppServerUrl: string | undefined;
   codexHome: string;
@@ -106,7 +103,6 @@ const CONFIG_DEFAULTS = Object.freeze({
   sparkTtlHours: 1,
   standardMaxConcurrent: 6,
   sparkMaxConcurrent: 16,
-  claudeMaxConcurrent: 4,
   admissionHeadroomPercent: 10,
   admissionResetProximityMs: 5 * 60_000,
   admissionQuotaStaleMs: 5 * 60_000,
@@ -114,8 +110,6 @@ const CONFIG_DEFAULTS = Object.freeze({
   operationReadConcurrency: 16,
   operationMutationConcurrency: 5,
   maintenanceChunkSize: 25,
-  claudeBin: "claude",
-  claudeAvailabilityCacheTtlMs: 30_000,
   codexBin: "codex",
   codexHome: ".codex",
   queueMaxMessages: 100,
@@ -191,7 +185,6 @@ const CONFIG_DEFINITIONS: readonly ConfigDefinition[] = Object.freeze([
   definition("FORGEDECK_SPARK_TTL_HOURS", CONFIG_DEFAULTS.sparkTtlHours, "Idle Spark-session archival age in hours; 0 disables it."),
   definition("FORGEDECK_STANDARD_MAX_CONCURRENT", CONFIG_DEFAULTS.standardMaxConcurrent, "Maximum concurrent standard Codex turns."),
   definition("FORGEDECK_SPARK_MAX_CONCURRENT", CONFIG_DEFAULTS.sparkMaxConcurrent, "Maximum concurrent Spark turns."),
-  definition("FORGEDECK_CLAUDE_MAX_CONCURRENT", CONFIG_DEFAULTS.claudeMaxConcurrent, "Maximum concurrent Claude turns."),
   definition("FORGEDECK_QUOTA_HEADROOM_PERCENT", CONFIG_DEFAULTS.admissionHeadroomPercent, "Provider quota percentage reserved before admission."),
   definition("FORGEDECK_QUOTA_RESET_PROXIMITY_MS", CONFIG_DEFAULTS.admissionResetProximityMs, "Nearby quota-reset window in milliseconds."),
   definition("FORGEDECK_QUOTA_STALE_MS", CONFIG_DEFAULTS.admissionQuotaStaleMs, "Maximum quota-observation age in milliseconds."),
@@ -200,8 +193,6 @@ const CONFIG_DEFINITIONS: readonly ConfigDefinition[] = Object.freeze([
   definition("FORGEDECK_READ_MAX_CONCURRENT", CONFIG_DEFAULTS.operationReadConcurrency, "Maximum shared read and health operations."),
   definition("FORGEDECK_MUTATION_MAX_CONCURRENT", CONFIG_DEFAULTS.operationMutationConcurrency, "Maximum shared mutation and archive operations."),
   definition("FORGEDECK_MAINTENANCE_CHUNK_SIZE", CONFIG_DEFAULTS.maintenanceChunkSize, "Maximum records processed per maintenance chunk."),
-  definition("FORGEDECK_CLAUDE_BIN", CONFIG_DEFAULTS.claudeBin, "Claude executable path or command name."),
-  definition("FORGEDECK_CLAUDE_AVAILABILITY_CACHE_TTL_MS", CONFIG_DEFAULTS.claudeAvailabilityCacheTtlMs, "Claude availability cache duration in milliseconds."),
   definition("CODEX_BIN", CONFIG_DEFAULTS.codexBin, "Codex executable path or command name."),
   definition("CODEX_APP_SERVER_URL", "none", "Existing Codex app-server WebSocket URL."),
   definition("CODEX_HOME", "~/.codex", "Codex state directory used by the external monitor."),
@@ -253,7 +244,7 @@ export type RuntimePreflight = {
   ok: boolean;
   errors: readonly string[];
   warnings: readonly string[];
-  dependencies: Readonly<Record<"codex" | "claude" | "flock" | "tmux", string | null>>;
+  dependencies: Readonly<Record<"codex" | "flock", string | null>>;
 };
 
 /** Captures the process environment once at an executable composition boundary. */
@@ -300,7 +291,6 @@ export function loadConfig(projectRoot: string, env: Readonly<NodeJS.ProcessEnv>
     sparkTtlMs: hoursSetting(env, "FORGEDECK_SPARK_TTL_HOURS", CONFIG_DEFAULTS.sparkTtlHours, 0, 24 * 365) * 3_600_000,
     standardMaxConcurrent: integerSetting(env, "FORGEDECK_STANDARD_MAX_CONCURRENT", CONFIG_DEFAULTS.standardMaxConcurrent, 1, 50),
     sparkMaxConcurrent: integerSetting(env, "FORGEDECK_SPARK_MAX_CONCURRENT", CONFIG_DEFAULTS.sparkMaxConcurrent, 1, 50),
-    claudeMaxConcurrent: integerSetting(env, "FORGEDECK_CLAUDE_MAX_CONCURRENT", CONFIG_DEFAULTS.claudeMaxConcurrent, 1, 50),
     admissionHeadroomPercent: decimalSetting(env, "FORGEDECK_QUOTA_HEADROOM_PERCENT", CONFIG_DEFAULTS.admissionHeadroomPercent, 0, 100),
     admissionResetProximityMs: integerSetting(env, "FORGEDECK_QUOTA_RESET_PROXIMITY_MS", CONFIG_DEFAULTS.admissionResetProximityMs, 0, 24 * 60 * 60_000),
     admissionQuotaStaleMs: integerSetting(env, "FORGEDECK_QUOTA_STALE_MS", CONFIG_DEFAULTS.admissionQuotaStaleMs, 1_000, 24 * 60 * 60_000),
@@ -309,8 +299,6 @@ export function loadConfig(projectRoot: string, env: Readonly<NodeJS.ProcessEnv>
     operationReadConcurrency: integerSetting(env, "FORGEDECK_READ_MAX_CONCURRENT", CONFIG_DEFAULTS.operationReadConcurrency, 1, 100),
     operationMutationConcurrency: integerSetting(env, "FORGEDECK_MUTATION_MAX_CONCURRENT", CONFIG_DEFAULTS.operationMutationConcurrency, 1, 50),
     maintenanceChunkSize: integerSetting(env, "FORGEDECK_MAINTENANCE_CHUNK_SIZE", CONFIG_DEFAULTS.maintenanceChunkSize, 1, 500),
-    claudeBin: nonEmptySetting(env.FORGEDECK_CLAUDE_BIN, CONFIG_DEFAULTS.claudeBin, "FORGEDECK_CLAUDE_BIN"),
-    claudeAvailabilityCacheTtlMs: integerSetting(env, "FORGEDECK_CLAUDE_AVAILABILITY_CACHE_TTL_MS", CONFIG_DEFAULTS.claudeAvailabilityCacheTtlMs, 0, 3_600_000),
     codexBin: nonEmptySetting(env.CODEX_BIN, CONFIG_DEFAULTS.codexBin, "CODEX_BIN"),
     codexAppServerUrl: optionalUrlSetting(env.CODEX_APP_SERVER_URL, "CODEX_APP_SERVER_URL", ["ws:", "wss:"]),
     codexHome: resolveSetting(projectRoot, env.CODEX_HOME, path.join(os.homedir(), CONFIG_DEFAULTS.codexHome)),
@@ -357,14 +345,10 @@ export function validateRuntime(config: ForgeDeckConfig): RuntimePreflight {
 
   const dependencies = {
     codex: config.codexAppServerUrl ? null : resolveExecutable(config.codexBin, config.executableSearchPath),
-    claude: resolveExecutable(config.claudeBin, config.executableSearchPath),
-    flock: resolveExecutable("flock", config.executableSearchPath),
-    tmux: resolveExecutable("tmux", config.executableSearchPath)
+    flock: resolveExecutable("flock", config.executableSearchPath)
   };
   if (!config.codexAppServerUrl && !dependencies.codex) errors.push(`Codex executable is not available: ${config.codexBin}`);
   if (!dependencies.flock) errors.push("Required locking dependency is not available: flock");
-  if (!dependencies.claude) warnings.push(`Claude executable is not available; the Claude backend will be disabled: ${config.claudeBin}`);
-  if (!dependencies.tmux) warnings.push("tmux is not available; the Claude backend will be disabled");
   if (!config.authEnabled && !isLoopbackHost(config.host)) {
     warnings.push(`Authentication is disabled while listening on non-loopback host ${config.host}`);
   }

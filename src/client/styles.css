@@ -27,7 +27,6 @@
   --color-info: #6e9dff;
   --color-provider-codex: #6e9dff;
   --color-provider-spark: #e5c04e;
-  --color-provider-claude: #c88fe4;
   --color-provider-unavailable: #67707e;
   --color-on-accent: #1d0d04;
   --surface-canvas: var(--color-bg);
@@ -78,7 +77,6 @@
     --color-info: #2f5fad;
     --color-provider-codex: #2f5fad;
     --color-provider-spark: #7a5a00;
-    --color-provider-claude: #7a3598;
     --color-provider-unavailable: #525c6b;
     --color-on-accent: #271006;
     --surface-canvas: var(--color-bg);
@@ -161,7 +159,6 @@ code, pre, kbd { font-family: var(--font-mono); }
 .provider-usage-list { display: grid; gap: 7px; }
 .provider-usage-row { --provider-color: var(--color-info); min-height: 18px; display: grid; grid-template-columns: 16px 43px minmax(0, 1fr); align-items: center; gap: 7px; }
 .provider-usage-row.provider-spark { --provider-color: var(--color-provider-spark); }
-.provider-usage-row.provider-claude { --provider-color: var(--color-provider-claude); }
 .provider-usage-row.unavailable { --provider-color: var(--color-provider-unavailable); }
 .provider-usage-icon { color: var(--provider-color); display: grid; place-items: center; }
 .provider-usage-row > strong { color: var(--color-text); font-size: var(--font-xs); }
@@ -221,7 +218,6 @@ code, pre, kbd { font-family: var(--font-mono); }
 .inventory-more:hover:not(:disabled) { border-color: var(--border-heat); background: var(--surface-hover); color: var(--color-text); }
 .session-card { width: 100%; min-height: 106px; border: 1px solid transparent; border-radius: 8px; background: transparent; display: flex; align-items: center; text-align: left; position: relative; transition: background .16s, border-color .16s, opacity .16s; content-visibility: auto; contain-intrinsic-size: auto 106px; }
 .session-card.provider-spark { box-shadow: inset 2px 0 rgba(245, 196, 81, .55); }
-.session-card.provider-claude { box-shadow: inset 2px 0 rgba(201, 105, 255, .5); }
 .session-card-main { min-width: 0; min-height: 104px; flex: 1; border: 0; background: transparent; color: inherit; display: flex; align-items: center; gap: 10px; text-align: left; padding: 9px 3px 9px 12px; }
 .session-checkbox { flex: 0 0 28px; align-self: stretch; border: 0; border-right: 1px solid var(--color-border-subtle); background: transparent; color: var(--color-text-subtle); display: grid; place-items: center; padding: 0; }
 .session-checkbox[aria-pressed="true"] { color: var(--color-accent-emphasis); }
@@ -887,7 +883,6 @@ code, pre, kbd { font-family: var(--font-mono); }
 .welcome-mark { padding: 20px; margin-bottom: 20px; }
 .eyebrow { color: var(--color-text-muted); font: 500 var(--font-xs) var(--font-sans); letter-spacing: .04em; text-transform: none; }
 .eyebrow.spark { color: var(--color-provider-spark); }
-.eyebrow.claude { color: var(--color-provider-claude); }
 .welcome h1 { font-size: clamp(22px, 2.6vw, 30px); line-height: 1.2; letter-spacing: -.4px; margin: 10px 0 12px; font-weight: 650; }
 .welcome h1 em { color: var(--color-accent); font-style: normal; }
 .welcome > p { max-width: 480px; color: var(--color-text-muted); font-size: var(--font-sm); line-height: 1.65; margin: 0 0 24px; }
@@ -1202,7 +1197,6 @@ code, pre, kbd { font-family: var(--font-mono); }
   --color-info: #2f5fad;
   --color-provider-codex: #2f5fad;
   --color-provider-spark: #7a5a00;
-  --color-provider-claude: #7a3598;
   --color-provider-unavailable: #525c6b;
   --color-on-accent: #271006;
   --surface-canvas: var(--color-bg);

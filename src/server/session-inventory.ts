@@ -350,7 +350,7 @@ function labelsValue(item: InventoryItem): string[] {
 }
 
 function modelValue(item: InventoryItem): string {
-  return stringValue(item.model) || stringValue(item.claudeModel);
+  return stringValue(item.model);
 }
 
 function stringValue(value: unknown, fallback = ""): string {

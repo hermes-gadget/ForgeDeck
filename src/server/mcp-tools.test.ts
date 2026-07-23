@@ -38,8 +38,7 @@ test("MCP tools expose schemas and invoke the ForgeDeck API through the real pro
   const workspace = process.cwd();
   const bootstrap = {
     roots: [workspace],
-    models: { data: [{ id: "gpt-test", model: "gpt-test", displayName: "Test", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] },
-    claudeModelOptions: []
+    models: { data: [{ id: "gpt-test", model: "gpt-test", displayName: "Test", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] }] }
   };
   const accountStatus = {
     account: { account: { planType: "test" } },
@@ -47,10 +46,8 @@ test("MCP tools expose schemas and invoke the ForgeDeck API through the real pro
     runtime: { available: true },
     backendStatus: {
       codex: { available: true },
-      spark: { available: false },
-      claude: { available: false, activeCount: 0, rateLimit: { primary: { usedPercent: 0 } }, modelOptions: [] }
-    },
-    claudeAvailable: false
+      spark: { available: false }
+    }
   };
   const inspectionThread = {
     id: "thread-12345678",
@@ -100,7 +97,7 @@ test("MCP tools expose schemas and invoke the ForgeDeck API through the real pro
       }
       if (endpoint === "/api/threads") {
         const body = (options as { body?: { provider?: string; model?: string; reasoningEffort?: string } })?.body || {};
-        const provider = body.provider === "claude" ? "claude" : "codex";
+        const provider = "codex";
         return {
           operation: {
             id: "11111111-1111-4111-8111-111111111111",
@@ -108,7 +105,7 @@ test("MCP tools expose schemas and invoke the ForgeDeck API through the real pro
             links: { self: "/api/operations/11111111-1111-4111-8111-111111111111" },
             result: {
               thread: {
-                id: provider === "claude" ? "claude-created1" : "thread-created1",
+                id: "thread-created1",
                 name: "Created",
                 preview: "",
                 cwd: workspace,
@@ -222,47 +219,28 @@ test("MCP tools expose schemas and invoke the ForgeDeck API through the real pro
       sessionClass: "standard",
       yolo: false,
       fileScope: ["server.py"],
-      permissionMode: "default",
-      maxTurns: 100,
       name: undefined,
       category: undefined,
       tags: [],
       prompt: undefined
     });
 
-    const mixedSpawned = await client.request("tools/call", {
+    const batchSpawned = await client.request("tools/call", {
       name: "forgedeck_spawn",
       arguments: {
         items: [
-          { cwd: workspace, provider: "claude", model: "sonnet", effort: "high", permissionMode: "plan", maxTurns: 80 },
+          { cwd: workspace, provider: "codex", model: "gpt-test", effort: "high" },
           { cwd: workspace, provider: "codex", model: "gpt-test", effort: "high" }
         ]
       }
     }) as ToolCallResult;
-    assert.equal(mixedSpawned.isError, undefined);
-    assert.equal(mixedSpawned.structuredContent.ok, 2);
-    assert.equal(mixedSpawned.structuredContent.failed, 0);
-    const mixedBodies = calls.filter((call) => call.endpoint === "/api/threads").slice(-2)
+    assert.equal(batchSpawned.isError, undefined);
+    assert.equal(batchSpawned.structuredContent.ok, 2);
+    assert.equal(batchSpawned.structuredContent.failed, 0);
+    const batchBodies = calls.filter((call) => call.endpoint === "/api/threads").slice(-2)
       .map((call) => (call.options as { body: Record<string, unknown> }).body);
-    const claudeBody = mixedBodies.find((body) => body.provider === "claude");
-    const codexBody = mixedBodies.find((body) => body.provider === "codex");
-    assert.deepEqual(claudeBody, {
-      cwd: workspace,
-      provider: "claude",
-      preset: undefined,
-      model: "sonnet",
-      reasoningEffort: "high",
-      sessionClass: "standard",
-      yolo: false,
-      permissionMode: "plan",
-      maxTurns: 80,
-      name: undefined,
-      category: undefined,
-      tags: [],
-      prompt: undefined
-    });
-    assert.equal(codexBody?.model, "gpt-test");
-    assert.equal(codexBody?.maxTurns, 100);
+    assert.equal(batchBodies.length, 2);
+    assert.equal(batchBodies.every((body) => body.provider === "codex" && body.model === "gpt-test"), true);
 
     const sent = await client.request("tools/call", {
       name: "forgedeck_send_message",

@@ -2,11 +2,8 @@ import * as z from "zod/v4";
 
 export const CONTRACT_SCHEMA_VERSION = 1 as const;
 
-export const providerSchema = z.enum(["codex", "claude"]);
+export const providerSchema = z.literal("codex");
 export const sessionClassSchema = z.enum(["standard", "spark"]);
-export const claudePermissionModeSchema = z.enum([
-  "default", "plan", "acceptEdits", "bypassPermissions", "auto", "manual", "dontAsk"
-]);
 export const modelPresetSchema = z.enum(["quick", "balanced", "deep"]);
 export const MODEL_PRESETS = Object.freeze({
   quick: Object.freeze({ label: "Quick", model: "gpt-5.6-luna", effort: "low" }),
@@ -219,13 +216,6 @@ export const codexModelSchema = z.object({
   defaultReasoningEffort: reasoningEffortSchema,
   supportedReasoningEfforts: z.array(reasoningOptionSchema),
   serviceTiers: z.array(z.object({ id: z.string(), name: z.string(), description: z.string() }).passthrough()).default([])
-}).passthrough();
-
-export const claudeModelOptionSchema = z.object({
-  id: z.string().min(1),
-  model: modelNameSchema,
-  displayName: z.string().default(""),
-  description: z.string().default("")
 }).passthrough();
 
 export const blueprintVariableValueSchema = z.union([z.string(), z.number(), z.boolean()]);
@@ -776,9 +766,6 @@ const rawThreadResourceSchema = z.object({
   settings: threadSessionMetadataSchema.nullable().optional(),
   metadata: threadSessionMetadataSchema.nullable().optional(),
   sessionMetadata: threadSessionMetadataSchema.nullable().optional(),
-  claudeModel: modelNameSchema.optional(),
-  claudeEffort: reasoningEffortSchema.optional(),
-  claudePermissionMode: z.string().optional(),
   archiveState: z.enum(["active", "archiving", "archived"]).optional(),
   pinned: z.boolean().optional(),
   queueState: z.enum(["empty", "queued"]).optional(),
@@ -794,8 +781,8 @@ const rawThreadResourceSchema = z.object({
 
 export const threadResourceSchema = rawThreadResourceSchema.transform((thread) => {
   const provider = thread.provider ?? thread.backend ?? "codex";
-  const model = thread.model ?? thread.claudeModel ?? null;
-  const reasoningEffort = thread.reasoningEffort ?? thread.effort ?? thread.claudeEffort ?? null;
+  const model = thread.model ?? null;
+  const reasoningEffort = thread.reasoningEffort ?? thread.effort ?? null;
   return {
     ...thread,
     provider,
@@ -932,7 +919,7 @@ export const admissionEventSchema = z.object({
     alerts: z.array(admissionAlertSchema),
     retryAt: nullableTimestampSchema,
     target: z.object({
-      provider: z.enum(["codex", "spark", "claude"]),
+      provider: z.enum(["codex", "spark"]),
       model: modelNameSchema
     }).passthrough().nullable()
   }).passthrough().optional(),
@@ -1074,7 +1061,6 @@ export const startupConfigurationSchema = z.object({
   }).passthrough(),
   models: z.object({ data: z.array(codexModelSchema) }).passthrough(),
   roots: z.array(z.string()),
-  claudeModelOptions: z.array(claudeModelOptionSchema).optional(),
   background: backgroundHealthSchema.optional(),
   degraded: z.boolean().optional(),
   errors: z.array(serverErrorSchema).optional()
@@ -1093,14 +1079,12 @@ export const accountStatusSchema = z.object({
   usage: usageSchema.nullable(),
   backendStatus: z.object({
     codex: backendStatusEntrySchema,
-    spark: backendStatusEntrySchema,
-    claude: backendStatusEntrySchema
+    spark: backendStatusEntrySchema
   }).passthrough().optional(),
   activeThreadIds: z.array(threadIdSchema).optional(),
   agentThreadIds: z.array(threadIdSchema).optional(),
   sparkAgentThreadIds: z.array(threadIdSchema).optional(),
   sparkActiveThreadIds: z.array(threadIdSchema).optional(),
-  claudeAvailable: z.boolean().optional(),
   runtime: jsonObjectSchema.optional(),
   admission: z.object({ settings: jsonObjectSchema }).passthrough().optional(),
   degraded: z.boolean().optional(),
@@ -1110,7 +1094,6 @@ export const bootstrapSchema = z.intersection(startupConfigurationSchema, accoun
 
 export type ReasoningOption = z.infer<typeof reasoningOptionSchema>;
 export type CodexModel = z.infer<typeof codexModelSchema>;
-export type ClaudeModelOption = z.infer<typeof claudeModelOptionSchema>;
 export type BlueprintVariableValue = z.infer<typeof blueprintVariableValueSchema>;
 export type BlueprintVariableSchema = z.infer<typeof blueprintVariableSchema>;
 export type AgentBlueprintDefinition = z.infer<typeof agentBlueprintDefinitionSchema>;
@@ -1205,8 +1188,6 @@ export const createSessionRequestSchema = z.object({
   yolo: z.boolean().default(false),
   leaseMode: workspaceLeaseModeSchema.default("exclusive"),
   fileScope: workspaceFileScopeSchema.optional(),
-  permissionMode: claudePermissionModeSchema.nullable().optional(),
-  maxTurns: z.number().int().min(1).max(100).default(15),
   name: z.string().max(100).optional(),
   prompt: z.string().max(100_000).nullable().optional(),
   tags: tagListSchema,
@@ -1228,7 +1209,7 @@ export const createSessionRequestSchema = z.object({
   if (value.reasoningEffort && value.effort && value.reasoningEffort !== value.effort) {
     context.addIssue({ code: "custom", path: ["reasoningEffort"], message: "reasoningEffort conflicts with deprecated effort alias" });
   }
-  if (value.leaseMode === "read-only" && (value.yolo || value.permissionMode === "bypassPermissions")) {
+  if (value.leaseMode === "read-only" && value.yolo) {
     context.addIssue({
       code: "custom",
       path: ["leaseMode"],
@@ -1321,23 +1302,6 @@ const codexEventPayloadSchema = z.object({
   method: z.string(),
   params: jsonObjectSchema.optional()
 }).passthrough().transform((value) => normalizeTimestampFields(value) as typeof value);
-const claudeTurnEventPayloadSchema = z.object({
-  id: z.string(),
-  threadId: threadIdSchema,
-  state: z.enum(["accepted", "running", "interrupting", "completed", "failed"]),
-  acceptedAt: timestampSchema,
-  startedAt: nullableTimestampSchema,
-  completedAt: nullableTimestampSchema,
-  exitCode: z.number().nullable(),
-  reason: z.string().nullable(),
-  error: z.string().nullable()
-}).passthrough();
-const claudeOutputEventPayloadSchema = z.object({
-  threadId: threadIdSchema,
-  turnId: z.string(),
-  observedAt: timestampSchema,
-  items: z.array(threadItemSchema)
-}).passthrough();
 const guardianEventPayloadSchema = z.object({
   threadId: threadIdSchema,
   reason: z.string(),
@@ -1345,8 +1309,7 @@ const guardianEventPayloadSchema = z.object({
 }).passthrough();
 const backendStatusEventPayloadSchema = z.object({
   codex: backendStatusEntrySchema.partial().optional(),
-  spark: backendStatusEntrySchema.partial().optional(),
-  claude: backendStatusEntrySchema.partial().optional()
+  spark: backendStatusEntrySchema.partial().optional()
 }).passthrough();
 const healthEventPayloadSchema = backgroundHealthSchema;
 const eventSubscriptionRequestSchema = z.object({
@@ -1370,8 +1333,6 @@ export const ssePayloadSchemas = {
   health: healthEventPayloadSchema,
   threads: threadsEventPayloadSchema,
   codex: codexEventPayloadSchema,
-  "claude-turn": claudeTurnEventPayloadSchema,
-  "claude-output": claudeOutputEventPayloadSchema,
   guardian: guardianEventPayloadSchema
 } as const;
 
@@ -1745,11 +1706,7 @@ const mcpBriefSessionSummaryOutputSchema = z.object({
 export const mcpRateLimitSchema = z.object({ usedPercent: z.number(), resetsAt: mcpNullableTimestampSchema }).nullable();
 export const mcpUsageSchema = z.object({
   codex: z.object({ available: z.boolean(), rateLimit: mcpRateLimitSchema, planType: z.string().nullable() }),
-  spark: z.object({ available: z.boolean(), rateLimit: mcpRateLimitSchema }),
-  claude: z.object({
-    available: z.boolean(), subscriptionActive: z.boolean(), rateLimit: mcpRateLimitSchema,
-    activeCount: z.number(), modelOptions: z.array(z.string())
-  })
+  spark: z.object({ available: z.boolean(), rateLimit: mcpRateLimitSchema })
 });
 export const mcpHealthOutputSchema = z.object({
   status: z.enum(["ok", "degraded"]), forgedeck: z.literal("reachable"),
@@ -1769,8 +1726,7 @@ export const mcpModelPresetOptionSchema = z.object({
   effort: reasoningEffortSchema
 });
 export const mcpOptionsOutputSchema = z.object({
-  workspace_roots: z.array(z.string()), models: z.array(mcpModelOptionSchema), presets: z.array(mcpModelPresetOptionSchema), claude_available: z.boolean(),
-  claude_models: z.array(mcpModelOptionSchema), usage: mcpUsageSchema,
+  workspace_roots: z.array(z.string()), models: z.array(mcpModelOptionSchema), presets: z.array(mcpModelPresetOptionSchema), usage: mcpUsageSchema,
   defaults: z.object({ yolo: z.literal(false), session_class: z.literal("standard"), class: z.literal("standard").optional() }),
   yolo_warning: z.string()
 });
@@ -1848,8 +1804,6 @@ export const mcpSpawnSessionInputSchema = z.object({
   class: sessionClassSchema.default("standard"),
   yolo: z.boolean().default(false),
   fileScope: workspaceFileScopeSchema.optional(),
-  permissionMode: claudePermissionModeSchema.default("default"),
-  maxTurns: z.number().int().min(1).max(100).default(100),
   name: z.string().max(100).optional(),
   category: z.string().max(50).optional(),
   tags: tagListSchema,

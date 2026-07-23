@@ -71,9 +71,9 @@ export function createSessionExport(thread: JsonObject, options: SessionExportOp
 
   const firstPrompt = runRecords.find((run) => run.prompt)?.prompt
     || safeNullableText(firstString(metadata.lastPrompt), workspace);
-  const provider = firstString(thread.provider, thread.backend, metadata.backend) === "claude" ? "claude" : "codex";
-  const model = safeNullableText(firstString(thread.model, thread.claudeModel, metadata.model), workspace);
-  const effort = safeNullableText(firstString(thread.reasoningEffort, thread.effort, thread.claudeEffort, metadata.effort), workspace);
+  const provider = "codex";
+  const model = safeNullableText(firstString(thread.model, metadata.model), workspace);
+  const effort = safeNullableText(firstString(thread.reasoningEffort, thread.effort, metadata.effort), workspace);
   const blueprintId = safeNullableText(firstString(thread.blueprintId, metadata.blueprintId), workspace);
   const blueprintVersion = positiveInteger(thread.blueprintVersion) || positiveInteger(metadata.blueprintVersion);
   const persistedArtifactSummaries = (options.artifacts || []).map((artifact) => summarizeArtifact(artifact, workspace));

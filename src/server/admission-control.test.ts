@@ -104,107 +104,6 @@ test("quota headroom, reset proximity, and retry-after signals reject before cap
   }
 });
 
-test("reset-less Claude exhaustion cannot block admission for more than one hour", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-claude-quota-admission-"));
-  const store = await TransactionalStore.open(dataDir, 10_000);
-  let now = 1_000_000;
-  try {
-    const controller = new AdmissionController(store, {
-      now: () => now,
-      quotaStaleMs: 24 * 60 * 60_000
-    });
-    controller.observeQuota({
-      provider: "claude",
-      limitId: "claude:five_hour",
-      observedAt: now,
-      usedPercent: 100,
-      remainingPercent: 0,
-      resetAt: null,
-      raw: { status: "rejected", resetsAt: 0 }
-    });
-
-    assert.equal(controller.evaluate({ ...context(), provider: "claude" }).admitted, false);
-    now += 60 * 60_000 + 1;
-    assert.equal(controller.evaluate({ ...context(), provider: "claude" }).admitted, true);
-  } finally {
-    store.close();
-    await fs.rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("replayed reset-less Claude exhaustion does not refresh its lifetime across restart", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-claude-quota-replay-"));
-  let store = await TransactionalStore.open(dataDir, 10_000);
-  let now = 1_000_000;
-  const rejection = () => ({
-    provider: "claude" as const,
-    limitId: "claude:session",
-    observedAt: now,
-    usedPercent: 100,
-    remainingPercent: 0,
-    resetAt: null,
-    raw: { status: "rejected", overageDisabledReason: "out_of_credits" }
-  });
-  try {
-    let controller = new AdmissionController(store, {
-      now: () => now,
-      quotaStaleMs: 24 * 60 * 60_000
-    });
-    assert.equal(controller.observeQuota(rejection()), true);
-    const firstObservedAt = store.latestQuotaEvents()[0]?.observedAt;
-
-    store.close();
-    store = await TransactionalStore.open(dataDir, 10_000);
-    controller = new AdmissionController(store, {
-      now: () => now,
-      quotaStaleMs: 24 * 60 * 60_000
-    });
-    now += 30 * 60_000;
-    assert.equal(controller.observeQuota(rejection()), false);
-    assert.equal(store.latestQuotaEvents()[0]?.observedAt, firstObservedAt);
-
-    now = firstObservedAt! + 60 * 60_000 + 1;
-    assert.equal(controller.evaluate({ ...context(), provider: "claude" }).admitted, true);
-  } finally {
-    store.close();
-    await fs.rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("a later allowed Claude transition clears an earlier rejection across limit ids", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-claude-quota-transition-"));
-  const store = await TransactionalStore.open(dataDir, 10_000);
-  let now = 2_000_000;
-  try {
-    const controller = new AdmissionController(store, { now: () => now, quotaStaleMs: 300_000 });
-    assert.equal(controller.observeQuota({
-      provider: "claude",
-      limitId: "claude:session",
-      observedAt: now,
-      usedPercent: 100,
-      remainingPercent: 0,
-      resetAt: null,
-      raw: { status: "rejected" }
-    }), true);
-    assert.equal(controller.evaluate({ ...context(), provider: "claude" }).admitted, false);
-
-    now += 1_000;
-    assert.equal(controller.observeQuota({
-      provider: "claude",
-      limitId: "claude:five_hour",
-      observedAt: now,
-      usedPercent: 0,
-      remainingPercent: 100,
-      resetAt: null,
-      raw: { status: "allowed" }
-    }), true);
-    assert.equal(controller.evaluate({ ...context(), provider: "claude" }).admitted, true);
-  } finally {
-    store.close();
-    await fs.rm(dataDir, { recursive: true, force: true });
-  }
-});
-
 test("run, blueprint, and workspace budgets emit soft alerts and enforce hard policies", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "forgedeck-budget-admission-"));
   const store = await TransactionalStore.open(dataDir, 10_000);
@@ -283,7 +182,7 @@ test("model and provider switches require a matching explicit approval", async (
 
     const fallback = controller.evaluate({
       ...context(),
-      policy: { action: "fallback", approved: true, target: { provider: "claude", model: "sonnet" } }
+      policy: { action: "fallback", approved: true, target: { provider: "spark", model: "gpt-5.3-codex-spark" } }
     });
     assert.equal(fallback.admitted, true);
     assert.equal(fallback.action, "fallback");

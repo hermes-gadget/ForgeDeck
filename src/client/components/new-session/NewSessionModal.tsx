@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowLeft, Bot, BrainCircuit, Check, ChevronRight, Copy, FileText, Folder, FolderOpen, History, LoaderCircle, LockKeyhole, ShieldCheck, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Bot, Check, ChevronRight, Copy, FileText, Folder, FolderOpen, History, LoaderCircle, LockKeyhole, ShieldCheck, Sparkles, X } from "lucide-react";
 import { api, apiErrorFromPayload, ApiError } from "../../api/client";
 import { readLaunchPreferences, rememberLaunch, type LastSessionSetup } from "../../state/preferences";
 import { MODEL_PRESETS } from "../../../shared/contracts";
@@ -16,8 +16,7 @@ import type {
 } from "../../types";
 
 export type SessionClass = "standard" | "spark";
-type SessionBackend = "codex" | "claude";
-type ClaudePermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions";
+type SessionBackend = "codex";
 type DirectoryResponse = {
   path: string | null;
   parent: string | null;
@@ -33,7 +32,6 @@ type SessionOperationResource = {
 };
 
 const SPARK_MODEL = "gpt-5.3-codex-spark";
-const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const EFFORT_LABELS: Record<string, string> = { none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Maximum", ultra: "Ultra" };
 const MODEL_PRESET_IDS: ModelPreset[] = ["quick", "balanced", "deep"];
 const MODEL_PRESET_DESCRIPTIONS: Record<ModelPreset, string> = {
@@ -57,17 +55,15 @@ const QUICK_START_PROMPT = "Explore this workspace, explain its structure, and s
 export function NewSessionModal({ bootstrap, sessionClass = "standard", quickStart = false, recentThreads = [], onClose, onCreated, onError }: NewSessionModalProps) {
   const spark = sessionClass === "spark";
   const defaultModel = bootstrap.models.data.find((candidate) => candidate.isDefault) || bootstrap.models.data[0];
-  const claudeModels = bootstrap.claudeModelOptions || [];
-  const claudeAvailable = bootstrap.claudeAvailable === true && claudeModels.length > 0;
   const launchPreferences = useRef(readLaunchPreferences()).current;
   const historicalSetup = launchPreferences?.lastSession || sessionSetupFromThread(recentThreads[0]);
-  const rememberedProvider = !spark && historicalSetup?.provider === "claude" && claudeAvailable ? "claude" : "codex";
+  const rememberedProvider: SessionBackend = "codex";
   const rememberedModel = validRememberedModel(historicalSetup, rememberedProvider, bootstrap)
     ? historicalSetup!.model
-    : rememberedProvider === "claude" ? claudeModels[0]?.model || "" : defaultModel?.model || "";
-  const rememberedEffort = validRememberedEffort(rememberedModel, historicalSetup?.effort, rememberedProvider, bootstrap)
+    : defaultModel?.model || "";
+  const rememberedEffort = validRememberedEffort(rememberedModel, historicalSetup?.effort, bootstrap)
     ? historicalSetup!.effort
-    : rememberedProvider === "claude" ? "high" : bootstrap.models.data.find((candidate) => candidate.model === rememberedModel)?.defaultReasoningEffort || "medium";
+    : bootstrap.models.data.find((candidate) => candidate.model === rememberedModel)?.defaultReasoningEffort || "medium";
   const rememberedPreset = !spark && rememberedProvider === "codex" && validRememberedPreset(historicalSetup, bootstrap)
     ? historicalSetup!.preset || null
     : null;
@@ -82,13 +78,12 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
   const [category, setCategory] = useState("");
   const [tags, setTags] = useState("");
   const [prompt, setPrompt] = useState(quickStart ? QUICK_START_PROMPT : "");
-  const [backend, setBackend] = useState<SessionBackend>(spark ? "codex" : rememberedProvider);
+  const backend: SessionBackend = "codex";
   const [model, setModel] = useState(spark ? SPARK_MODEL : rememberedModel);
   const [effort, setEffort] = useState(spark ? "high" : rememberedEffort);
   const [preset, setPreset] = useState<ModelPreset | null>(rememberedPreset);
   const [yolo, setYolo] = useState(false);
   const [leaseMode, setLeaseMode] = useState<WorkspaceLeaseMode>(quickStart ? "read-only" : "exclusive");
-  const [claudePermissionMode, setClaudePermissionMode] = useState<ClaudePermissionMode>("default");
   const [browser, setBrowser] = useState<DirectoryResponse | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [blueprints, setBlueprints] = useState<AgentBlueprintManifest[]>([]);
@@ -101,8 +96,7 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
   const [busy, setBusy] = useState(false);
   busyRef.current = busy;
   const selectedCodexModel = bootstrap.models.data.find((candidate) => candidate.model === model);
-  const selectedClaudeModel = claudeModels.find((candidate) => candidate.model === model);
-  const effortOptions = spark ? ["high"] : backend === "claude" ? [...CLAUDE_EFFORTS] : selectedCodexModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
+  const effortOptions = spark ? ["high"] : selectedCodexModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
   const selectedBlueprint = blueprints.find((blueprint) => blueprint.id === selectedBlueprintId) || null;
   const validVariables = !selectedBlueprint || selectedBlueprint.definition.variables.every((variable) => {
     if (variable.secret || !variable.required || variable.default !== undefined) return true;
@@ -172,14 +166,13 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
 
   const cloneLastSession = () => {
     if (!historicalSetup) return;
-    const provider: SessionBackend = historicalSetup.provider === "claude" && claudeAvailable ? "claude" : "codex";
+    const provider: SessionBackend = "codex";
     const nextModel = validRememberedModel(historicalSetup, provider, bootstrap)
       ? historicalSetup.model
-      : provider === "claude" ? claudeModels[0]?.model || "" : defaultModel?.model || "";
-    const nextEffort = validRememberedEffort(nextModel, historicalSetup.effort, provider, bootstrap)
+      : defaultModel?.model || "";
+    const nextEffort = validRememberedEffort(nextModel, historicalSetup.effort, bootstrap)
       ? historicalSetup.effort
-      : provider === "claude" ? "high" : bootstrap.models.data.find((candidate) => candidate.model === nextModel)?.defaultReasoningEffort || "medium";
-    setBackend(provider);
+      : bootstrap.models.data.find((candidate) => candidate.model === nextModel)?.defaultReasoningEffort || "medium";
     setModel(nextModel);
     setEffort(nextEffort);
     setPreset(provider === "codex" && validRememberedPreset(historicalSetup, bootstrap) ? historicalSetup.preset || null : null);
@@ -189,25 +182,15 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
     setPrompt("");
     setYolo(false);
     setLeaseMode("exclusive");
-    setClaudePermissionMode("default");
     setSelectedBlueprintId("");
     setBlueprintVariables({});
     void chooseWorkspace(historicalSetup.workspace);
-  };
-
-  const chooseBackend = (next: SessionBackend) => {
-    if (spark || next === backend || (next === "claude" && !claudeAvailable)) return;
-    setBackend(next);
-    setPreset(null);
-    if (next === "claude") { setModel(claudeModels[0].model); setEffort("high"); }
-    else { setModel(defaultModel?.model || ""); setEffort(defaultModel?.defaultReasoningEffort || "medium"); }
   };
 
   const chooseLeaseMode = (next: WorkspaceLeaseMode) => {
     setLeaseMode(next);
     if (next === "read-only") {
       setYolo(false);
-      setClaudePermissionMode("plan");
     }
   };
 
@@ -215,7 +198,6 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
     setPreset(next);
     if (!next) return;
     const target = MODEL_PRESETS[next];
-    setBackend("codex");
     setModel(target.model);
     setEffort(target.effort);
   };
@@ -228,13 +210,11 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
       return;
     }
     const definition = blueprint.definition;
-    setBackend(definition.model.backend);
     setModel(definition.model.model);
     setEffort(definition.model.effort || "medium");
     setPreset(definition.model.preset || null);
     setPrompt(definition.promptTemplate);
     setYolo(definition.approvals.mode === "never");
-    setClaudePermissionMode(definition.approvals.mode === "never" ? "bypassPermissions" : definition.approvals.mode === "plan" ? "plan" : "default");
     setBlueprintVariables(Object.fromEntries(definition.variables.flatMap((variable) => variable.default === undefined ? [] : [[variable.name, variable.default]])));
     if (definition.workspace.selector === "fixed" && definition.workspace.value) {
       setSelectedPath(definition.workspace.value);
@@ -254,9 +234,7 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
     try {
       let blueprint = selectedBlueprint;
       if (saveAsBlueprint) {
-        const approvalMode = backend === "claude"
-          ? claudePermissionMode === "bypassPermissions" ? "never" : claudePermissionMode === "plan" ? "plan" : "on-request"
-          : yolo ? "never" : "on-request";
+        const approvalMode = yolo ? "never" : "on-request";
         const response = await api<{ blueprint: AgentBlueprintManifest }>("/api/blueprints", {
           method: "POST",
           body: JSON.stringify({
@@ -287,7 +265,7 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
           blueprintEnvironment: blueprintEnvironment.trim() || "local",
           blueprintVariables
         } : {}),
-        ...(backend === "claude" && !spark ? { permissionMode: claudePermissionMode } : { yolo })
+        yolo
       });
       const previousRequest = createRequestRef.current;
       const idempotencyKey = previousRequest?.body === requestBody ? previousRequest.idempotencyKey : crypto.randomUUID();
@@ -332,7 +310,7 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
 
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
     <form ref={dialogRef} className="new-modal" role="dialog" aria-modal="true" aria-labelledby="new-session-title" onSubmit={submit}>
-      <div className="modal-header"><div><span className={`eyebrow ${spark ? "spark" : backend === "claude" ? "claude" : ""}`}>{spark ? "Spark session" : backend === "claude" ? "Claude session" : "New session"}</span><h2 id="new-session-title">{quickStart ? "Workspace tour" : spark ? "Launch a quick task" : "Launch settings"}</h2></div><div className="modal-header-actions">{historicalSetup && !spark && <button type="button" className="clone-session-button" onClick={cloneLastSession} title="Copy the last session's workspace, model, and organization"><Copy size={14} />Clone last session</button>}<button type="button" className="icon-button" onClick={onClose} aria-label="Close new session dialog"><X size={19} /></button></div></div>
+      <div className="modal-header"><div><span className={`eyebrow ${spark ? "spark" : ""}`}>{spark ? "Spark session" : "New session"}</span><h2 id="new-session-title">{quickStart ? "Workspace tour" : spark ? "Launch a quick task" : "Launch settings"}</h2></div><div className="modal-header-actions">{historicalSetup && !spark && <button type="button" className="clone-session-button" onClick={cloneLastSession} title="Copy the last session's workspace, model, and organization"><Copy size={14} />Clone last session</button>}<button type="button" className="icon-button" onClick={onClose} aria-label="Close new session dialog"><X size={19} /></button></div></div>
       <div className="new-grid">
         <section className="directory-picker" aria-label="Workspace directory"><div className="section-label"><FolderOpen size={15} />Workspace directory</div>{recentWorkspaces.length > 0 && <div className="recent-workspaces"><span><History size={13} />Recent workspaces</span><div>{recentWorkspaces.map((path) => <button type="button" key={path} className={selectedPath === path ? "selected" : ""} onClick={() => void chooseWorkspace(path)} title={path}><Folder size={13} /><span>{workspaceName(path)}</span></button>)}</div></div>}<div className="path-bar"><button type="button" disabled={!browser?.parent} onClick={() => { if (browser?.parent) void browse(browser.parent); }} aria-label="Browse parent directory"><ArrowLeft size={15} /></button><span title={browser?.path || "Workspace roots"}>{browser?.path || "Available roots"}</span></div><div className="folder-list">{!browser && <LoaderCircle className="spin" />}{browser?.entries.map((entry) => <button type="button" key={entry.path} onClick={() => { setSelectedPath(entry.path); void browse(entry.path); }} className={selectedPath === entry.path ? "selected" : ""}><Folder size={16} /><span>{entry.name}</span>{entry.leaseStatus && entry.leaseStatus.state !== "available" && <em className={`directory-lease ${entry.leaseStatus.state}`}><LockKeyhole size={10} />{entry.leaseStatus.state}</em>}<ChevronRight size={15} /></button>)}{browser && !browser.entries.length && <div className="folder-empty">No child directories</div>}</div><button type="button" className={`select-directory ${browser?.path && selectedPath === browser.path ? "chosen" : ""}`} disabled={!browser?.path} onClick={() => setSelectedPath(browser!.path)}>{selectedPath === browser?.path ? <Check size={16} /> : <FolderOpen size={16} />}{selectedPath === browser?.path ? "Selected" : "Use this directory"}</button>{browser?.leaseStatus && browser.leaseStatus.state !== "available" && <small className={`workspace-lease-status ${browser.leaseStatus.state}`}><LockKeyhole size={11} />{browser.leaseStatus.state} lease held by {browser.leaseStatus.leases.length} session{browser.leaseStatus.leases.length === 1 ? "" : "s"}</small>}</section>
         <section className="launch-settings">
@@ -348,9 +326,8 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
           <label className="field"><span>Session name <i>optional</i></span><input ref={initialFocusRef} value={name} onChange={(event) => setName(event.target.value)} placeholder="Uses the first task line automatically" maxLength={100} /></label>
           <div className="organization-fields"><label className="field"><span>Category <i>optional</i></span><input value={category} onChange={(event) => setCategory(event.target.value)} placeholder="e.g. Product" maxLength={50} /></label><label className="field"><span>Tags <i>comma-separated</i></span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="bug, release" /></label></div>
           <div className="field"><span>Workspace lease</span><div className="effort-grid"><button type="button" className={leaseMode === "exclusive" ? "selected" : ""} onClick={() => chooseLeaseMode("exclusive")} aria-pressed={leaseMode === "exclusive"}><LockKeyhole size={12} /> Exclusive editing</button><button type="button" className={leaseMode === "read-only" ? "selected" : ""} onClick={() => chooseLeaseMode("read-only")} aria-pressed={leaseMode === "read-only"}><FileText size={12} /> Read-only inspection</button></div><small>{leaseMode === "exclusive" ? "Blocks other sessions from using this workspace while the agent works." : "Can share the workspace with other read-only inspection sessions."}</small></div>
-          {!spark && <div className="field"><span>Backend</span><div className="effort-grid"><button type="button" className={backend === "codex" ? "selected" : ""} onClick={() => chooseBackend("codex")} aria-pressed={backend === "codex"}><Bot size={13} /> Codex</button><button type="button" disabled={!claudeAvailable} className={backend === "claude" ? "selected" : ""} onClick={() => chooseBackend("claude")} aria-pressed={backend === "claude"}><BrainCircuit size={13} /> Claude</button></div>{!claudeAvailable && <small>Claude Code CLI not installed or not authenticated</small>}</div>}
           {!spark && <div className="field model-preset-field"><span>Model preset <i>optional</i></span><div className="model-preset-grid" role="group" aria-label="Model preset"><button type="button" className={!preset ? "selected" : ""} onClick={() => choosePreset(null)} aria-pressed={!preset}><strong>Manual</strong><small>Choose model and effort below</small></button>{MODEL_PRESET_IDS.map((id) => { const target = MODEL_PRESETS[id]; const available = modelPresetAvailable(id, bootstrap); return <button type="button" key={id} disabled={!available} className={preset === id ? "selected" : ""} onClick={() => choosePreset(id)} aria-pressed={preset === id} title={available ? `${target.model} · ${target.effort}` : `${target.model} with ${target.effort} effort is unavailable`}><strong>{target.label}</strong><small>{MODEL_PRESET_DESCRIPTIONS[id]}</small><code>{target.model} · {EFFORT_LABELS[target.effort] || target.effort}</code></button>; })}</div><small>Presets are transparent fixed mappings; they do not route dynamically.</small></div>}
-          <label className="field"><span>Model</span><select value={model} disabled={spark} onChange={(event) => { const nextModel = event.target.value; setPreset(null); setModel(nextModel); if (backend === "codex") { const next = bootstrap.models.data.find((candidate) => candidate.model === nextModel); if (next) setEffort(next.defaultReasoningEffort); } }}>{spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : backend === "claude" ? claudeModels.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>) : bootstrap.models.data.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><small>{spark ? "Fast, lightweight Codex model locked for SparkBoard tasks." : backend === "claude" ? selectedClaudeModel?.description : selectedCodexModel?.description}</small></label>
+          <label className="field"><span>Model</span><select value={model} disabled={spark} onChange={(event) => { const nextModel = event.target.value; setPreset(null); setModel(nextModel); const next = bootstrap.models.data.find((candidate) => candidate.model === nextModel); if (next) setEffort(next.defaultReasoningEffort); }}>{spark ? <option value={SPARK_MODEL}>GPT-5.3 Codex Spark</option> : bootstrap.models.data.map((item) => <option key={item.id} value={item.model}>{item.displayName}</option>)}</select><small>{spark ? "Fast, lightweight Codex model locked for SparkBoard tasks." : selectedCodexModel?.description}</small></label>
           <div className="field"><span>Thinking amount</span><div className="effort-grid">{effortOptions.map((option) => <button type="button" key={option} className={effort === option ? "selected" : ""} onClick={() => { setPreset(null); setEffort(option); }} aria-pressed={effort === option}>{EFFORT_LABELS[option] || option}</button>)}</div>{!validSettings && <small role="alert">Choose a model and one of its supported reasoning levels.</small>}</div>
           <label className="field prompt-field"><span>First task <i>optional</i></span><textarea value={prompt} disabled={Boolean(selectedBlueprint)} onChange={(event) => setPrompt(event.target.value)} placeholder="Start the session with a task, or leave it waiting…" rows={4} />{selectedBlueprint && <small>The immutable blueprint template is resolved when the session launches.</small>}</label>
           {selectedBlueprint && <div className="blueprint-variables">
@@ -372,7 +349,7 @@ export function NewSessionModal({ bootstrap, sessionClass = "standard", quickSta
           </div>
         </section>
       </div>
-      <div className="modal-footer">{backend === "claude" && !spark ? <div className="modal-permissions"><span className="sr-only">Claude permissions</span><div className="effort-grid"><button type="button" disabled={leaseMode === "read-only"} className={claudePermissionMode === "default" ? "selected" : ""} onClick={() => setClaudePermissionMode("default")}><ShieldCheck size={12} /> Workspace-write</button><button type="button" className={claudePermissionMode === "plan" ? "selected" : ""} onClick={() => setClaudePermissionMode("plan")}><FileText size={12} /> Plan</button><button type="button" disabled={leaseMode === "read-only"} className={claudePermissionMode === "acceptEdits" ? "selected" : ""} onClick={() => setClaudePermissionMode("acceptEdits")}><Check size={12} /> Accept edits</button><button type="button" disabled={leaseMode === "read-only"} className={claudePermissionMode === "bypassPermissions" ? "selected" : ""} onClick={() => setClaudePermissionMode("bypassPermissions")}><Sparkles size={12} /> YOLO</button></div></div> : <label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" disabled={leaseMode === "read-only"} checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{leaseMode === "read-only" ? "Read-only sandbox" : yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{leaseMode === "read-only" ? "Inspection only while the lease is active" : yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label>}<button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!selectedPath || !validSettings || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Launch {spark ? "Spark session" : backend === "claude" ? "Claude session" : "session"}</button></div>
+      <div className="modal-footer"><label className={`yolo-toggle ${yolo ? "enabled" : ""}`}><input type="checkbox" disabled={leaseMode === "read-only"} checked={yolo} onChange={(event) => setYolo(event.target.checked)} /><span className="toggle-track"><i /></span><span>{leaseMode === "read-only" ? "Read-only sandbox" : yolo ? "YOLO mode" : "Workspace-write sandbox"}<small>{leaseMode === "read-only" ? "Inspection only while the lease is active" : yolo ? "No approvals · full system access" : "Approvals appear in ForgeDeck"}</small></span></label><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={!selectedPath || !validSettings || busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}Launch {spark ? "Spark session" : "session"}</button></div>
     </form>
   </div>;
 }
@@ -386,7 +363,7 @@ function sessionSetupFromThread(thread?: Thread): LastSessionSetup | null {
   if (!model || !effort) return null;
   return {
     workspace: thread.cwd,
-    provider: thread.provider === "claude" ? "claude" : "codex",
+    provider: "codex",
     model,
     effort,
     ...(preset ? { preset } : {}),
@@ -398,14 +375,11 @@ function sessionSetupFromThread(thread?: Thread): LastSessionSetup | null {
 
 function validRememberedModel(setup: LastSessionSetup | null | undefined, provider: SessionBackend, bootstrap: Bootstrap): boolean {
   if (!setup || setup.provider !== provider) return false;
-  return provider === "claude"
-    ? (bootstrap.claudeModelOptions || []).some((candidate) => candidate.model === setup.model)
-    : bootstrap.models.data.some((candidate) => candidate.model === setup.model);
+  return bootstrap.models.data.some((candidate) => candidate.model === setup.model);
 }
 
-function validRememberedEffort(model: string, effort: string | undefined, provider: SessionBackend, bootstrap: Bootstrap): boolean {
+function validRememberedEffort(model: string, effort: string | undefined, bootstrap: Bootstrap): boolean {
   if (!effort) return false;
-  if (provider === "claude") return CLAUDE_EFFORTS.includes(effort as typeof CLAUDE_EFFORTS[number]);
   return bootstrap.models.data.find((candidate) => candidate.model === model)?.supportedReasoningEfforts.some((candidate) => candidate.reasoningEffort === effort) === true;
 }
 

@@ -12,7 +12,6 @@ export type {
   AgentSchedule,
   BlueprintVariableValue,
   Bootstrap,
-  ClaudeModelOption,
   CodexModel,
   CompareRequest,
   ComparisonModel,

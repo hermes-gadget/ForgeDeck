@@ -7,11 +7,10 @@ import {
 import { api } from "../../api/client";
 import { useThreadLiveState } from "../../state/thread-store";
 import type { SessionOperation } from "../session-actions/SessionActionDialog";
-import type { ClaudeModelOption, CodexModel, SessionSettings, Thread, ThreadItem } from "../../types";
+import type { CodexModel, SessionSettings, Thread, ThreadItem } from "../../types";
 
 const LazyReactMarkdown = lazy(() => import("react-markdown"));
 const SAFE_PROTOCOLS = new Set(["http", "https", "mailto"]);
-const CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const EFFORT_LABELS: Record<string, string> = { none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Maximum", ultra: "Ultra" };
 const SLASH_COMMANDS: AssistSuggestion[] = [
   { id: "compact", label: "/compact", description: "Compact the session context", insert: "/compact", kind: "command" },
@@ -28,7 +27,6 @@ type ChatProps = {
   thread: Thread;
   loading: boolean;
   models: CodexModel[];
-  claudeModels: ClaudeModelOption[];
   settings: SessionSettings;
   onSettings: (settings: SessionSettings) => void;
   onRefresh: () => Promise<unknown>;
@@ -131,18 +129,16 @@ export function useActivityAnnouncement(running: boolean, providerName: string):
 }
 
 /** Chat subscribes to only its own thread's live snapshot. */
-export const Chat = memo(function Chat({ thread, loading, models, claudeModels, settings, onSettings, onRefresh, onSessionAction, onError }: ChatProps) {
+export const Chat = memo(function Chat({ thread, loading, models, settings, onSettings, onRefresh, onSessionAction, onError }: ChatProps) {
   const live = useThreadLiveState(thread.id);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const assist = useComposerAssist(text, setText, thread.cwd);
-  const claude = thread.backend === "claude";
   const spark = thread.sessionClass === "spark";
-  const providerName = claude ? "Claude" : spark ? "Spark" : "Codex";
+  const providerName = spark ? "Spark" : "Codex";
   const selectedModel = models.find((model) => model.model === settings.model);
-  const effortOptions = claude ? CLAUDE_EFFORTS : spark ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
-  const settingsValid = claude ? claudeModels.some((model) => model.model === settings.model) && effortOptions.includes(settings.effort)
-    : spark ? settings.model === "gpt-5.3-codex-spark" && settings.effort === "high"
+  const effortOptions = spark ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
+  const settingsValid = spark ? settings.model === "gpt-5.3-codex-spark" && settings.effort === "high"
     : Boolean(selectedModel && effortOptions.includes(settings.effort));
   const effectiveStatus = live.status || thread.status;
   const runningTurn = useMemo(() => [...thread.turns].reverse().find((turn) => turn.status === "inProgress"), [thread.turns]);
@@ -175,7 +171,7 @@ export const Chat = memo(function Chat({ thread, loading, models, claudeModels, 
 
   const changeModel = (modelId: string) => {
     const model = models.find((candidate) => candidate.model === modelId);
-    if (model && !claude && !spark) onSettings({ ...settings, model: model.model, effort: model.defaultReasoningEffort });
+    if (model && !spark) onSettings({ ...settings, model: model.model, effort: model.defaultReasoningEffort });
   };
 
   return <div className="chat-layout">
@@ -201,7 +197,7 @@ export const Chat = memo(function Chat({ thread, loading, models, claudeModels, 
         <label className="sr-only" htmlFor={`composer-${thread.id}`}>Task for {providerName}</label>
         <textarea id={`composer-${thread.id}`} value={text} onChange={(event) => setText(event.target.value)} placeholder={running ? `Queue the next task while ${providerName} works…` : `Give ${providerName} a task…`} rows={3} onKeyDown={(event) => { if (assist.onKeyDown(event)) return; if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />
         <div className="composer-footer"><div className="model-controls">
-          <label><ProviderIcon thread={thread} size={14} /><span className="sr-only">Model</span><select value={settings.model} disabled={claude || spark} onChange={(event) => changeModel(event.target.value)}>{claude ? claudeModels.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>) : spark ? <option value="gpt-5.3-codex-spark">GPT-5.3 Codex Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
+          <label><ProviderIcon thread={thread} size={14} /><span className="sr-only">Model</span><select value={settings.model} disabled={spark} onChange={(event) => changeModel(event.target.value)}>{spark ? <option value="gpt-5.3-codex-spark">GPT-5.3 Codex Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label>
           <label><BrainCircuit size={14} /><span className="sr-only">Reasoning effort</span><select value={settings.effort} disabled={spark} onChange={(event) => onSettings({ ...settings, effort: event.target.value })}>{effortOptions.map((effort) => <option key={effort} value={effort}>{EFFORT_LABELS[effort] || effort}</option>)}</select></label>
           <PolicyButton thread={thread} running={running} onRefresh={onRefresh} onError={onError} />
         </div><div className="composer-actions">{running && <button type="button" className="stop-button" onClick={() => onSessionAction("stop")}><CircleStop size={16} /> Stop</button>}<button className={`send-button ${running ? "queue" : ""}`} disabled={!text.trim() || sending || !settingsValid}>{sending ? <LoaderCircle className="spin" size={17} /> : running ? <ListPlus size={16} /> : <Send size={16} />}<span>{running ? "Queue" : "Send"}</span></button></div></div>
@@ -226,10 +222,6 @@ export function CompactItem({ item, thread, liveOutput }: { item: ThreadItem; th
 export function PolicyButton({ thread, running, onRefresh, onError, compact = false }: { thread: Thread; running: boolean; onRefresh: () => void | Promise<unknown>; onError: (error: unknown) => void; compact?: boolean }) {
   const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
-  if (thread.backend === "claude") {
-    const mode = thread.claudePermissionMode || "default";
-    return <button type="button" className={`policy-button ${mode === "bypassPermissions" ? "yolo" : "workspace"} ${compact ? "compact" : ""}`} disabled aria-label={`Claude permission mode: ${mode}`}><ShieldCheck size={compact ? 11 : 13} /><span>{mode === "plan" ? "PLAN" : mode === "bypassPermissions" ? "YOLO" : mode === "acceptEdits" ? "EDITS" : compact ? "SAFE" : "Workspace"}</span></button>;
-  }
   const yolo = thread.policy === "yolo";
   const updatePolicy = async (nextYolo: boolean) => {
     if (running || pending) return;
@@ -359,8 +351,8 @@ export async function executeComposerText(thread: Thread, outgoing: string, sett
 
 function Markdown({ children }: { children: string }) { return <Suspense fallback={<span>{children}</span>}><LazyReactMarkdown urlTransform={safeMarkdownUrl}>{children}</LazyReactMarkdown></Suspense>; }
 function safeMarkdownUrl(value: string) { const normalized = value.trim().replace(/[\u0000-\u001F\u007F\s]/g, ""); const scheme = /^([a-z][a-z\d+.-]*):/i.exec(normalized)?.[1]?.toLowerCase(); return scheme && !SAFE_PROTOCOLS.has(scheme) ? "" : value; }
-function ProviderIcon({ thread, size }: { thread: Thread; size: number }) { return thread.backend === "claude" ? <BrainCircuit size={size} color="var(--color-provider-claude)" /> : thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />; }
-function providerLabel(thread: Thread) { return thread.backend === "claude" ? "Claude" : thread.sessionClass === "spark" ? "Spark" : "Codex"; }
+function ProviderIcon({ thread, size }: { thread: Thread; size: number }) { return thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />; }
+function providerLabel(thread: Thread) { return thread.sessionClass === "spark" ? "Spark" : "Codex"; }
 function parseSlashCommand(value: string) { const match = value.match(/^\/([a-z-]+)(?:\s+([\s\S]+))?$/i); return match ? { command: match[1].toLowerCase(), args: match[2]?.trim() || null } : null; }
 async function executeSlashCommand(thread: Thread, slash: { command: string; args: string | null }) { let args = slash.args; if (slash.command === "goal" && (!args || args === "set")) { const objective = window.prompt("Goal objective", thread.goal?.objective || ""); if (!objective?.trim()) return false; args = objective.trim(); } await api(`/api/threads/${thread.id}/command`, { method: "POST", body: JSON.stringify({ ...slash, args }) }); return true; }
 function userText(item: ThreadItem) { return item.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n") || ""; }

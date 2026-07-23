@@ -88,20 +88,11 @@ export type QuotaSnapshot = {
   raw: unknown;
 };
 
-/**
- * A reset-less Claude rejection is an incomplete provider signal, so it must
- * not inherit an unusually long operator-configured quota lifetime forever.
- */
-const CLAUDE_RESETLESS_EXHAUSTION_MAX_AGE_MS = 60 * 60_000;
-
-export function quotaObservationLifetimeMs(
-  quota: Pick<QuotaSnapshot, "provider" | "usedPercent" | "resetAt">,
+function quotaObservationLifetimeMs(
+  _quota: Pick<QuotaSnapshot, "provider" | "usedPercent" | "resetAt">,
   quotaStaleMs: number
 ): number {
-  const configuredLifetime = Math.max(0, quotaStaleMs);
-  return quota.provider === "claude" && quota.usedPercent >= 100 && quota.resetAt === null
-    ? Math.min(configuredLifetime, CLAUDE_RESETLESS_EXHAUSTION_MAX_AGE_MS)
-    : configuredLifetime;
+  return Math.max(0, quotaStaleMs);
 }
 
 export type CostCatalog = {
@@ -246,7 +237,6 @@ export class AdmissionController {
 
   observeQuota(snapshot: QuotaSnapshot): boolean {
     const normalized = normalizeQuota(snapshot);
-    if (this.isRedundantClaudeQuota(normalized)) return false;
     const row = toQuotaRow(normalized);
     this.repository.appendQuotaEvent(row);
     this.rememberQuota(normalized);
@@ -447,37 +437,12 @@ export class AdmissionController {
       quota.limitId === "provider-retry-after" && quota.resetAt !== null && quota.resetAt > now
     ));
     const observations = providerQuotas.filter((quota) => quota.limitId !== "provider-retry-after");
-    if (provider !== "claude") {
-      return [...retryAfter, ...observations.filter((quota) => this.isCurrentQuota(quota, now))];
-    }
-
-    // Claude reports discrete provider admission outcomes rather than
-    // independent utilization windows. The newest outcome supersedes every
-    // older one before its lifetime is evaluated; otherwise an expired or
-    // later-allowed transition can reveal an older rejection again.
-    const latest = latestQuota(observations);
-    return [...retryAfter, ...(latest && this.isCurrentQuota(latest, now) ? [latest] : [])];
+    return [...retryAfter, ...observations.filter((quota) => this.isCurrentQuota(quota, now))];
   }
 
   private isCurrentQuota(quota: QuotaSnapshot, now: number): boolean {
     const staleMs = quotaObservationLifetimeMs(quota, this.quotaStaleMs);
     return now - quota.observedAt <= staleMs || (quota.resetAt !== null && quota.resetAt > now);
-  }
-
-  private isRedundantClaudeQuota(snapshot: QuotaSnapshot): boolean {
-    if (snapshot.provider !== "claude" || snapshot.limitId === "provider-retry-after") return false;
-    const previous = latestQuota([...this.quotas.values()].filter((quota) => (
-      quota.provider === "claude" && quota.limitId !== "provider-retry-after"
-    )));
-    if (!previous) return false;
-
-    // observedAt is deliberately excluded. Replaying the same discrete Claude
-    // state after a spawn attempt or server recovery must not move the start
-    // of its staleness window. A changed outcome or concrete reset is a new
-    // transition and is persisted normally.
-    return previous.usedPercent === snapshot.usedPercent
-      && previous.remainingPercent === snapshot.remainingPercent
-      && previous.resetAt === snapshot.resetAt;
   }
 
   private rememberQuota(snapshot: QuotaSnapshot): void {
@@ -676,12 +641,6 @@ function fromQuotaRow(row: QuotaEventStoreRow): QuotaSnapshot {
   return { ...row, raw: JSON.parse(row.rawJson) as unknown };
 }
 
-function latestQuota(quotas: readonly QuotaSnapshot[]): QuotaSnapshot | null {
-  return quotas.reduce<QuotaSnapshot | null>((latest, quota) => (
-    !latest || quota.observedAt > latest.observedAt ? quota : latest
-  ), null);
-}
-
 function toBudgetRow(policy: BudgetPolicy): BudgetPolicyStoreRow {
   return {
     scopeType: policy.scopeType,
@@ -798,7 +757,7 @@ function approvedSwitch(context: AdmissionContext, action: "downgrade" | "fallba
 }
 
 function validateAttribution(value: UsageAttribution): void {
-  if (!(value.provider === "codex" || value.provider === "spark" || value.provider === "claude")) throw new Error("Usage provider is invalid");
+  if (!(value.provider === "codex" || value.provider === "spark")) throw new Error("Usage provider is invalid");
   nonEmpty(value.model, "Usage model");
   nonEmpty(value.runId, "Usage run ID");
 }

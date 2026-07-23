@@ -3,52 +3,45 @@ import test from "node:test";
 import { mergeBackendStatus, reconcileBackendStatusResponse } from "./backend-status.js";
 import type { AccountStatus } from "../types.js";
 
-test("Claude backend status events update usage without removing provider metadata", () => {
+test("backend status events update usage without removing provider metadata", () => {
   const status: AccountStatus = {
     account: { account: null, requiresOpenaiAuth: false },
     usage: null,
     backendStatus: {
       codex: { available: true, activeCount: 0, rateLimit: null },
-      spark: { available: true, activeCount: 0, rateLimit: null },
-      claude: {
-        available: true,
-        activeCount: 0,
-        maxConcurrent: 1,
-        rateLimit: { primary: { usedPercent: 0 } }
-      }
+      spark: { available: true, activeCount: 0, rateLimit: null }
     }
   };
 
   const updated = mergeBackendStatus(status, {
-    claude: {
+    codex: {
       activeCount: 1,
       maxConcurrent: 1,
       rateLimit: { primary: { usedPercent: 100 } }
     }
   });
 
-  assert.equal(updated.backendStatus?.claude.available, true);
-  assert.equal(updated.backendStatus?.claude.activeCount, 1);
-  assert.equal(updated.backendStatus?.claude.rateLimit?.primary?.usedPercent, 100);
-  assert.strictEqual(updated.backendStatus?.codex, status.backendStatus?.codex);
+  assert.equal(updated.backendStatus?.codex.available, true);
+  assert.equal(updated.backendStatus?.codex.activeCount, 1);
+  assert.equal(updated.backendStatus?.codex.rateLimit?.primary?.usedPercent, 100);
+  assert.strictEqual(updated.backendStatus?.spark, status.backendStatus?.spark);
 });
 
-test("a status response cannot overwrite Claude usage received while it was in flight", () => {
+test("a status response cannot overwrite usage received while it was in flight", () => {
   const stale: AccountStatus = {
     account: { account: null, requiresOpenaiAuth: false },
     usage: null,
     backendStatus: {
-      codex: { available: true, activeCount: 0 },
-      spark: { available: true, activeCount: 0 },
-      claude: { available: true, activeCount: 0, maxConcurrent: 1, rateLimit: { primary: { usedPercent: 0 } } }
+      codex: { available: true, activeCount: 0, maxConcurrent: 1, rateLimit: { primary: { usedPercent: 0 } } },
+      spark: { available: true, activeCount: 0 }
     }
   };
 
   const reconciled = reconcileBackendStatusResponse(stale, 3, {
     generation: 4,
-    value: { claude: { activeCount: 1, maxConcurrent: 1, rateLimit: { primary: { usedPercent: 100 } } } }
+    value: { codex: { activeCount: 1, maxConcurrent: 1, rateLimit: { primary: { usedPercent: 100 } } } }
   });
 
-  assert.equal(reconciled.backendStatus?.claude.activeCount, 1);
-  assert.equal(reconciled.backendStatus?.claude.rateLimit?.primary?.usedPercent, 100);
+  assert.equal(reconciled.backendStatus?.codex.activeCount, 1);
+  assert.equal(reconciled.backendStatus?.codex.rateLimit?.primary?.usedPercent, 100);
 });

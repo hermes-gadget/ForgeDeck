@@ -22,7 +22,7 @@ type ComparisonLabProps = {
 
 type ModelOption = {
   key: string;
-  provider: "codex" | "claude";
+  provider: "codex";
   model: string;
   label: string;
   efforts: string[];
@@ -267,14 +267,6 @@ function modelOptions(bootstrap: Bootstrap): ModelOption[] {
       label: model.displayName || model.model,
       efforts: model.supportedReasoningEfforts.map((option) => option.reasoningEffort),
       defaultEffort: model.defaultReasoningEffort
-    })),
-    ...(bootstrap.claudeModelOptions || []).map((model) => ({
-      key: `claude:${model.model}`,
-      provider: "claude" as const,
-      model: model.model,
-      label: model.displayName || model.model,
-      efforts: ["low", "medium", "high", "max"],
-      defaultEffort: "high"
     }))
   ];
 }

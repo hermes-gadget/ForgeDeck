@@ -136,10 +136,9 @@ function EvalForm({ bootstrap, blueprints, saving, onSubmit, onClose }: {
   const [maxDurationSeconds, setMaxDurationSeconds] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
   const [formError, setFormError] = useState("");
-  const modelOptions = useMemo(() => [
-    ...bootstrap.models.data.map((model) => ({ key: `codex:${model.model}`, provider: "codex" as const, model: model.model, effort: model.defaultReasoningEffort })),
-    ...(bootstrap.claudeModelOptions || []).map((model) => ({ key: `claude:${model.model}`, provider: "claude" as const, model: model.model, effort: null }))
-  ], [bootstrap]);
+  const modelOptions = useMemo(() =>
+    bootstrap.models.data.map((model) => ({ key: `codex:${model.model}`, provider: "codex" as const, model: model.model, effort: model.defaultReasoningEffort })),
+  [bootstrap]);
 
   const toggleModel = (key: string) => setSelectedModels((current) => {
     const next = new Set(current);

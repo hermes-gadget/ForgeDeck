@@ -153,14 +153,7 @@ server.registerTool("forgedeck_list_options", {
       supported_reasoning_efforts: model.supportedReasoningEfforts
     })),
     presets: Object.entries(MODEL_PRESETS).map(([preset, target]) => ({ preset, ...target })),
-    claude_available: status.claudeAvailable === true,
-    claude_models: (bootstrap.claudeModelOptions || []).map((model) => ({
-      id: model.id,
-      model: model.model,
-      display_name: model.displayName,
-      description: model.description
-    })),
-    usage: presentUsage(status, bootstrap),
+    usage: presentUsage(status),
     defaults: { yolo: false, session_class: "standard", class: "standard" },
     yolo_warning: "YOLO mode uses danger-full-access and never asks for command or file approvals."
   };
@@ -593,8 +586,6 @@ async function spawnOne(
       sessionClass,
       yolo: params.yolo || false,
       ...(params.fileScope ? { fileScope: params.fileScope } : {}),
-      permissionMode: params.permissionMode,
-      maxTurns: params.maxTurns,
       name: params.name,
       category: params.category,
       tags: params.tags || [],

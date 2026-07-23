@@ -208,19 +208,17 @@ async function respond(route: Route) {
     version: "0.1.0",
     health: { status: "ok", runtime: { available: true }, storage: { status: "ok", writable: true } },
     models: { data: [MODEL] },
-    roots: ["/workspace"],
-    claudeModelOptions: []
+    roots: ["/workspace"]
   };
   else if (path === "/api/account/status") body = {
     account: { account: { type: "api", email: "dev@example.com", planType: "team" }, requiresOpenaiAuth: false },
     usage: null,
     backendStatus: {
       codex: { available: true, rateLimit: null, activeCount: 1 },
-      spark: { available: true, rateLimit: null, activeCount: 0 },
-      claude: { available: false, rateLimit: null, activeCount: 0 }
+      spark: { available: true, rateLimit: null, activeCount: 0 }
     },
     activeThreadIds: [THREADS[0].id],
-    agentThreadIds: [], sparkAgentThreadIds: [], sparkActiveThreadIds: [], claudeAvailable: false
+    agentThreadIds: [], sparkAgentThreadIds: [], sparkActiveThreadIds: []
   };
   else if (path === "/api/approvals") body = { data: [] };
   else if (/^\/api\/events\/subscriptions\/[^/]+$/.test(path)) {
@@ -257,7 +255,6 @@ async function respond(route: Route) {
     codex: { reconnectAttempts: 0, pendingRpcCalls: 0, lastHeartbeatAt: Date.parse(NOW) },
     capacity: {
       "codex/standard": { limit: 4, activeCount: 1, waitingCount: 0 },
-      claude: { limit: 2, activeCount: 0, waitingCount: 0 },
       "codex/spark": { limit: 8, activeCount: 0, waitingCount: 0 }
     },
     operations: {

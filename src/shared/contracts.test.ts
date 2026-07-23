@@ -18,12 +18,12 @@ import {
 test("session requests normalize canonical names and retain legacy aliases at the adapter", () => {
   const legacy = createSessionRequestSchema.parse({
     cwd: "/workspace",
-    backend: "claude",
+    backend: "codex",
     class: "standard",
     model: "sonnet",
     effort: "high"
   });
-  assert.equal(legacy.provider, "claude");
+  assert.equal(legacy.provider, "codex");
   assert.equal(legacy.sessionClass, "standard");
   assert.equal(legacy.reasoningEffort, "high");
   assert.equal(legacy.leaseMode, "exclusive");
@@ -42,12 +42,6 @@ test("session requests normalize canonical names and retain legacy aliases at th
   assert.equal(canonical.reasoningEffort, "high");
   assert.deepEqual(canonical.guardian, { stallTimeoutMinutes: 8, escalationModel: "gpt-5.6-sol" });
 
-  assert.equal(createSessionRequestSchema.safeParse({
-    cwd: "/workspace",
-    provider: "codex",
-    backend: "claude",
-    model: "gpt-test"
-  }).success, false);
   assert.equal(createSessionRequestSchema.safeParse({
     cwd: "/workspace",
     model: "gpt-test",
@@ -84,8 +78,6 @@ test("model presets resolve transparently and reject conflicting manual settings
   assert.equal(createSessionRequestSchema.safeParse({
     cwd: "/workspace", preset: "deep", model: "gpt-5.6-luna", reasoningEffort: "low"
   }).success, false);
-  assert.equal(createSessionRequestSchema.safeParse({ cwd: "/workspace", provider: "claude", preset: "balanced" }).success, false);
-
   assert.equal(mcpSpawnSessionInputSchema.safeParse({ cwd: "/workspace", preset: "balanced" }).success, true);
   assert.equal(mcpSpawnSessionInputSchema.safeParse({ cwd: "/workspace", model: "gpt-test" }).success, false);
   assert.deepEqual(mcpSpawnSessionInputSchema.parse({ cwd: "/workspace", preset: "balanced" }), {
@@ -94,17 +86,8 @@ test("model presets resolve transparently and reject conflicting manual settings
     preset: "balanced",
     class: "standard",
     yolo: false,
-    permissionMode: "default",
-    maxTurns: 100,
     tags: []
   });
-  assert.equal(mcpSpawnSessionInputSchema.safeParse({
-    cwd: "/workspace", provider: "claude", model: "sonnet", effort: "high",
-    permissionMode: "plan", maxTurns: 80
-  }).success, true);
-  assert.equal(mcpSpawnSessionInputSchema.safeParse({
-    cwd: "/workspace", provider: "claude", model: "sonnet", effort: "high", maxTurns: 101
-  }).success, false);
 });
 
 test("message requests accept effort only as a temporary alias", () => {
@@ -129,7 +112,7 @@ test("comparison contracts require distinct model branches and normalize result 
   }) as {
     prompt: string;
     workspace: string;
-    models: Array<{ provider: "codex" | "claude"; model: string; reasoningEffort: string | null }>;
+    models: Array<{ provider: "codex"; model: string; reasoningEffort: string | null }>;
     judge: null;
   };
   assert.equal(request.models.length, 2);
@@ -233,9 +216,9 @@ test("HTTP and MCP adapters reuse resource schemas and emit canonical provider f
       name: null,
       preview: "",
       cwd: "/workspace",
-      backend: "claude",
-      claudeModel: "sonnet",
-      claudeEffort: "high",
+      backend: "codex",
+      model: "gpt-test",
+      effort: "high",
       createdAt: 2_000_000_000,
       updatedAt: 2_000_000_001,
       recencyAt: null,
@@ -245,7 +228,7 @@ test("HTTP and MCP adapters reuse resource schemas and emit canonical provider f
   }) as { thread: { provider: string; model: string | null; reasoningEffort: string | null; createdAt: string } };
   assert.deepEqual(
     [response.thread.provider, response.thread.model, response.thread.reasoningEffort],
-    ["claude", "sonnet", "high"]
+    ["codex", "gpt-test", "high"]
   );
   assert.match(response.thread.createdAt, /^2033-05-18T/);
 
@@ -258,16 +241,16 @@ test("HTTP and MCP adapters reuse resource schemas and emit canonical provider f
     updated_at: 2_000_000_001,
     category: null,
     tags: [],
-    provider: "claude",
-    backend: "claude",
+    provider: "codex",
+    backend: "codex",
     session_class: "standard",
-    model: "sonnet",
+    model: "gpt-test",
     reasoning_effort: "high",
     state: "idle",
     agent_owned: true,
     mutation_access: "allowed"
   });
-  assert.equal(mcp.provider, "claude");
+  assert.equal(mcp.provider, "codex");
   assert.equal(mcp.created_at, "2033-05-18T03:33:20.000Z");
 });
 

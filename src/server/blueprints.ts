@@ -6,7 +6,7 @@ const AGENT_BLUEPRINT_SCHEMA_VERSION = 1 as const;
 
 export type BlueprintVariableValue = string | number | boolean;
 type BlueprintVariableType = "string" | "number" | "boolean";
-type BlueprintBackend = "codex" | "claude";
+type BlueprintBackend = "codex";
 
 type BlueprintVariableSchema = {
   name: string;
@@ -287,7 +287,7 @@ function workspaceSelector(value: unknown): BlueprintWorkspaceSelector {
 function modelPolicy(value: unknown): BlueprintModelPolicy {
   const record = object(value, "Model policy");
   allowedKeys(record, ["backend", "routing", "model", "effort", "preset", "fallbacks"]);
-  const backend = oneOf(record.backend, ["codex", "claude"] as const, "Model backend");
+  const backend = oneOf(record.backend, ["codex"] as const, "Model backend");
   const routing = oneOf(record.routing, ["fixed", "fallback"] as const, "Model routing policy");
   const model = identifier(record.model, "Model", 128, /^[a-zA-Z0-9._:/-]+$/);
   const effort = optionalIdentifier(record.effort, "Reasoning effort", 64, /^[a-zA-Z0-9_-]+$/);
@@ -299,7 +299,7 @@ function modelPolicy(value: unknown): BlueprintModelPolicy {
     const fallback = object(item, `Model fallback ${index + 1}`);
     allowedKeys(fallback, ["backend", "model", "effort"]);
     return {
-      backend: oneOf(fallback.backend, ["codex", "claude"] as const, "Fallback backend"),
+      backend: oneOf(fallback.backend, ["codex"] as const, "Fallback backend"),
       model: identifier(fallback.model, "Fallback model", 128, /^[a-zA-Z0-9._:/-]+$/),
       effort: optionalIdentifier(fallback.effort, "Fallback effort", 64, /^[a-zA-Z0-9_-]+$/)
     };

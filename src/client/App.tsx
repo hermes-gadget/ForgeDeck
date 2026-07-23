@@ -46,8 +46,7 @@ const EMPTY_ACCOUNT_STATUS: AccountStatus = {
   activeThreadIds: [],
   agentThreadIds: [],
   sparkAgentThreadIds: [],
-  sparkActiveThreadIds: [],
-  claudeAvailable: false
+  sparkActiveThreadIds: []
 };
 
 export default function App() {
@@ -342,7 +341,6 @@ export default function App() {
     if (!bootstrap) return;
     const models = bootstrap.models.data;
     const defaultModel = models.find((model) => model.isDefault) || models[0];
-    const claudeModels = bootstrap.claudeModelOptions || [];
     setSettings((current) => {
       let next = current;
       for (const thread of threads) {
@@ -350,7 +348,7 @@ export default function App() {
         const signature = `${metadata.model || ""}:${metadata.effort || ""}`;
         const previousSignature = settingsMetadataSignatures.current.get(thread.id);
         if (previousSignature === signature && current[thread.id]) continue;
-        const normalized = resolveThreadSettings(thread, models, claudeModels, current[thread.id], defaultModel);
+        const normalized = resolveThreadSettings(thread, models, current[thread.id], defaultModel);
         settingsMetadataSignatures.current.set(thread.id, signature);
         if (current[thread.id]?.model === normalized.model && current[thread.id]?.effort === normalized.effort) continue;
         if (next === current) next = { ...current };
@@ -366,7 +364,7 @@ export default function App() {
     if (settingsMetadataSignatures.current.get(currentThread.id) === signature && settings[currentThread.id]) return;
     const defaultChoice = bootstrap.models.data.find((model) => model.isDefault) || bootstrap.models.data[0];
     setSettings((current) => {
-      const normalized = resolveThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], current[currentThread.id], defaultChoice);
+      const normalized = resolveThreadSettings(currentThread, bootstrap.models.data, current[currentThread.id], defaultChoice);
       settingsMetadataSignatures.current.set(currentThread.id, signature);
       return current[currentThread.id]?.model === normalized.model && current[currentThread.id]?.effort === normalized.effort
         ? current : { ...current, [currentThread.id]: normalized };
@@ -561,7 +559,7 @@ export default function App() {
     const models = bootstrap?.models.data || [];
     const defaultModel = models.find((model) => model.isDefault) || models[0];
     const persisted = settingsFromThread(thread);
-    const canonical = resolveThreadSettings(thread, models, bootstrap?.claudeModelOptions || [], requested, defaultModel);
+    const canonical = resolveThreadSettings(thread, models, requested, defaultModel);
     settingsMetadataSignatures.current.set(thread.id, `${persisted.model || ""}:${persisted.effort || ""}`);
     handleSettings(thread.id, canonical);
     threadStore.upsertSummary(thread);
@@ -649,8 +647,8 @@ export default function App() {
     const persisted = settingsFromThread(currentThread);
     const signature = `${persisted.model || ""}:${persisted.effort || ""}`;
     return settingsMetadataSignatures.current.get(currentThread.id) === signature
-      ? normalizeThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], settings[currentThread.id], defaultModel)
-      : resolveThreadSettings(currentThread, bootstrap.models.data, bootstrap.claudeModelOptions || [], settings[currentThread.id], defaultModel);
+      ? normalizeThreadSettings(currentThread, bootstrap.models.data, settings[currentThread.id], defaultModel)
+      : resolveThreadSettings(currentThread, bootstrap.models.data, settings[currentThread.id], defaultModel);
   }, [bootstrap, currentThread, defaultModel, settings]);
   const sessionNames = useMemo(() => Object.fromEntries(threads.map((thread) => [thread.id, threadTitle(thread)])), [threads]);
   const displayedBackendHealth = backendHealth === "unknown"
@@ -751,13 +749,13 @@ export default function App() {
         <FleetSummary threads={threads} bootstrap={bootstrap} approvalCount={pending.length} errors={errors} compact onError={handleError} />
       </div>}
       <section className="workspace-panel" id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${view}`}>
-      {view === "control" ? <ControlCenter threads={controlThreads} allThreads={filteredStandardThreads} fleetThreads={threads} bootstrap={bootstrap} approvalCount={pending.length} showFleetSummary={!mobileLayout} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || []} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddControl} onClearCompleted={handleClearControl} onVisibleThreadsChange={handleVisibleBoardThreads} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
-        : view === "spark" ? <SparkBoard threads={sparkThreads} allThreads={filteredSparkThreads} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} claudeModels={[]} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddSpark} onClearCompleted={handleClearSpark} onVisibleThreadsChange={handleVisibleBoardThreads} onLaunch={handleNewSpark} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
+      {view === "control" ? <ControlCenter threads={controlThreads} allThreads={filteredStandardThreads} fleetThreads={threads} bootstrap={bootstrap} approvalCount={pending.length} showFleetSummary={!mobileLayout} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddControl} onClearCompleted={handleClearControl} onVisibleThreadsChange={handleVisibleBoardThreads} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
+        : view === "spark" ? <SparkBoard threads={sparkThreads} allThreads={filteredSparkThreads} errors={errors} waitingThreadIds={waitingThreadIds} models={bootstrap.models.data} settings={settings} defaultModel={defaultModel} pollInterval={0} onSettings={handleSettings} onOpen={handleOpenBoardThread} onRemove={(threadId) => requestSessionAction("remove", [threadId])} onAdd={handleAddSpark} onClearCompleted={handleClearSpark} onVisibleThreadsChange={handleVisibleBoardThreads} onLaunch={handleNewSpark} onSessionAction={requestSessionAction} onRefresh={handleRefreshBoardThread} onError={handleError} />
         : view === "missions" ? <MissionsView onError={handleError} />
         : view === "compare" ? <ComparisonLab bootstrap={bootstrap} onOpenSession={handleSelect} onError={handleError} />
         : view === "evals" ? <EvalLab bootstrap={bootstrap} onOpenSession={handleSelect} onError={handleError} />
         : view === "archive" ? <ArchiveView onError={handleError} onPinned={handleArchivePinned} onRestored={handleArchiveRestored} />
-        : currentThread && activeSettings ? <Chat key={currentThread.id} thread={currentThread} loading={loadingDetail} models={bootstrap.models.data} claudeModels={bootstrap.claudeModelOptions || []} settings={activeSettings} onSettings={handleSelectedSettings} onRefresh={handleRefreshSelectedThread} onSessionAction={(operation) => requestSessionAction(operation, [currentThread.id])} onError={handleError} />
+        : currentThread && activeSettings ? <Chat key={currentThread.id} thread={currentThread} loading={loadingDetail} models={bootstrap.models.data} settings={activeSettings} onSettings={handleSelectedSettings} onRefresh={handleRefreshSelectedThread} onSessionAction={(operation) => requestSessionAction(operation, [currentThread.id])} onError={handleError} />
         : <Welcome onNew={handleNew} />}
       </section>
     </main>

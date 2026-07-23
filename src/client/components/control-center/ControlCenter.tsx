@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
-  Activity, AlertTriangle, Bot, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleStop,
+  Activity, AlertTriangle, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop,
   Clock3, Copy, Database, Gauge, LayoutGrid, ListPlus, LoaderCircle, MessageSquareText, Package, Pencil, Plus, RefreshCw, Send, Server,
   Sparkles, Target, Timer, Trash2, Users, Wifi, X
 } from "lucide-react";
@@ -13,7 +13,7 @@ import { activityTitle, buildSessionCardDetails, relativeActivity, SessionStateB
 import type { ErrorEntry } from "../error-center/ErrorCenter";
 import type { SessionOperation } from "../session-actions/SessionActionDialog";
 import type {
-  AgentBlueprintManifest, AgentSchedule, BlueprintVariableValue, Bootstrap, ClaudeModelOption, CodexModel,
+  AgentBlueprintManifest, AgentSchedule, BlueprintVariableValue, Bootstrap, CodexModel,
   ScheduleTiming, SessionSettings, Thread, ThreadItem
 } from "../../types";
 
@@ -35,7 +35,6 @@ export type ControlCenterProps = {
   errors?: readonly ErrorEntry[];
   waitingThreadIds?: ReadonlySet<string>;
   models: CodexModel[];
-  claudeModels: ClaudeModelOption[];
   settings: ThreadSettings;
   defaultModel?: CodexModel;
   pollInterval: number;
@@ -59,7 +58,7 @@ export function BoardHeader({ variant, count, activeCount }: { variant: BoardVar
 export const ControlCenter = memo(function ControlCenter(props: ControlCenterProps) { return <SessionBoard {...props} variant="control" />; });
 export const SparkBoard = memo(function SparkBoard(props: ControlCenterProps) { return <SessionBoard {...props} variant="spark" />; });
 
-function SessionBoard({ variant, threads, allThreads, fleetThreads, bootstrap, approvalCount, showFleetSummary = true, errors, waitingThreadIds, models, claudeModels, settings, defaultModel, pollInterval, onSettings, onOpen, onRemove, onAdd, onClearCompleted, onVisibleThreadsChange, onSessionAction, onLaunch, onRefresh, onError }: ControlCenterProps & { variant: BoardVariant }) {
+function SessionBoard({ variant, threads, allThreads, fleetThreads, bootstrap, approvalCount, showFleetSummary = true, errors, waitingThreadIds, models, settings, defaultModel, pollInterval, onSettings, onOpen, onRemove, onAdd, onClearCompleted, onVisibleThreadsChange, onSessionAction, onLaunch, onRefresh, onError }: ControlCenterProps & { variant: BoardVariant }) {
   const spark = variant === "spark";
   const containerRef = useRef<HTMLDivElement>(null);
   const [density, setDensity] = useState<BoardDensity>(() => readBoardPreference(variant, "density", ["comfortable", "compact"], "comfortable"));
@@ -146,7 +145,7 @@ function SessionBoard({ variant, threads, allThreads, fleetThreads, bootstrap, a
   }, [pollInterval, refreshPage]);
 
   const completedCount = pageThreads.filter((thread) => threadStore.getLive(thread.id).completed).length;
-  const renderCard = (thread: Thread) => <ControlCard key={thread.id} density={density} summary={thread} errors={errors || []} waiting={waitingThreadIds?.has(thread.id) || false} models={models} claudeModels={claudeModels} localSettings={settings[thread.id]} defaultModel={defaultModel} onSettings={onSettings} onOpen={onOpen} onRemove={onRemove} onSessionAction={onSessionAction} onRefresh={onRefresh} onError={onError} />;
+  const renderCard = (thread: Thread) => <ControlCard key={thread.id} density={density} summary={thread} errors={errors || []} waiting={waitingThreadIds?.has(thread.id) || false} models={models} localSettings={settings[thread.id]} defaultModel={defaultModel} onSettings={onSettings} onOpen={onOpen} onRemove={onRemove} onSessionAction={onSessionAction} onRefresh={onRefresh} onError={onError} />;
   return <div className={`control-center density-${density}`} ref={containerRef}>
     {!spark && showFleetSummary && <FleetSummary threads={fleetThreads || threads} bootstrap={bootstrap} approvalCount={approvalCount || 0} errors={errors || []} onError={onError} />}
     {!spark && <SchedulePanel onError={onError} />}
@@ -230,7 +229,7 @@ function groupBoardThreads(threads: readonly Thread[], mode: BoardGroup, setting
       label = providerLabel(thread);
       title = `${label} backend`;
     } else if (mode === "model") {
-      key = settings[thread.id]?.model || thread.model || thread.claudeModel || "unassigned";
+      key = settings[thread.id]?.model || thread.model || "unassigned";
       label = key === "unassigned" ? "No model" : key;
       title = label;
     } else if (mode === "state") {
@@ -432,7 +431,7 @@ function formatScheduleTiming(timing: ScheduleTiming): string {
   return `Every ${minutes}m`;
 }
 
-type CapacityBackend = "codex/standard" | "claude" | "codex/spark";
+type CapacityBackend = "codex/standard" | "codex/spark";
 type CapacityMetric = { limit: number; activeCount: number; waitingCount: number };
 type PerformanceReport = {
   codex: {
@@ -652,9 +651,8 @@ function isThreadFailure(thread: Thread): boolean {
 }
 
 function capacityRows(performance?: PerformanceReport | null, bootstrap?: Bootstrap) {
-  const labels: Array<{ key: CapacityBackend; label: string; fallback: "codex" | "claude" | "spark" }> = [
+  const labels: Array<{ key: CapacityBackend; label: string; fallback: "codex" | "spark" }> = [
     { key: "codex/standard", label: "Codex", fallback: "codex" },
-    { key: "claude", label: "Claude", fallback: "claude" },
     { key: "codex/spark", label: "Spark", fallback: "spark" }
   ];
   return labels.map(({ key, label, fallback }) => {
@@ -727,17 +725,17 @@ function redactDiagnosticText(value: string): string {
 }
 
 type ControlCardProps = {
-  density: BoardDensity; summary: Thread; errors: readonly ErrorEntry[]; waiting: boolean; models: CodexModel[]; claudeModels: ClaudeModelOption[]; localSettings?: SessionSettings; defaultModel?: CodexModel;
+  density: BoardDensity; summary: Thread; errors: readonly ErrorEntry[]; waiting: boolean; models: CodexModel[]; localSettings?: SessionSettings; defaultModel?: CodexModel;
   onSettings: (threadId: string, settings: SessionSettings) => void; onOpen: (threadId: string) => void; onRemove: (threadId: string) => void;
   onSessionAction: (operation: SessionOperation, threadIds: string[]) => void;
   onRefresh: (threadId: string) => Promise<unknown>; onError: (error: unknown) => void;
 };
 
-const ControlCard = memo(function ControlCard({ density, summary, errors, waiting, models, claudeModels, localSettings, defaultModel, onSettings, onOpen, onRemove, onSessionAction, onRefresh, onError }: ControlCardProps) {
+const ControlCard = memo(function ControlCard({ density, summary, errors, waiting, models, localSettings, defaultModel, onSettings, onOpen, onRemove, onSessionAction, onRefresh, onError }: ControlCardProps) {
   const detail = useThreadDetail(summary.id);
   const live = useThreadLiveState(summary.id);
   const thread = detail || summary;
-  const settings = normalizeThreadSettings(thread, models, claudeModels, localSettings, defaultModel);
+  const settings = normalizeThreadSettings(thread, models, localSettings, defaultModel);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const assist = useComposerAssist(text, setText, thread.cwd);
@@ -756,7 +754,7 @@ const ControlCard = memo(function ControlCard({ density, summary, errors, waitin
   const items = usePausedRecentItems(allItems, autoFollow.isFollowing, density === "compact" ? 6 : 12);
   const tokens = live.tokenUsage?.totalTokens ?? thread.goal?.tokensUsed ?? null;
   const selectedModel = models.find((model) => model.model === settings.model);
-  const efforts = thread.backend === "claude" ? ["low", "medium", "high", "max"] : thread.sessionClass === "spark" ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
+  const efforts = thread.sessionClass === "spark" ? ["high"] : selectedModel?.supportedReasoningEfforts.map((option) => option.reasoningEffort) || [];
   const valid = Boolean(settings.model && efforts.includes(settings.effort));
   const guardianStatus = guardianStatusText(thread);
 
@@ -786,7 +784,7 @@ const ControlCard = memo(function ControlCard({ density, summary, errors, waitin
     {live.truncated && <RecoveryNotice compact onLoad={() => onRefresh(thread.id)} onError={onError} />}
     <div className="control-feed-shell"><div className="control-feed" ref={autoFollow.scrollerRef} onScroll={autoFollow.onScroll} role="region" aria-label={`Recent activity for ${threadTitle(thread)}`} aria-busy={running}>{!items.length && !streaming.some(([, value]) => value) && <div className="control-waiting"><ProviderIcon thread={thread} size={21} /><span>{running ? `${providerLabel(thread)} is starting…` : "Waiting for a task"}</span></div>}{items.map((item, index) => <CompactItem key={item.id || `${item.type}-${index}`} item={item} thread={thread} liveOutput={item.id ? live.toolOutput[item.id] : undefined} />)}{streaming.map(([id, value]) => value && <div className="compact-message agent live" key={id}><span><ProviderIcon thread={thread} /></span><div>{value}<i className="typing-cursor" /></div></div>)}</div><AutoFollowIndicator compact isFollowing={autoFollow.isFollowing} unseenCount={autoFollow.unseenCount} onJump={autoFollow.jumpToLatest} /></div>
     {live.queue.length > 0 && <div className="control-queue"><span><ListPlus size={11} />{live.queue.length} queued</span>{live.queue.map((entry, index) => <div key={entry.id}><b>{index + 1}</b><em>{entry.text}</em><button onClick={() => void api(`/api/threads/${thread.id}/queue/${entry.id}`, { method: "DELETE" }).catch(onError)} aria-label={`Remove queued task ${index + 1}`}><X size={10} /></button></div>)}</div>}
-    <div className="control-models"><select aria-label={`Model for ${threadTitle(thread)}`} value={settings.model} disabled={thread.backend === "claude" || thread.sessionClass === "spark"} onChange={(event) => { const model = models.find((candidate) => candidate.model === event.target.value); if (model) onSettings(thread.id, { ...settings, model: model.model, effort: model.defaultReasoningEffort }); }}>{thread.backend === "claude" ? claudeModels.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>) : thread.sessionClass === "spark" ? <option value="gpt-5.3-codex-spark">Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select><select aria-label={`Reasoning effort for ${threadTitle(thread)}`} value={settings.effort} disabled={thread.sessionClass === "spark"} onChange={(event) => onSettings(thread.id, { ...settings, effort: event.target.value })}>{efforts.map((effort) => <option key={effort}>{effort}</option>)}</select></div>
+    <div className="control-models"><select aria-label={`Model for ${threadTitle(thread)}`} value={settings.model} disabled={thread.sessionClass === "spark"} onChange={(event) => { const model = models.find((candidate) => candidate.model === event.target.value); if (model) onSettings(thread.id, { ...settings, model: model.model, effort: model.defaultReasoningEffort }); }}>{thread.sessionClass === "spark" ? <option value="gpt-5.3-codex-spark">Spark</option> : models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select><select aria-label={`Reasoning effort for ${threadTitle(thread)}`} value={settings.effort} disabled={thread.sessionClass === "spark"} onChange={(event) => onSettings(thread.id, { ...settings, effort: event.target.value })}>{efforts.map((effort) => <option key={effort}>{effort}</option>)}</select></div>
     <form className="control-composer" onSubmit={submit}><ComposerAssist suggestions={assist.suggestions} activeIndex={assist.activeIndex} onChoose={assist.choose} compact /><label className="sr-only" htmlFor={`control-composer-${thread.id}`}>Task for {threadTitle(thread)}</label><input id={`control-composer-${thread.id}`} value={text} onChange={(event) => setText(event.target.value)} onKeyDown={assist.onKeyDown} placeholder={valid ? running ? "Queue next task…" : "Send a task…" : "Choose valid settings"} /><button className={running ? "queue" : ""} disabled={!text.trim() || sending || !valid} aria-label={running ? "Queue task" : "Send task"}>{sending ? <LoaderCircle className="spin" size={13} /> : running ? <ListPlus size={13} /> : <Send size={13} />}</button>{running && <button type="button" className="stop" onClick={() => onSessionAction("stop", [thread.id])} aria-label={`Stop ${threadTitle(thread)}`}><CircleStop size={13} /></button>}</form>
   </article>;
 });
@@ -819,7 +817,7 @@ function withControlKeys(items: ThreadItem[]): Array<{ item: ThreadItem; key: st
 }
 function threadTitle(thread: Thread) { return thread.name || thread.preview || "Untitled session"; }
 function basename(value: string) { return value.split("/").filter(Boolean).pop() || value; }
-function providerLabel(thread: Thread) { return thread.backend === "claude" ? "Claude" : thread.sessionClass === "spark" ? "Spark" : "Codex"; }
+function providerLabel(thread: Thread) { return thread.sessionClass === "spark" ? "Spark" : "Codex"; }
 function guardianStatusText(thread: Thread): string | null {
   const state = thread.guardian;
   if (!state) return null;
@@ -832,8 +830,8 @@ function guardianStatusText(thread: Thread): string | null {
 }
 function threadOptionLabel(thread: Thread) {
   const labels = [thread.category, ...(thread.tags || [])].filter(Boolean).slice(0, 2).join(", ");
-  const model = thread.model || thread.claudeModel;
+  const model = thread.model;
   return [threadTitle(thread), basename(thread.cwd), model, labels].filter(Boolean).join(" · ");
 }
 function formatTokens(tokens: number) { return tokens < 1_000 ? String(tokens) : `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k`; }
-function ProviderIcon({ thread, size = 11 }: { thread: Thread; size?: number }) { return thread.backend === "claude" ? <BrainCircuit size={size} color="var(--color-provider-claude)" /> : thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />; }
+function ProviderIcon({ thread, size = 11 }: { thread: Thread; size?: number }) { return thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />; }

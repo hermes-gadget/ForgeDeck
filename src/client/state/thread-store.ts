@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import { timestampNow, timestampToEpochMs } from "../../shared/contracts";
 import { notificationPreferences } from "./preferences";
 import type {
-  ClaudeModelOption, CodexModel, LiveThreadState, QueueEntry, SessionSettings,
+  CodexModel, LiveThreadState, QueueEntry, SessionSettings,
   LiveRecoverySnapshot, RunGuardianState, Thread, ThreadItem, ThreadStatus, ThreadTokenUsage
 } from "../types";
 
@@ -416,30 +416,20 @@ export function useThreadLiveState(threadId: string): ThreadLiveSnapshot {
 /** Resolve server-persisted settings before local overrides or account defaults. */
 export function settingsFromThread(thread: Thread): Partial<SessionSettings> {
   const metadata = thread.sessionMetadata || thread.metadata || thread.settings;
-  const model = metadata?.model || thread.model || thread.claudeModel || undefined;
-  const effort = metadata?.effort || thread.effort || thread.claudeEffort || undefined;
+  const model = metadata?.model || thread.model || undefined;
+  const effort = metadata?.effort || thread.effort || undefined;
   return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
 }
 
 export function normalizeThreadSettings(
   thread: Thread,
   models: readonly CodexModel[],
-  claudeModels: readonly ClaudeModelOption[],
   local: SessionSettings | undefined,
   defaultModel?: CodexModel
 ): SessionSettings {
   const notifications = notificationPreferences(local);
   if (thread.sessionClass === "spark") return { model: "gpt-5.3-codex-spark", effort: "high", notifications };
   const persisted = settingsFromThread(thread);
-  if (thread.backend === "claude") {
-    const allowedModels = new Set(claudeModels.map((model) => model.model));
-    const model = allowedModels.has(local?.model || "") ? local!.model
-      : allowedModels.has(persisted.model || "") ? persisted.model!
-      : claudeModels[0]?.model || "";
-    const candidateEffort = local?.effort || persisted.effort || "high";
-    const effort = ["low", "medium", "high", "max"].includes(candidateEffort) ? candidateEffort : "high";
-    return { model, effort, notifications };
-  }
   const persistedModel = models.find((candidate) => candidate.model === persisted.model || candidate.id === persisted.model);
   const localModel = models.find((candidate) => candidate.model === local?.model || candidate.id === local?.model);
   const selected = localModel || persistedModel || defaultModel || models[0];
@@ -454,15 +444,14 @@ export function normalizeThreadSettings(
 export function resolveThreadSettings(
   thread: Thread,
   models: readonly CodexModel[],
-  claudeModels: readonly ClaudeModelOption[],
   local: SessionSettings | undefined,
   defaultModel?: CodexModel
 ): SessionSettings {
   const persisted = settingsFromThread(thread);
-  if (!persisted.model && !persisted.effort) return normalizeThreadSettings(thread, models, claudeModels, local, defaultModel);
+  if (!persisted.model && !persisted.effort) return normalizeThreadSettings(thread, models, local, defaultModel);
   const model = persisted.model || local?.model || "";
   const effort = persisted.effort || (local?.model === model ? local.effort : "");
-  return normalizeThreadSettings(thread, models, claudeModels, { model, effort, notifications: local?.notifications }, defaultModel);
+  return normalizeThreadSettings(thread, models, { model, effort, notifications: local?.notifications }, defaultModel);
 }
 
 /** The sole reducer for recovery snapshots, SSE deltas, and local presentation actions. */
@@ -673,8 +662,6 @@ function sameThreadSnapshot(current: Thread | undefined, next: Thread): boolean 
     && current.policy === next.policy && current.category === next.category
     && sameArray(current.tags || [], next.tags || [])
     && current.gitInfo?.branch === next.gitInfo?.branch && current.gitInfo?.repositoryUrl === next.gitInfo?.repositoryUrl
-    && current.claudeModel === next.claudeModel && current.claudeEffort === next.claudeEffort
-    && current.claudePermissionMode === next.claudePermissionMode
     && current.archiveState === next.archiveState && current.pinned === next.pinned && current.queueState === next.queueState
     && current.queueDepth === next.queueDepth && current.owner === next.owner && current.source === next.source
     && current.metadata?.model === next.metadata?.model && current.metadata?.effort === next.metadata?.effort

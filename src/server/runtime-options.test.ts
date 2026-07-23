@@ -31,10 +31,8 @@ test("production construction propagates every dependency setting explicitly", (
     FORGEDECK_MUTATION_MAX_CONCURRENT: "3",
     CODEX_BIN: "/opt/codex-custom",
     CODEX_APP_SERVER_URL: "wss://codex.example.test/socket",
-    FORGEDECK_CLAUDE_BIN: "/opt/claude-custom",
     FORGEDECK_STANDARD_MAX_CONCURRENT: "7",
     FORGEDECK_SPARK_MAX_CONCURRENT: "8",
-    FORGEDECK_CLAUDE_MAX_CONCURRENT: "9",
     FORGEDECK_QUOTA_HEADROOM_PERCENT: "13.5",
     FORGEDECK_QUOTA_RESET_PROXIMITY_MS: "1234",
     FORGEDECK_QUOTA_STALE_MS: "5678",
@@ -45,7 +43,6 @@ test("production construction propagates every dependency setting explicitly", (
       models: { custom: { totalTokens: 123 } }
     }),
     FORGEDECK_MODEL_CACHE_TTL_MS: "2345",
-    FORGEDECK_CLAUDE_AVAILABILITY_CACHE_TTL_MS: "3456",
     FORGEDECK_SLOW_REQUEST_MS: "456",
     FORGEDECK_LIVE_OUTPUT_BUDGET_BYTES: "300000",
     CODEX_HOME: "custom-codex-home",
@@ -97,12 +94,7 @@ test("production construction propagates every dependency setting explicitly", (
   assert.equal(options.codex.appServerUrl, "wss://codex.example.test/socket");
   assert.equal(options.codex.environment.KEEP_ME, "adapter-value");
   assert.match(options.codex.environment.PATH || "", /^\/custom\/bin/);
-  assert.deepEqual(options.claude, {
-    claudeBin: "/opt/claude-custom",
-    environment: options.codex.environment
-  });
-  assert.equal(options.claudeAvailability, options.claude);
-  assert.deepEqual(options.capacity, { "codex/standard": 7, "codex/spark": 8, claude: 9 });
+  assert.deepEqual(options.capacity, { "codex/standard": 7, "codex/spark": 8 });
   assert.deepEqual(options.admission, {
     headroomPercent: 13.5,
     resetProximityMs: 1234,
@@ -110,7 +102,7 @@ test("production construction propagates every dependency setting explicitly", (
     defaultExhaustionPolicy: "pause",
     costCatalog: config.costCatalog
   });
-  assert.deepEqual(options.caches, { modelTtlMs: 2345, claudeAvailabilityTtlMs: 3456 });
+  assert.deepEqual(options.caches, { modelTtlMs: 2345 });
   assert.deepEqual(options.profiler, { slowRequestMs: 456 });
   assert.deepEqual(options.liveRecovery, { maxBytes: 300_000 });
   assert.deepEqual(options.externalMonitor, {

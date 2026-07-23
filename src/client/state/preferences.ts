@@ -1,6 +1,6 @@
 import type { ModelPreset, NotificationPreferences, SessionSettings, ThreadTokenUsage } from "../types";
 
-type LaunchProvider = "codex" | "claude";
+type LaunchProvider = "codex";
 
 type RecentWorkspace = {
   path: string;
@@ -154,7 +154,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function readLastSessionSetup(value: unknown): LastSessionSetup | null {
   if (!isRecord(value)
     || typeof value.workspace !== "string" || !value.workspace.trim()
-    || (value.provider !== "codex" && value.provider !== "claude")
+    || value.provider !== "codex"
     || typeof value.model !== "string" || !value.model
     || typeof value.effort !== "string" || !value.effort) return null;
   return {

@@ -20,16 +20,14 @@ test("browser lifecycle authenticates, loads application state, opens events, an
       version: "0.1.0",
       health: { status: "ok", runtime: {}, storage: { status: "ok", writable: true } },
       models: { data: [] },
-      roots: ["/workspace"],
-      claudeModelOptions: []
+      roots: ["/workspace"]
     });
     if (url.pathname === "/api/account/status") return jsonResponse({
       account: { account: null, requiresOpenaiAuth: false },
       usage: null,
       activeThreadIds: [],
       agentThreadIds: [],
-      sparkAgentThreadIds: [],
-      claudeAvailable: false
+      sparkAgentThreadIds: []
     });
     if (url.pathname === "/api/approvals") return jsonResponse({ data: [] });
     if (url.pathname === "/api/events/revision") return jsonResponse({ revision: 4 });

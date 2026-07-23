@@ -260,7 +260,7 @@ test("invalid and excessive tags are rejected", () => {
   assert.throws(() => normalizeTags(Array.from({ length: 11 }, (_, index) => `tag-${index}`)), /at most 10/);
 });
 
-test("session creation settings and Claude metadata persist, enrich, and filter", async () => {
+test("session creation settings persist, enrich, and filter", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forgedeck-sessions-"));
   try {
     const manager = await SessionManager.create(directory, () => 10_000);
@@ -271,17 +271,6 @@ test("session creation settings and Claude metadata persist, enrich, and filter"
       model: "gpt-5.3-codex",
       effort: "xhigh"
     });
-    await manager.setMetadata("claude-thread", {
-      sessionClass: "standard",
-      backend: "claude",
-      cwd: "/workspace",
-      name: "Claude task",
-      model: "claude-sonnet-4-6",
-      effort: "high",
-      permissionMode: "plan",
-      maxTurns: 15
-    });
-
     const restored = await SessionManager.create(directory, () => 20_000);
     const artifactStatus = {
       status: "not-configured" as const,
@@ -307,25 +296,6 @@ test("session creation settings and Claude metadata persist, enrich, and filter"
       model: "gpt-5.3-codex",
       reasoningEffort: "xhigh",
       effort: "xhigh"
-    });
-    assert.deepEqual(restored.enrich({ id: "claude-thread" }), {
-      id: "claude-thread",
-      tags: [],
-      category: null,
-      sessionClass: "standard",
-      backend: "claude",
-      provider: "claude",
-      artifactStatus,
-      policyWarnings: [],
-      workspaceLeaseMode: "exclusive",
-      workspaceLease: null,
-      model: "claude-sonnet-4-6",
-      reasoningEffort: "high",
-      effort: "high",
-      claudeModel: "claude-sonnet-4-6",
-      claudeEffort: "high",
-      claudePermissionMode: "plan",
-      claudeMaxTurns: 15
     });
     assert.equal(restored.enrich({ id: "untracked", model: "gpt-5.3-codex-spark" }).sessionClass, "spark");
     const providerOrigin = restored.enrich({

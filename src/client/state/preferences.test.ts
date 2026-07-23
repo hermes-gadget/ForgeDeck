@@ -43,7 +43,7 @@ test("launch preferences remember safe defaults and keep recent workspaces uniqu
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: dom.window.localStorage });
   try {
     rememberLaunch({ workspace: "/work/alpha", provider: "codex", model: "gpt-a", effort: "medium", name: "Alpha", tags: ["one"] }, 10);
-    rememberLaunch({ workspace: "/work/beta", provider: "claude", model: "claude-b", effort: "high", category: "Product" }, 20);
+    rememberLaunch({ workspace: "/work/beta", provider: "codex", model: "gpt-b", effort: "high", category: "Product" }, 20);
     rememberLaunch({ workspace: "/work/alpha", provider: "codex", model: "gpt-c", effort: "high" }, 30);
 
     assert.deepEqual(readLaunchPreferences(), {

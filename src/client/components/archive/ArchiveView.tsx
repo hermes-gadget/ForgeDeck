@@ -155,7 +155,7 @@ function ArchiveCard({ entry, now, retentionHours, busy, onPin, onRestore }: {
   return <article className={`archive-card ${entry.pinned ? "pinned" : ""}`}>
     <header>
       <div className="archive-card-icon"><Archive size={17} /></div>
-      <div className="archive-card-title"><strong>{entry.name}</strong><span>{entry.backend === "claude" ? "Claude" : "Codex"} · {entry.sessionClass === "spark" ? "Spark" : "Standard"}</span></div>
+      <div className="archive-card-title"><strong>{entry.name}</strong><span>Codex · {entry.sessionClass === "spark" ? "Spark" : "Standard"}</span></div>
       <span className={`archive-reason ${entry.reason}`}>{entry.reason === "ttl" ? <Clock3 size={11} /> : <Archive size={11} />}{entry.reason === "ttl" ? "TTL cleanup" : "Manual archive"}</span>
     </header>
     <div className="archive-card-details">

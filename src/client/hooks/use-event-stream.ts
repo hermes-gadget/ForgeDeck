@@ -626,43 +626,6 @@ export function useEventStream(options: UseEventStreamOptions) {
       // reconciled only by reconnect/gap recovery, explicit UI actions, or terminal.
       if (/^(thread|turn)\//.test(notification.method)) scheduleInventory(400);
     });
-    onRevisioned<{ threadId?: unknown; state?: unknown; completedAt?: unknown; error?: unknown }>(events, "claude-turn", (snapshot, revision) => {
-      if (!snapshot || typeof snapshot.threadId !== "string") return;
-      if (removedSessions.has(snapshot.threadId)) return;
-      const terminal = snapshot.state === "completed" || snapshot.state === "failed";
-      threadStore.applyEvent(terminal
-        ? {
-          type: "live/completed",
-          threadId: snapshot.threadId,
-          revision,
-          completedAt: typeof snapshot.completedAt === "string" || typeof snapshot.completedAt === "number"
-            ? timestampToEpochMs(snapshot.completedAt)
-            : Date.now()
-        }
-        : { type: "live/started", threadId: snapshot.threadId, revision });
-      if (terminal) {
-        optionsRef.current.onNotification?.({
-          kind: snapshot.state === "failed" ? "failed" : "completed",
-          threadId: snapshot.threadId,
-          message: typeof snapshot.error === "string" && snapshot.error ? snapshot.error : undefined
-        });
-        reconcileTerminal(snapshot.threadId);
-      }
-    });
-    onRevisioned<{ threadId?: unknown; items?: unknown }>(events, "claude-output", (payload, revision) => {
-      if (!payload || typeof payload.threadId !== "string" || !Array.isArray(payload.items)) return;
-      flushNow();
-      const items = payload.items.filter((item): item is ThreadItem => isRecord(item) && typeof item.type === "string");
-      for (const [index, item] of items.entries()) {
-        threadStore.applyEvent({
-          type: "live/item",
-          threadId: payload.threadId,
-          ...(index === 0 ? { revision } : {}),
-          item,
-          completed: item.status !== "inProgress"
-        });
-      }
-    });
     onRevisioned<{ threadId?: unknown; reason?: unknown; guardian?: unknown }>(events, "guardian", (payload) => {
       if (!payload || typeof payload.threadId !== "string" || !isRecord(payload.guardian)) return;
       if (removedSessions.has(payload.threadId)) return;

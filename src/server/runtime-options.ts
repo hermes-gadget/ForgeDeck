@@ -2,7 +2,6 @@ import os from "node:os";
 import path from "node:path";
 import type { AdmissionControlOptions } from "./admission-control.js";
 import type { AuthManagerOptions } from "./auth.js";
-import type { ClaudeAvailabilityOptions, ClaudeBridgeOptions } from "./claude-bridge.js";
 import type { CodexRuntimeOptions } from "./codex-bridge.js";
 import type { ForgeDeckConfig } from "./config.js";
 import type { ExternalCodexMonitorOptions } from "./external-monitor.js";
@@ -37,11 +36,9 @@ export type ServerRuntimeOptions = Readonly<{
   readOperations: OperationPoolRuntimeOptions;
   mutationOperations: OperationPoolRuntimeOptions;
   codex: CodexRuntimeOptions;
-  claude: Pick<ClaudeBridgeOptions, "claudeBin" | "environment">;
-  claudeAvailability: ClaudeAvailabilityOptions;
-  capacity: Readonly<{ "codex/standard": number; "codex/spark": number; claude: number }>;
+  capacity: Readonly<{ "codex/standard": number; "codex/spark": number }>;
   admission: Readonly<Required<Omit<AdmissionControlOptions, "now">>>;
-  caches: Readonly<{ modelTtlMs: number; claudeAvailabilityTtlMs: number }>;
+  caches: Readonly<{ modelTtlMs: number }>;
   profiler: Readonly<{ slowRequestMs: number }>;
   liveRecovery: Readonly<{ maxBytes: number }>;
   externalMonitor: ExternalMonitorRuntimeOptions;
@@ -58,7 +55,6 @@ export function createServerRuntimeOptions(
     path.join(os.homedir(), ".local", "bin")
   ])].join(path.delimiter);
   const commandEnvironment = Object.freeze({ ...environment, PATH: executableSearchPath });
-  const claude = Object.freeze({ claudeBin: config.claudeBin, environment: commandEnvironment });
   return Object.freeze({
     logging: Object.freeze({
       level: config.logLevel,
@@ -108,12 +104,9 @@ export function createServerRuntimeOptions(
       appServerUrl: config.codexAppServerUrl,
       environment: commandEnvironment
     }),
-    claude,
-    claudeAvailability: claude,
     capacity: Object.freeze({
       "codex/standard": config.standardMaxConcurrent,
-      "codex/spark": config.sparkMaxConcurrent,
-      claude: config.claudeMaxConcurrent
+      "codex/spark": config.sparkMaxConcurrent
     }),
     admission: Object.freeze({
       headroomPercent: config.admissionHeadroomPercent,
@@ -122,10 +115,7 @@ export function createServerRuntimeOptions(
       defaultExhaustionPolicy: config.admissionDefaultPolicy,
       costCatalog: config.costCatalog
     }),
-    caches: Object.freeze({
-      modelTtlMs: config.modelCacheTtlMs,
-      claudeAvailabilityTtlMs: config.claudeAvailabilityCacheTtlMs
-    }),
+    caches: Object.freeze({ modelTtlMs: config.modelCacheTtlMs }),
     profiler: Object.freeze({ slowRequestMs: config.slowRequestMs }),
     liveRecovery: Object.freeze({ maxBytes: config.liveOutputBudgetBytes }),
     externalMonitor: Object.freeze({

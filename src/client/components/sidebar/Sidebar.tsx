@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  AlertTriangle, Archive, ArrowDownAZ, BarChart3, Bell, BookOpen, Bot, BrainCircuit, CheckSquare, CircleStop, Clock3, Folder, Gauge, LayoutGrid,
+  AlertTriangle, Archive, ArrowDownAZ, BarChart3, Bell, BookOpen, Bot, CheckSquare, CircleStop, Clock3, Folder, Gauge, LayoutGrid,
   Eraser, ListFilter, ListPlus, LoaderCircle, LockKeyhole, LogOut, MessageSquareText, Package, PanelLeftClose, Pin, PinOff, Plus, Search, ShieldCheck, Sparkles, Square, Target
 } from "lucide-react";
 import { DEFAULT_THREAD_FILTERS, type InventoryFacet, type InventoryFacets, type SortDirection, type SortMode, type ThreadFilters } from "../../hooks/use-thread-inventory";
@@ -221,7 +221,7 @@ export const Sidebar = memo(function Sidebar({
         <option value="all">All status</option><option value="active">Active</option><option value="idle">Idle</option><option value="error">Errors</option>
       </select>
       <select value={filters.backend} onChange={(event) => onFilters({ ...filters, backend: event.target.value as ThreadFilters["backend"] })} aria-label="Filter by provider">
-        <option value="all">All providers</option><option value="codex">Codex / Spark</option><option value="claude">Claude</option>
+        <option value="all">All providers</option><option value="codex">Codex / Spark</option>
       </select>
     </div>
     <details className="inventory-facets">
@@ -287,12 +287,11 @@ const SessionCard = memo(function SessionCard({ thread, selected, pinned, inBoar
   const state = details.state;
   const running = state === "running";
   const spark = thread.sessionClass === "spark";
-  const claude = thread.backend === "claude";
   const tokens = live.tokenUsage?.totalTokens ?? (thread.goal?.tokensUsed || null);
   const archived = thread.archiveState === "archived";
   const guardianStatus = guardianStatusText(thread);
   const previewId = useId();
-  return <article className={`session-card state-${state} ${selected ? "selected" : ""} ${spark ? "provider-spark" : claude ? "provider-claude" : "provider-codex"}`}>
+  return <article className={`session-card state-${state} ${selected ? "selected" : ""} ${spark ? "provider-spark" : "provider-codex"}`}>
     {selectionMode && <button className="session-checkbox" tabIndex={-1} onClick={onCheck} aria-label={`${checked ? "Deselect" : "Select"} ${threadTitle(thread)}`} aria-pressed={checked}>{checked ? <CheckSquare size={15} /> : <Square size={15} />}</button>}
     <button ref={setRef} className="session-card-main" tabIndex={rovingActive ? 0 : -1} onFocus={onFocus} onKeyDown={onKeyDown} onClick={() => onSelect(thread.id)} aria-current={selected ? "page" : undefined} aria-pressed={selectionMode ? checked : undefined} aria-describedby={previewId}>
       <span className="session-copy">
@@ -347,7 +346,7 @@ function activeFacetCount(filters: ThreadFilters): number {
     .filter((key) => filters[key] !== DEFAULT_THREAD_FILTERS[key]).length;
 }
 
-type ProviderUsageRowProps = { icon: ReactNode; provider: "codex" | "spark" | "claude"; name: string; available: boolean; percent?: number | null };
+type ProviderUsageRowProps = { icon: ReactNode; provider: "codex" | "spark"; name: string; available: boolean; percent?: number | null };
 function ProviderUsageRow({ icon, provider, name, available, percent = null }: ProviderUsageRowProps) {
   const roundedPercent = percent === null ? null : Math.round(percent);
   return <div className={`provider-usage-row provider-${provider} ${available ? "" : "unavailable"}`}><span className="provider-usage-icon">{icon}</span><strong>{name}</strong>{!available ? <span className="provider-usage-status">Unavailable</span> : <span className="provider-usage-meter"><span>{roundedPercent === null ? "—" : `${roundedPercent}%`}</span><progress max={100} value={roundedPercent ?? 0} aria-label={`${name} usage`} /></span>}</div>;
@@ -359,12 +358,11 @@ function UsageCard({ usage, backendStatus }: { usage: Usage | null; backendStatu
   return <section className="usage-card" aria-label="Provider usage"><div className="usage-top"><span><Gauge size={15} /> Usage</span></div><div className="provider-usage-list">
     <ProviderUsageRow icon={<Bot size={14} />} provider="codex" name="Codex" available={backendStatus?.codex.available ?? Boolean(legacyCodex?.primary)} percent={clamp(backendStatus?.codex.rateLimit?.primary?.usedPercent ?? legacyCodex?.primary?.usedPercent)} />
     <ProviderUsageRow icon={<Sparkles size={14} />} provider="spark" name="Spark" available={backendStatus?.spark.available ?? false} percent={clamp(backendStatus?.spark.rateLimit?.primary?.usedPercent)} />
-    <ProviderUsageRow icon={<BrainCircuit size={14} />} provider="claude" name="Claude" available={backendStatus?.claude.available ?? false} percent={clamp(backendStatus?.claude.rateLimit?.primary?.usedPercent)} />
   </div></section>;
 }
 
 function ProviderIcon({ thread, size }: { thread: Thread; size: number }) {
-  return thread.backend === "claude" ? <BrainCircuit size={size} color="var(--color-provider-claude)" /> : thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />;
+  return thread.sessionClass === "spark" ? <Sparkles size={size} color="var(--color-provider-spark)" /> : <Bot size={size} color="var(--color-provider-codex)" />;
 }
 function threadTitle(thread: Thread) { return thread.name || thread.preview || "Untitled session"; }
 function basename(value: string) { return value.split("/").filter(Boolean).pop() || value; }

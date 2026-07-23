@@ -17,17 +17,6 @@ test("revisioned SSE messages expose the same monotonic id in the wire frame and
   assert.match(second, /^id: 42\nevent: codex\n/);
 });
 
-test("Claude output progress is a thread-scoped revisioned SSE event", () => {
-  const message = formatRevisionedSseEvent("claude-output", {
-    threadId: "thread-11111111",
-    turnId: "turn-1",
-    observedAt: 1_750_000_000_000,
-    items: [{ id: "message-1", type: "agentMessage", text: "Working" }]
-  }, 43, "thread-11111111");
-  assert.match(message, /^id: 43\nevent: claude-output\n/);
-  assert.match(message, /"type":"agentMessage","text":"Working"/);
-});
-
 test("thread fan-out includes only subscribed clients while global fan-out includes all clients", () => {
   const streams = new SseSessionRegistry(8, 3);
   const first = fakeResponse();

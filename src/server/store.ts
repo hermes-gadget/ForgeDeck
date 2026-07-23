@@ -108,7 +108,7 @@ export type SessionOperationStoreRow = {
   completedAt: number | null;
 };
 
-export type UsageProvider = "codex" | "spark" | "claude";
+export type UsageProvider = "codex" | "spark";
 export type BudgetScopeType = "run" | "blueprint" | "workspace";
 export type BudgetExhaustionPolicy = "wait" | "pause" | "downgrade" | "fallback";
 
@@ -2055,7 +2055,7 @@ function createSchema(database: DatabaseSync): void {
       id TEXT PRIMARY KEY,
       source_event_id TEXT UNIQUE,
       observed_at INTEGER NOT NULL,
-      provider TEXT NOT NULL CHECK (provider IN ('codex', 'spark', 'claude')),
+      provider TEXT NOT NULL CHECK (provider IN ('codex', 'spark')),
       model TEXT NOT NULL,
       run_id TEXT NOT NULL,
       workspace_id TEXT,
@@ -2087,7 +2087,7 @@ function createSchema(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS provider_quota_events (
       id TEXT PRIMARY KEY,
       observed_at INTEGER NOT NULL,
-      provider TEXT NOT NULL CHECK (provider IN ('codex', 'spark', 'claude')),
+      provider TEXT NOT NULL CHECK (provider IN ('codex', 'spark')),
       limit_id TEXT NOT NULL,
       used_percent REAL NOT NULL CHECK (used_percent >= 0 AND used_percent <= 100),
       remaining_percent REAL NOT NULL CHECK (remaining_percent >= 0 AND remaining_percent <= 100),
@@ -2427,7 +2427,7 @@ function validateSessionOperationRow(row: SessionOperationStoreRow): void {
 
 function validateUsageEventRow(row: UsageEventStoreRow): void {
   if (!row.id || !row.model || !row.runId) throw new Error("Usage event identity fields must not be empty");
-  if (!(["codex", "spark", "claude"] as const).includes(row.provider)) throw new Error("Usage provider is invalid");
+  if (!(["codex", "spark"] as const).includes(row.provider)) throw new Error("Usage provider is invalid");
   assertFiniteNonNegative(row.observedAt, "Usage observation timestamp");
   for (const [label, value] of Object.entries({
     requestCount: row.requestCount,
@@ -2455,7 +2455,7 @@ function validateCostEstimateRow(row: CostEstimateStoreRow): void {
 
 function validateQuotaEventRow(row: QuotaEventStoreRow): void {
   if (!row.id || !row.limitId) throw new Error("Quota event identity fields must not be empty");
-  if (!(["codex", "spark", "claude"] as const).includes(row.provider)) throw new Error("Quota provider is invalid");
+  if (!(["codex", "spark"] as const).includes(row.provider)) throw new Error("Quota provider is invalid");
   assertFiniteNonNegative(row.observedAt, "Quota observation timestamp");
   for (const [label, value] of [["used", row.usedPercent], ["remaining", row.remainingPercent]] as const) {
     if (!Number.isFinite(value) || value < 0 || value > 100) throw new Error(`Quota ${label} percentage must be between zero and 100`);
